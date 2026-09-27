@@ -86,7 +86,6 @@ from ouroboros.boundary.binding_flow import (
 from ouroboros.boundary.check_env import (
     CheckInterpreter,
     resolve_check_interpreter,
-    scrubbed_check_environment,
 )
 from ouroboros.boundary.constructor import ALL_CRITERIA_UNCOVERED
 from ouroboros.boundary.coverage import (
@@ -393,7 +392,6 @@ class _Sealer:
             package,
             self.base,
             timeout_seconds=self.settings.check_timeout_seconds,
-            env=scrubbed_check_environment(),
             interpreter=self.interpreter.path,
             interpreter_source=self.interpreter.source,
             reject_prose_only_checks=True,
@@ -422,7 +420,6 @@ class _Sealer:
             package,
             references,
             seed=self.seed,
-            env=scrubbed_check_environment(),
             interpreter=self.interpreter.path,
             timeout_seconds=self.settings.check_timeout_seconds,
         )
@@ -466,8 +463,8 @@ async def prepare_check_package(
     admission: AdmissionResult | None = None
     package_path: Path | None = None
     failure_reason: str | None = None
-    # Model-written checks run with a scrubbed environment and the project's
-    # interpreter when one exists (boundary/check_env.py).
+    # Model-written checks run in an environment built from an allowlist and
+    # with the project's interpreter when one exists (boundary/check_env.py).
     interpreter = resolve_check_interpreter(base)
     sealer = _Sealer(ledger, seed, base, store, settings, interpreter)
     reference_check: ReferenceCheck | None = None
@@ -797,7 +794,6 @@ async def verify_check_package(
     )
     interpreter = state.interpreter or resolve_check_interpreter(candidate)
     run_options = {
-        "env": scrubbed_check_environment(),
         "interpreter": interpreter.path,
         "interpreter_source": interpreter.source,
     }
@@ -809,7 +805,7 @@ async def verify_check_package(
         base_manifest=_base_manifest(state),
         expected_base_digest=state.admission.base_tree_digest,
         admitted_tiers=state.admission.check_tiers,
-        run_options={"env": run_options["env"], "interpreter": run_options["interpreter"]},
+        run_options={"interpreter": run_options["interpreter"]},
         base_run_cache=base_run_cache,
     )
     await ledger.record_bindings(
@@ -1001,7 +997,7 @@ def render_preparation(state: BoundaryRunState) -> list[str]:
         if state.interpreter is not None:
             lines.append(
                 f"Checks run with {state.interpreter.path} ({state.interpreter.source}) "
-                "and a scrubbed environment"
+                "and a minimal environment (allowlisted variables, scratch HOME)"
             )
         if package.uncovered:
             lines.append(

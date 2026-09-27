@@ -1,83 +1,141 @@
 """Process environment and interpreter for model-written check scripts.
 
 Admission and candidate verification execute Python scripts that a model
-wrote. They always run on a throwaway copy of the checkout, without a shell,
-under the per-check timeout (``boundary/admission.py``). This module adds two
-product-path rules:
+wrote, and an oracle check runs the implementation under test in target
+processes. They always run on a throwaway copy of the checkout, without a
+shell, under the per-check timeout (``boundary/admission.py``,
+``boundary/oracle_run.py``). This module adds two product-path rules:
 
-- **Scrubbed environment.** Only an allowlist of variables needed to run
-  Python and the project's tooling reaches the script (``PATH``, ``HOME``,
-  locale, temp directories, virtualenv markers, and the Windows system
-  variables). ``PYTHONPATH`` is dropped: a relative entry would resolve
-  inside the checkout copy ahead of the standard library. Everything else, including every credential-like variable
-  (``*_API_KEY``, ``*_TOKEN``, ``AWS_*``, ``GH_*``, ``OPENAI_*``, ...), is
-  dropped.
+- **Environment built from scratch.** Every such process gets
+  ``check_environment``: a new mapping, not a filtered copy of this
+  process's environment. Only the variables named in ``CHECK_ENV_COPIED``
+  (``PATH``, the locale, Python I/O settings, and on Windows the system
+  variables any process needs) take their value from the value source (this
+  process by default); ``HOME`` (``USERPROFILE``, ``APPDATA`` and
+  ``LOCALAPPDATA`` on Windows) and the temp directory point to a scratch
+  directory created for the process and removed afterwards; ``VIRTUAL_ENV``
+  names the interpreter's virtualenv, whose scripts directory leads ``PATH``.
+  No other variable exists in the child, so a credential held in an
+  environment variable, or in a file found through ``HOME``, is not in a
+  check's environment. ``PYTHONPATH`` is never copied: a relative entry would
+  resolve inside the checkout copy ahead of the standard library.
+  ``check_process_environment`` owns the scratch directory's lifetime; the
+  two spawn points (``admission._run_argv`` and
+  ``oracle_run.run_oracle_check``) use it, so no caller can hand a check the
+  parent environment.
 - **Project interpreter.** A check's ``python3``/``python`` runs with the
   project's virtualenv interpreter when one is found (the checkout's, or the
   main working tree's when the checkout is a linked git worktree, then an
   active ``VIRTUAL_ENV``), else ``python3`` from ``PATH``. The choice is
   recorded in the admission and verification receipts.
 
-Residual risk, not addressed here: there is no OS sandbox. A check can still
-read files the user can read (for example under ``HOME``), write outside its
-copy, and use the network. Opt out with ``--no-check-package``,
-``OUROBOROS_CHECK_PACKAGE=off``, or ``boundary.check_package: off``.
+Residual risk, not addressed here: there is no OS sandbox. A check runs as
+the user, so it can read files the user can read (including, on Linux,
+another of the user's processes' ``/proc/<pid>/environ``), write outside its
+copy, and use the network, as the worker agent can. Opt out with
+``--no-check-package``, ``OUROBOROS_CHECK_PACKAGE=off``, or
+``boundary.check_package: off``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
-ALLOWED_CHECK_ENV = frozenset(
-    {
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LANGUAGE",
-        "TERM",
-        "TZ",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "CONDA_DEFAULT_ENV",
-        "PYTHONIOENCODING",
-        "PYTHONUTF8",
-        "PYTHONDONTWRITEBYTECODE",
-        "PYTHONHASHSEED",
-        "SOURCE_DATE_EPOCH",
-        # Windows needs these to start any process and to locate temp dirs.
-        "SYSTEMROOT",
-        "SYSTEMDRIVE",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "PROGRAMDATA",
-    }
+# The only variables whose value a check process takes from the value source.
+CHECK_ENV_COPIED: tuple[str, ...] = (
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
 )
-ALLOWED_CHECK_ENV_PREFIXES = ("LC_",)
+# Windows cannot start a process, or find its system directories, without these.
+CHECK_ENV_COPIED_WINDOWS: tuple[str, ...] = (
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "PROGRAMDATA",
+)
 CHECK_INTERPRETER_NAMES = frozenset({"python3", "python"})
 
 
-def scrubbed_check_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return only the allowlisted variables of ``environ`` (default: this process)."""
-    source = os.environ if environ is None else environ
-    return {
-        key: value
-        for key, value in source.items()
-        if key.upper() in ALLOWED_CHECK_ENV or key.upper().startswith(ALLOWED_CHECK_ENV_PREFIXES)
-    }
+def _interpreter_venv(interpreter: str | None) -> Path | None:
+    """The virtualenv that ``interpreter`` belongs to (its ``pyvenv.cfg``), if any."""
+    if not interpreter or not Path(interpreter).is_absolute():
+        return None
+    root = Path(interpreter).parent.parent
+    return root if (root / "pyvenv.cfg").is_file() else None
+
+
+def check_environment(
+    scratch: Path,
+    *,
+    interpreter: str | None = None,
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The complete environment of a check process, rooted at the directory ``scratch``.
+
+    ``source`` (default: this process's environment) supplies values for the
+    names in ``CHECK_ENV_COPIED`` (and ``CHECK_ENV_COPIED_WINDOWS`` on
+    Windows) only; nothing else is read from it. ``scratch`` must exist; the
+    temp directory is created inside it.
+    """
+    values = os.environ if source is None else source
+    names = CHECK_ENV_COPIED + (CHECK_ENV_COPIED_WINDOWS if sys.platform == "win32" else ())
+    env = {name: values[name] for name in names if values.get(name)}
+    home = scratch / "home"
+    temp = scratch / "tmp"
+    home.mkdir(exist_ok=True)
+    temp.mkdir(exist_ok=True)
+    env["HOME"] = str(home)
+    env["TMPDIR"] = str(temp)
+    if sys.platform == "win32":
+        env["USERPROFILE"] = str(home)
+        env["APPDATA"] = str(home / "AppData" / "Roaming")
+        env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
+        env["TEMP"] = env["TMP"] = str(temp)
+    venv = _interpreter_venv(interpreter)
+    if venv is not None:
+        env["VIRTUAL_ENV"] = str(venv)
+        scripts = Path(interpreter or "").parent
+        env["PATH"] = os.pathsep.join(filter(None, (str(scripts), env.get("PATH"))))
+    return env
+
+
+@contextmanager
+def check_process_environment(
+    source: Mapping[str, str] | None = None,
+    *,
+    interpreter: str | None = None,
+    parent: Path | None = None,
+) -> Iterator[dict[str, str]]:
+    """``check_environment`` on a fresh owner-only scratch directory, removed on exit.
+
+    The directory is created in ``parent`` (the run's work directory, beside
+    the checkout copy and never inside it) or, without one, in the system
+    temp directory.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="ouroboros-check-env-", dir=parent))
+    try:
+        yield check_environment(scratch, interpreter=interpreter, source=source)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,10 +206,11 @@ def resolve_check_interpreter(
 
 
 __all__ = [
-    "ALLOWED_CHECK_ENV",
-    "ALLOWED_CHECK_ENV_PREFIXES",
+    "CHECK_ENV_COPIED",
+    "CHECK_ENV_COPIED_WINDOWS",
     "CHECK_INTERPRETER_NAMES",
     "CheckInterpreter",
+    "check_environment",
+    "check_process_environment",
     "resolve_check_interpreter",
-    "scrubbed_check_environment",
 ]

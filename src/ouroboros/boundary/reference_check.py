@@ -155,7 +155,7 @@ async def _disagreeing_cases(
     spec: OracleSpec,
     reference: OracleReference,
     *,
-    env: Mapping[str, str],
+    env: Mapping[str, str] | None = None,
     interpreter: str | None,
     timeout_seconds: float,
 ) -> list[str] | None:
@@ -194,7 +194,7 @@ async def check_references(
     references: Mapping[str, OracleReference | None],
     *,
     seed: Seed,
-    env: Mapping[str, str],
+    env: Mapping[str, str] | None = None,
     interpreter: str | None,
     timeout_seconds: float,
 ) -> tuple[CheckPackage, ReferenceCheck]:

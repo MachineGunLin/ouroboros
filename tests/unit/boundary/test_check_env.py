@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
 
 import pytest
 
-from ouroboros.boundary import admit_check_package
+from ouroboros.boundary import admit_check_package, verify_candidate
+from ouroboros.boundary.admission import _run_argv
 from ouroboros.boundary.check_env import (
+    check_environment,
+    check_process_environment,
     resolve_check_interpreter,
-    scrubbed_check_environment,
 )
 from ouroboros.boundary.package import CheckRole
 from ouroboros.boundary.run_wiring import CheckPackageSettings, prepare_check_package
 from ouroboros.persistence.event_store import EventStore
 
+from .test_oracle import FIXED, _repo
+from .test_oracle import _package as _oracle_package
+from .test_oracle import _seed as _oracle_seed
 from .test_run_wiring import FakeConstructor, _ok, _package, _seed
 
 SECRETS = {
@@ -27,6 +33,10 @@ SECRETS = {
     "AWS_SECRET_ACCESS_KEY": "aws-test",
     "MY_SERVICE_PASSWORD": "hunter2",
 }
+# A parent variable no name pattern would call a credential: only an
+# environment built from an allowlist keeps it out.
+SENTINEL_NAME = "OUROBOROS_TEST_PARENT_ONLY"
+SENTINEL_VALUE = "parent-credential-sentinel-7f3a"
 
 # Preservation check: passes only when no credential-like variable is visible.
 NO_SECRET_SCRIPT = """import os, sys
@@ -35,17 +45,106 @@ print("leaked:", leaked)
 sys.exit(1 if leaked else 0)
 """
 
-
-def test_scrub_keeps_the_allowlist_and_drops_credentials() -> None:
-    env = scrubbed_check_environment(
-        {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "VIRTUAL_ENV": "/v", **SECRETS}
-    )
-    assert env == {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "VIRTUAL_ENV": "/v"}
+POSIX_KEYS = {"PATH", "HOME", "TMPDIR"}
 
 
-def test_scrub_drops_pythonpath() -> None:
-    # S9: a relative PYTHONPATH entry would resolve inside the checkout copy.
-    assert "PYTHONPATH" not in scrubbed_check_environment({"PATH": "/bin", "PYTHONPATH": "."})
+def test_the_environment_is_built_from_the_allowlist_not_copied(tmp_path: Path) -> None:
+    source = {
+        "PATH": "/bin",
+        "HOME": "/home/user",
+        "LC_ALL": "C",
+        "VIRTUAL_ENV": "/other/venv",
+        "PYTHONPATH": ".",
+        "LC_SECRET_TOKEN": "a name pattern would have kept this",
+        SENTINEL_NAME: SENTINEL_VALUE,
+        **SECRETS,
+    }
+    env = check_environment(tmp_path, source=source)
+    expected = POSIX_KEYS | {"LC_ALL"}
+    if sys.platform == "win32":
+        expected |= {"USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"}
+    assert set(env) == expected
+    assert env["PATH"] == "/bin" and env["LC_ALL"] == "C"
+    # HOME and the temp directory are the scratch directory, never the parent's.
+    assert env["HOME"] == str(tmp_path / "home") and (tmp_path / "home").is_dir()
+    assert env["TMPDIR"] == str(tmp_path / "tmp") and (tmp_path / "tmp").is_dir()
+    assert SENTINEL_VALUE not in json.dumps(env)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX venv layout")
+def test_a_virtualenv_interpreter_names_its_venv_and_leads_path(tmp_path: Path) -> None:
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    python = venv / "bin" / "python3"
+    python.symlink_to(sys.executable)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env = check_environment(scratch, interpreter=str(python), source={"PATH": "/bin"})
+    assert env["VIRTUAL_ENV"] == str(venv)
+    assert env["PATH"] == os.pathsep.join((str(venv / "bin"), "/bin"))
+    plain = check_environment(scratch, interpreter="python3", source={"PATH": "/bin"})
+    assert "VIRTUAL_ENV" not in plain and plain["PATH"] == "/bin"
+
+
+def test_the_scratch_directory_is_removed_afterwards() -> None:
+    with check_process_environment({"PATH": "/bin"}) as env:
+        scratch = Path(env["HOME"]).parent
+        assert scratch.is_dir()
+    assert not scratch.exists()
+
+
+async def test_a_script_check_never_sees_a_parent_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child process, launched the way every script check is (``_run_argv``)."""
+    monkeypatch.setenv(SENTINEL_NAME, SENTINEL_VALUE)
+    for key, value in SECRETS.items():
+        monkeypatch.setenv(key, value)
+    parent_home = os.environ.get("HOME", "")
+    argv = ["python3", "-c", "import json, os; print(json.dumps(dict(os.environ)))"]
+    # No ``env``: the library default must not hand the child this process's environment.
+    completed = await _run_argv(argv, tmp_path, 30, interpreter=sys.executable)
+    assert completed.return_code == 0, completed.stderr
+    child = json.loads(completed.stdout)
+    assert SENTINEL_NAME not in child
+    assert not set(SECRETS) & set(child)
+    assert SENTINEL_VALUE not in completed.stdout.decode()
+    assert not any(value in completed.stdout.decode() for value in SECRETS.values())
+    assert child["HOME"] != parent_home
+    assert not Path(child["HOME"]).exists()  # the scratch directory is gone
+    if sys.platform != "win32":
+        # Only the built names (VIRTUAL_ENV: this interpreter's venv); the OS
+        # itself may add LC_CTYPE or macOS's __CF_USER_TEXT_ENCODING at exec.
+        assert set(child) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"} <= (
+            POSIX_KEYS | {"VIRTUAL_ENV"} | set(_copied_names())
+        )
+
+
+def _copied_names() -> tuple[str, ...]:
+    from ouroboros.boundary.check_env import CHECK_ENV_COPIED
+
+    return CHECK_ENV_COPIED
+
+
+async def test_an_oracle_target_process_never_sees_a_parent_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The implementation under an oracle check runs in the same built environment."""
+    monkeypatch.setenv(SENTINEL_NAME, SENTINEL_VALUE)
+    for key, value in SECRETS.items():
+        monkeypatch.setenv(key, value)
+    report = tmp_path / "target-env.json"
+    probe = f"import json, os\nopen({str(report)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+    base = _repo(tmp_path / "base", {"mathutils.py": FIXED})
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": probe + FIXED})
+    package = _oracle_package(_oracle_seed(), base)
+    result = await verify_candidate(package, candidate)
+    assert result.verdict.value == "pass"
+    seen = json.loads(report.read_text())
+    assert SENTINEL_NAME not in seen and not set(SECRETS) & set(seen)
+    assert SENTINEL_VALUE not in report.read_text()
+    assert seen["HOME"] != os.environ.get("HOME")
 
 
 def _preservation_package(seed):
@@ -99,10 +198,10 @@ async def test_product_admission_hides_credentials_from_checks(
     seed = _seed("add(2, 3) returns 5")
     package = _preservation_package(seed)
 
-    # The library default keeps the caller's environment (a harness may need it),
-    # so the same check sees the secrets and is rejected there.
-    unscrubbed = await admit_check_package(package, repo)
-    assert unscrubbed.verdict.value == "rejected"
+    # The library default builds the same environment: no caller can hand a
+    # check the parent's variables.
+    library = await admit_check_package(package, repo)
+    assert library.verdict.value == "admitted", library.reasons
 
     state = await _prepare(seed, package, repo, tmp_path)
     assert state.admitted, state.failure_reason
@@ -193,7 +292,7 @@ async def test_admission_runs_checks_with_the_resolved_interpreter(
     result = await admit_check_package(
         package,
         repo,
-        env=scrubbed_check_environment({"PATH": os.environ.get("PATH", "")}),
+        env={"PATH": os.environ.get("PATH", "")},
         interpreter=chosen.path,
         interpreter_source=chosen.source,
     )

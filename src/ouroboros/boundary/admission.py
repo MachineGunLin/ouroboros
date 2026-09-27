@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 from ouroboros.boundary.admission_rules import UNSAFE_CHECK_REASON, unsafe_checks
 from ouroboros.boundary.binding import Binding, CheckTier
+from ouroboros.boundary.check_env import check_process_environment
 from ouroboros.boundary.check_rules import PROSE_ONLY_CHECK_REASON, prose_only_checks
 from ouroboros.boundary.oracle import (
     is_oracle_file,
@@ -263,14 +264,6 @@ class _Completed:
     output_overflow: bool = False
 
 
-def _command_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if base is None else base)
-    # Same rule as mechanical verification: a nested-server sentinel must not
-    # leak into the checked process.
-    env.pop("_OUROBOROS_NESTED", None)
-    return env
-
-
 _PYTHON_ARGV0 = frozenset({"python3", "python"})
 
 
@@ -288,15 +281,35 @@ async def _run_argv(
     *,
     env: Mapping[str, str] | None = None,
     interpreter: str | None = None,
+    scratch_parent: Path | None = None,
 ) -> _Completed:
-    """Run ``argv`` without a shell; kill its whole process group on timeout."""
+    """Run ``argv`` without a shell; kill its whole process group on timeout.
+
+    The process gets ``check_process_environment``: an environment built
+    from scratch, with ``env`` (default: this process's) only as the source
+    of the allowlisted values (``boundary/check_env.py``), and its scratch
+    directory in ``scratch_parent``.
+    """
+    with check_process_environment(
+        env, interpreter=interpreter, parent=scratch_parent
+    ) as child_env:
+        return await _run_in_environment(argv, cwd, timeout, child_env, interpreter)
+
+
+async def _run_in_environment(
+    argv: Sequence[str],
+    cwd: Path,
+    timeout: int,
+    child_env: Mapping[str, str],
+    interpreter: str | None,
+) -> _Completed:
     started = time.monotonic()
     posix = sys.platform != "win32"
     try:
         process = await asyncio.create_subprocess_exec(
             *_resolved_argv(argv, interpreter),
             cwd=cwd,
-            env=_command_env(env),
+            env=dict(child_env),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -489,9 +502,10 @@ async def _execute_check(
             cwd,
             timeout_seconds=timeout,
             on_base=on_base,
-            env=_command_env(env),
+            env=env,
             interpreter=interpreter,
             binding=binding,
+            scratch_parent=copy_root.parent,
         )
         completed = _Completed(
             oracle_run.return_code,
@@ -502,7 +516,14 @@ async def _execute_check(
             oracle_run.duration,
         )
     else:
-        completed = await _run_argv(check.argv, cwd, timeout, env=env, interpreter=interpreter)
+        completed = await _run_argv(
+            check.argv,
+            cwd,
+            timeout,
+            env=env,
+            interpreter=interpreter,
+            scratch_parent=copy_root.parent,
+        )
     after = tree_manifest(copy_root, unprotected_names=unprotected)
     mutated_paths = changed_paths(protected, after)
     new_paths = added_paths(protected, after)
@@ -673,8 +694,10 @@ async def admit_check_package(
     command runs; such a check's tier is ``C``. ``check_tiers`` (check id to
     tier) is recorded on each check and in the receipt.
 
-    ``env`` replaces the process environment of every check (default: this
-    process's environment); ``interpreter`` replaces a bare ``python3`` or
+    Every check runs in an environment built from scratch
+    (``check_env.check_process_environment``); ``env`` (default: this
+    process's environment) is only where the allowlisted variables take their
+    values from. ``interpreter`` replaces a bare ``python3`` or
     ``python`` in a check's argv, and it and ``interpreter_source`` are
     recorded in the receipt. With ``reject_prose_only_checks`` a check that
     only matches text in prose files (``boundary/check_rules.py``) makes the

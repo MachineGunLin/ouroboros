@@ -76,7 +76,7 @@ from ouroboros.boundary.binding_flow import (
     retire_revealed,
     verify_with_bindings,
 )
-from ouroboros.boundary.check_env import resolve_check_interpreter, scrubbed_check_environment
+from ouroboros.boundary.check_env import resolve_check_interpreter
 from ouroboros.boundary.ledger import BoundaryLedger
 from ouroboros.boundary.package import seed_criterion_keys
 from ouroboros.boundary.per_check import criteria_without_admitted_check, excluded_check_ids
@@ -442,7 +442,7 @@ class CheckPackageGate:
             base_manifest=_base_manifest(state),
             expected_base_digest=state.admission.base_tree_digest,
             admitted_tiers=state.admission.check_tiers,
-            run_options={"env": options["env"], "interpreter": options["interpreter"]},
+            run_options={"interpreter": options["interpreter"]},
             base_run_cache=authority.base_runs,
         )
         subset = {check_id: assignments[check_id] for check_id in check_ids}
@@ -663,7 +663,6 @@ class CheckPackageAuthority:
     def run_options(self) -> dict[str, Any]:
         interpreter = self._state.interpreter or resolve_check_interpreter(self.candidate)
         return {
-            "env": scrubbed_check_environment(),
             "interpreter": interpreter.path,
             "interpreter_source": interpreter.source,
         }

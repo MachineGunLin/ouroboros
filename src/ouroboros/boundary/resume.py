@@ -77,7 +77,7 @@ from ouroboros.boundary.binding_flow import (
     retire_revealed,
     verify_with_bindings,
 )
-from ouroboros.boundary.check_env import resolve_check_interpreter, scrubbed_check_environment
+from ouroboros.boundary.check_env import resolve_check_interpreter
 from ouroboros.boundary.events import (
     ACTOR_STARTED,
     ADMISSION_COMPLETED,
@@ -424,7 +424,6 @@ async def decide_resumed(
     snapshot = boundary.store_dir / BASE_SNAPSHOT_DIR
     manifest_path = boundary.store_dir / BASE_MANIFEST_FILE
     interpreter = resolve_check_interpreter(candidate)
-    env = scrubbed_check_environment()
     assignments, _results = await assign_tiers(
         package,
         artifact=candidate,
@@ -435,14 +434,13 @@ async def decide_resumed(
         else None,
         expected_base_digest=boundary.base_tree_digest,
         admitted_tiers=boundary.check_tiers,
-        run_options={"env": env, "interpreter": interpreter.path},
+        run_options={"interpreter": interpreter.path},
     )
     bound = await verify_with_bindings(
         package,
         candidate,
         assignments,
         timeout_seconds=settings.check_timeout_seconds,
-        env=env,
         interpreter=interpreter.path,
         interpreter_source=interpreter.source,
     )

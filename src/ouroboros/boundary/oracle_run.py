@@ -72,6 +72,7 @@ import time
 from typing import Any
 
 from ouroboros.boundary.binding import Binding, CallKind
+from ouroboros.boundary.check_env import check_process_environment
 from ouroboros.boundary.oracle import (
     ORACLE_DATA_PATH,
     ORACLE_HARNESS_PATH,
@@ -648,11 +649,17 @@ async def run_oracle_check(
     *,
     timeout_seconds: float,
     on_base: bool,
-    env: Mapping[str, str],
+    env: Mapping[str, str] | None = None,
     interpreter: str | None,
     binding: Binding | None,
+    scratch_parent: Path | None = None,
 ) -> OracleRun:
     """Run one oracle check on the checkout copy at ``cwd`` (see the module docstring).
+
+    Every target process gets ``check_process_environment``: an environment
+    built from scratch, with ``env`` (default: this process's) only as the
+    source of the allowlisted values (``boundary/check_env.py``), and its
+    scratch directory in ``scratch_parent``.
 
     Never raises: an unexpected controller error is an indeterminate check,
     never a verdict and never a reason to fall back to another verifier.
@@ -662,7 +669,7 @@ async def run_oracle_check(
     data_text = package_files.get(ORACLE_DATA_PATH)
     source = "declared" if binding is not None else "default"
     bound = binding or oracle.default_binding
-    python = target_interpreter(interpreter, env)
+    python = target_interpreter(interpreter, os.environ if env is None else env)
     if harness is None or data_text is None:
         launch_error: str | None = "oracle files missing from the package"
     elif harness != ORACLE_HARNESS_SOURCE:
@@ -678,16 +685,17 @@ async def run_oracle_check(
     try:
         # Parsed before any target starts; held in memory only.
         oracle_data = json.loads(data_text)
-        resolve, detail, observations, timed_out = await _observe(
-            oracle,
-            bound,
-            harness,
-            cwd,
-            env,
-            python,
-            max(0.1, timeout_seconds),
-            on_base=on_base,
-        )
+        with check_process_environment(env, interpreter=python, parent=scratch_parent) as child_env:
+            resolve, detail, observations, timed_out = await _observe(
+                oracle,
+                bound,
+                harness,
+                cwd,
+                child_env,
+                python,
+                max(0.1, timeout_seconds),
+                on_base=on_base,
+            )
         result: dict[str, Any] | None = None
         if _decided(resolve, on_base=on_base):
             result = _HARNESS["_compare"](

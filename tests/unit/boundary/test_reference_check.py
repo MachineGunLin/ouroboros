@@ -14,7 +14,6 @@ from typing import Any
 
 import pytest
 
-from ouroboros.boundary.check_env import scrubbed_check_environment
 from ouroboros.boundary.constructor import ConstructionOutcome, package_from_reply
 from ouroboros.boundary.events import BOUNDARY_AGGREGATE_TYPE
 from ouroboros.boundary.package import seed_criterion_keys
@@ -108,7 +107,6 @@ async def _check(reply: dict[str, Any], repo: Path) -> tuple[Any, Any]:
         package,
         references_from_reply(reply),
         seed=seed,
-        env=scrubbed_check_environment(),
         interpreter=sys.executable,
         timeout_seconds=30,
     )
@@ -310,7 +308,6 @@ async def test_a_command_reference_runs_as_a_script(repo: Path) -> None:
         package,
         references_from_reply(reply),
         seed=seed,
-        env=scrubbed_check_environment(),
         interpreter=sys.executable,
         timeout_seconds=30,
     )
@@ -319,7 +316,7 @@ async def test_a_command_reference_runs_as_a_script(repo: Path) -> None:
     assert [case.case_id for case in package.oracles[0].cases] == ["stated", "held_ok"]
 
 
-def test_the_counts_reach_telemetry_as_buckets() -> None:
+def test_the_counts_reach_the_outcome_summary_as_buckets() -> None:
     from types import SimpleNamespace
 
     from ouroboros.boundary.reference_check import ReferenceCheck
