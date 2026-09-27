@@ -30,16 +30,17 @@ cannot own consistently.
 
 ## Preferred evidence forms
 
-For test commands whose output is filtered or paged, the preferred proof is a
-runner-agnostic command contract:
+For test commands whose output is filtered or paged, the preferred form is
+the plain pipeline, which replay supports:
 
 ```sh
-set -o pipefail && <test command> 2>&1 | tail -100
+<test command> 2>&1 | tail -100
 ```
 
-`pipefail` preserves the failing status of the left-hand test command even when
-the right-hand output filter succeeds. Without it, a filtered pipeline is a real
-transcript event but not a clean command proof.
+Replay runs `<test command>` alone and judges its own exit status, so the
+filter cannot mask a failure. A `set -o pipefail && ...` preamble is not
+replayable (`set` is a shell builtin), so claims resting on it keep the
+transcript-only rules.
 
 For richer result formats, prefer one of these approaches:
 
@@ -65,39 +66,95 @@ the default) and the leaf held Bash authority. The rules:
   are peeled. Commands linked to an unproven claim come first, then recognized
   test runs that the runner-output rules judge (for example a
   `pytest tests/test_a.py` run behind a `tests/test_a.py::test_x` claim). At
-  most 3 per criterion.
+  most 3 per criterion. The most recent run of a command decides: when the
+  transcript recorded a non-zero exit for it (or a failed tool result), it is
+  not replayed.
+- **Allowlist.** Only these programs are replayed, found after peeling
+  wrappers (`timeout`, `stdbuf`, `time`, `nice`, `ionice`, `env`, `nohup`,
+  `command`, `exec`, `setsid`) with per-wrapper option tables; an option or
+  operand the tables do not know leaves the program unknown, and nothing is
+  replayed:
+  - `python`/`python3`/`pythonX.Y` with `-m pytest`, `-m unittest`, `-m tox`,
+    `-m nox`, `-m django test`, or a script inside the workspace (never `-c`,
+    `-` or stdin);
+  - `pytest`, `py.test`, `tox`, `nox`, `django-admin test`, `rspec`, `jest`,
+    `vitest`, `mocha`, `ava`, `phpunit`, `ctest`;
+  - `make`/`gmake`, except targets whose words include `install`, `deploy`,
+    `publish`, `release`, `upload` or `push`, and except `-C`, `-f` and dry
+    runs;
+  - `npm`/`pnpm`/`yarn`/`bun` `test`, or `run <script>` with the same
+    exceptions for the script name; `bun test`;
+  - `go test|vet|build`, `cargo test|check|build|clippy|nextest`,
+    `mvn`/`mvnw` with a `test` or `verify` goal, `gradle`/`gradlew` with a
+    `test`, `check` or `build` task (not `install`/`publish`/`deploy` tasks,
+    not with tests skipped), `dotnet test|build`, `deno test`,
+    `swift test|build`, `mix test`;
+  - any of these reached through `uv run`, `uvx`, `poetry run`, `pipenv run`,
+    `pdm run`, `bundle exec`, `npx` or `bunx`;
+  - a script inside the workspace, run directly (`./run_tests.sh`,
+    `bin/test`) or by `python`, `sh` or `bash`.
+
+  Everything else is refused: file viewers and text utilities (`cat`, `sed`,
+  `head`, `tail`, `less`, `grep`, `rg`, `awk`, `wc`, `ls`, `find`, `stat`,
+  `file`, `diff`, `git`, ...), package managers, `xargs`, an absolute-path
+  program or argument outside the workspace, and a runner in a mode that runs
+  no tests (`--help`, `--collect-only`, `make -n`, ...). The denylist below is
+  a second layer.
 - **Isolation.** Each command runs as a direct argv (no shell) in a fresh copy
-  of the workspace, with the verify gate's scrubbed environment and
-  `execution.verify_command_timeout_seconds`. `.git` and caches are not copied;
-  `.venv`, `venv`, `node_modules`, `.tox` and `.nox` are linked, not copied. A
-  workspace over 50,000 files or 1 GiB is not replayed. Absolute workspace
-  paths in the command point at the copy. Network access is denied with
-  `sandbox-exec` on macOS (loopback allowed) or an unprivileged network
-  namespace on Linux; where neither works the run is recorded as not
-  network-isolated (`network_isolated=False`, and the transcript note says
-  "network not isolated").
-- **Success.** Exit 0, no timeout, and no change to or deletion of a
-  pre-existing file (SHA-256 of every file before and after, outside build
-  outputs, caches and dependency directories). A non-zero exit, a timeout, or
-  a mutation leaves the claim unsupported.
-- **Linkage.** A claim is corroborated by a successful replay when the claim
-  equals or contains the command (whitespace-normalized, at word boundaries),
-  or when the claim, minus a trailing `(N tests)` count, is one test target
-  that appears verbatim as an argument of the command. For example
-  `migrations (578 tests)` is linked to `python tests/runtests.py migrations`.
-  Nothing looser is matched.
+  of the workspace, with the verify gate's scrubbed environment plus
+  `PYTHONDONTWRITEBYTECODE=1`, and `execution.verify_command_timeout_seconds`.
+  `.git` and caches are not copied; `.venv`, `venv`, `node_modules`, `.tox`
+  and `.nox` are linked, not copied. A workspace over 50,000 files or 1 GiB is
+  not replayed. Absolute workspace paths in the command point at the copy.
+- **Network.** Network access must be denied: `sandbox-exec` on macOS
+  (loopback allowed), an unprivileged network namespace on Linux, or a Linux
+  process that already has only a loopback interface (a container started
+  with `--network none`). Where none of these works, nothing is replayed, the
+  claims keep the transcript-only rules, and the observation records
+  `replay_skipped: network_isolation_unavailable`.
+- **Live paths.** The copy reaches live paths through its links: the linked
+  dependency trees and the targets of copied symlinks. On macOS the sandbox
+  denies writes to them and to the live workspace. Elsewhere their metadata
+  (type, size, mtime and ctime of every entry) is fingerprinted before and
+  after the run, and any change marks it `mutated`; a tree over 250,000
+  entries is not replayed. Writes to other absolute paths outside the copy are
+  not confined.
+- **Success.** Exit 0, no timeout, the transcript's recorded exit (when it
+  recorded one) equal to the replay's, and no change to or deletion of a
+  pre-existing file (SHA-256 of every file in the copy before and after,
+  outside build outputs, caches and dependency directories) or of a live
+  linked path. Anything else leaves the claim unsupported.
+- **Linkage.** A claim is corroborated by a successful replay only when the
+  whitespace-normalized claim:
+  - equals the transcript command or its replayed core;
+  - equals one of them plus one trailing parenthetical annotation
+    (`make test (12 passed)`); or
+  - minus a trailing `(N tests)` count, is one test target that is a
+    positional operand (not an option value) of a test runner that executes
+    it (pytest, unittest, Django-style runners, `bin/test`, jest, vitest,
+    mocha, rspec, `go test`, phpunit), with no option that excludes or
+    narrows the tests (`--ignore`, `--deselect`, `-k`, `-m`, `--exclude*`,
+    `--tag`, `--start-after`, ...). For example `migrations (578 tests)` is
+    linked to `python tests/runtests.py migrations`, and `tests/test_x.py` is
+    not linked to `sed -n 1,40p tests/test_x.py` or to
+    `pytest --ignore tests/test_x.py`.
+
+  A claim that merely contains a command (`make` inside `make test`) is not
+  linked to it. The runner-output rules apply to a replayed run only under the
+  same conditions: no excluding option, and a claimed file named in the
+  command must be one of its executed operands.
 - **Output filters.** `CMD | tail ...`, `CMD 2>&1 | grep ...` and chains of
-  pure output filters (`tail`, `head`, `grep`, `egrep`, `fgrep`, `sed`, `cat`,
+  output filters (`tail`, `head`, `grep`, `egrep`, `fgrep`, `sed`, `cat`,
   `cut`, `sort`, `uniq`, `wc`, `tr`) replay `CMD` alone and use `CMD`'s own
-  exit status. Any other shell construct (`||`, `;`, `&&` other than a leading
-  `cd <relative-dir> &&`, redirection to a file, substitution, `tee`, a pipe
-  into a program) is not replayed.
+  exit status. The filters are never run. Any other shell construct (`||`,
+  `;`, `&&` other than a leading `cd <relative-dir> &&`, redirection to a
+  file, substitution, `tee`, a pipe into a program) is not replayed.
 - **Denylist.** Commands that escalate privilege, reach the network or other
   hosts, drive containers, delete files, write to version control, or install
   packages (`sudo`, `ssh`, `curl`, `wget`, `docker`, `rm`, `git` other than
-  read-only subcommands, `pip install`, `npm install`, `uv add`, `brew`, ...)
-  and inline shell programs (`bash -c`) are never replayed. Their claims keep
-  the transcript-only rules.
+  read-only subcommands, `pip install`, `npm install`, `uv add`, `brew`,
+  `twine`, `gh`, ...) and inline shell programs (`bash -c`) are never
+  replayed, whatever the allowlist says.
 
 A claim that no successful replay backs falls through to the transcript-only
 rules and failure classes below, unchanged.
