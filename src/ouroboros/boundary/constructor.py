@@ -38,6 +38,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ouroboros.boundary.constructor_session import disable_session_persistence
 from ouroboros.boundary.incremental import construct_pieces, merge_pieces
 from ouroboros.boundary.oracle import is_oracle_file
 from ouroboros.boundary.oracle_build import assemble_package, build_oracle_spec
@@ -434,6 +435,10 @@ class CheckConstructor:
 
             from ouroboros.orchestrator.runtime_factory import preflight_agent_runtime
 
+            # The reply holds every held-out case: no session may reach disk.
+            refusal = disable_session_persistence(runtime)
+            if refusal is not None:
+                return failed(refusal)
             blocker = preflight_agent_runtime(runtime)
             if blocker is not None:
                 return failed(f"constructor_runtime_unavailable:{blocker}")

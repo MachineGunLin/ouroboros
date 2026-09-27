@@ -58,6 +58,10 @@ def _reply() -> str:
 
 
 class FakeRuntime:
+    # A Codex-like runtime: the constructor switches it to ``--ephemeral``.
+    _runtime_backend = "codex"
+    _exec_session_flags: tuple[str, ...] = ()
+
     def __init__(self, reply: str, *, delay: float = 0.0, write_to: Path | None = None) -> None:
         self.reply = reply
         self.delay = delay

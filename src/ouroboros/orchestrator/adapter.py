@@ -1149,6 +1149,9 @@ class ClaudeAgentAdapter:
     _runtime_handle_backend = "claude"
     _runtime_backend = "claude"
     _provider_name = "claude"
+    #: Extra Claude Code CLI flags for every call as ``(flag, value)`` pairs, for
+    #: example ``(("no-session-persistence", None),)`` to keep no transcript on disk.
+    _session_cli_args: tuple[tuple[str, str | None], ...] = ()
 
     #: This adapter runs its own shared RPM/TPM bucket
     #: (:meth:`_build_rate_limit_bucket`), so the parallel executor must NOT add a
@@ -1654,6 +1657,9 @@ class ClaudeAgentAdapter:
 
                 if self._cli_path:
                     options_kwargs["cli_path"] = self._cli_path
+
+                if self._session_cli_args:
+                    options_kwargs["extra_args"] = dict(self._session_cli_args)
 
                 if system_prompt:
                     options_kwargs["system_prompt"] = system_prompt

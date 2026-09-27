@@ -59,6 +59,10 @@ FULL = {
 
 
 class _Runtime:
+    # A Codex-like runtime: the constructor switches it to ``--ephemeral``.
+    _runtime_backend = "codex"
+    _exec_session_flags: tuple[str, ...] = ()
+
     def __init__(self, delays: dict[int, float]) -> None:
         self.delays = delays
         self.prompts: list[str] = []

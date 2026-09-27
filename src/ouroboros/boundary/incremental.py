@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ouroboros.boundary.constructor_session import disable_session_persistence
 from ouroboros.boundary.package import CheckPackageError, sha256_bytes
 
 if TYPE_CHECKING:
@@ -186,12 +187,14 @@ async def construct_pieces(
             resolver = getattr(constructor, "_resolved_generator", None)
             label = resolver(runtime) if resolver is not None else constructor.generator
             digest = input_digest_for(prompt, label)
-            blocker = preflight_agent_runtime(runtime)
-            if blocker is not None:
+            # The reply holds every held-out case: no session may reach disk.
+            refusal = disable_session_persistence(runtime)
+            blocker = preflight_agent_runtime(runtime) if refusal is None else None
+            if refusal is not None or blocker is not None:
                 return CriterionPiece(
                     number,
                     "failed",
-                    reason=f"constructor_runtime_unavailable:{blocker}",
+                    reason=refusal or f"constructor_runtime_unavailable:{blocker}",
                     input_digest=digest,
                     generator=label,
                 )
