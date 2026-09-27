@@ -98,9 +98,15 @@ the default) and the leaf held Bash authority. The rules:
   `head`, `tail`, `less`, `grep`, `rg`, `awk`, `wc`, `ls`, `find`, `stat`,
   `file`, `diff`, `git`, ...), package managers, `xargs`, an absolute-path
   program or argument outside the workspace, an environment assignment in
-  the command naming an absolute path outside the workspace (`PATH=/tmp/x`),
-  `uv run --env-file`, and a runner in a mode that runs no tests
-  (`--help`, `--collect-only`, `make -n`, ...). One exception: an absolute-path program whose name is an
+  the command (leading, or consumed by an `env` wrapper such as
+  `timeout 60 env PATH=/tmp/x pytest`) naming an absolute path outside the
+  workspace, `uv run --env-file`, and a runner in a mode that runs no tests
+  (`--help`, `--collect-only`, `make -n`, ...). A workspace file named like an
+  interpreter or a test runner (`./python`, `./pytest`) is that program only
+  inside an environment's `bin` directory (`.venv/bin/pytest`,
+  `node_modules/.bin/jest`); elsewhere an interpreter name is refused and a
+  runner name is replayed as a plain script, whose operands are never test
+  targets. One exception: an absolute-path program whose name is an
   allowlisted interpreter or runner (`python3.9`, `pytest`, `make`, ...) is
   admitted when its real path, symlinks resolved, lies inside a known
   environment root: `sys.prefix` or `sys.base_prefix` of the verifying

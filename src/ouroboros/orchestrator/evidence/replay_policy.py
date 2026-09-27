@@ -633,6 +633,15 @@ def peel_wrappers(argv: Sequence[str]) -> tuple[str, ...] | None:
     return None
 
 
+def _environment_bin_path(program: str) -> bool:
+    """Return True when ``program``'s parent directory is an environment's
+    ``bin`` (``Scripts`` on Windows) or ``node_modules/.bin``."""
+    parts = PurePosixPath(program.replace("\\", "/")).parts
+    if len(parts) < 3:
+        return False
+    return parts[-2] in {"bin", "Scripts"} or parts[-3:-1] == ("node_modules", ".bin")
+
+
 def _denied_task_name(name: str) -> bool:
     return any(word in _DENIED_TASK_WORDS for word in _TASK_WORD_SPLIT_RE.split(name.lower()))
 
@@ -812,10 +821,18 @@ def _resolve(
             if _environment_program(program, roots):
                 return _runner(name, peeled, workspace, cwd_relative)
             return None
+        interpreter = _is_python_executable(name) or name in _SHELL_INTERPRETERS
+        if (interpreter or name in _DIRECT_RUNNERS) and not _environment_bin_path(program):
+            # A workspace file named like an interpreter or a test runner
+            # (``./pytest``) is that program only inside an environment's
+            # ``bin`` directory (``.venv/bin/pytest``, ``node_modules/.bin/jest``);
+            # elsewhere an interpreter name is refused and a runner name is a
+            # plain script, whose operands are never test targets.
+            return None if interpreter else ResolvedRunner("script", peeled[1:])
         resolved = _runner(name, peeled, workspace, cwd_relative)
         if resolved is not None:
             return resolved
-        if _is_python_executable(name) or name in _SHELL_INTERPRETERS:
+        if interpreter:
             return None
         script = _project_test_runner_script(list(peeled))
         if script is None:

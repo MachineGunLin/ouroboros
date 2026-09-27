@@ -92,6 +92,7 @@ from ouroboros.orchestrator.evidence.harness_observation import (
 from ouroboros.orchestrator.evidence.replay_policy import (
     NARROWING_ENVIRONMENT,
     claim_target_operands,
+    command_line_assignments,
     outside_known_roots,
     peel_wrappers,
     replay_allowed,
@@ -384,9 +385,10 @@ def replay_admissible(
     """Return True when the allowlist admits ``candidate`` and the denylist does not refuse it.
 
     ``environment`` is the replay environment (the process environment when
-    None). An environment assignment in the command whose value names an
-    absolute path outside the workspace and the environment roots (for
-    example ``PATH=/tmp/elsewhere``) is refused as well.
+    None). An environment assignment in the command, leading or consumed by
+    an ``env`` wrapper, whose value names an absolute path outside the
+    workspace and the environment roots (for example ``PATH=/tmp/elsewhere``)
+    is refused as well.
     """
     if replay_denied(candidate.argv) or not replay_allowed(
         candidate.argv,
@@ -395,9 +397,13 @@ def replay_admissible(
         environment=environment,
     ):
         return False
+    values = [
+        *candidate.env_delta.values(),
+        *(token.partition("=")[2] for token in command_line_assignments(candidate.argv)),
+    ]
     return not any(
         outside_known_roots(part, workspace=workspace, environment=environment)
-        for value in candidate.env_delta.values()
+        for value in values
         for part in value.split(os.pathsep)
     )
 

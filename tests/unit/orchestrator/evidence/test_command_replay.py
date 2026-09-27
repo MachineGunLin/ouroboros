@@ -40,8 +40,10 @@ from ouroboros.orchestrator.evidence.harness_observation import (
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
     VIEWER_PROGRAMS,
+    ResolvedRunner,
     claim_target_operands,
     replay_allowed,
+    resolve_replay_program,
 )
 from ouroboros.orchestrator.evidence.verification import (
     _verify_atomic_evidence_against_runtime_messages,
@@ -757,6 +759,8 @@ class TestClaimLinkage:
             ("migrations", "python tests/runtests.py --tag slow migrations"),
             ("migrations", "python tests/runtests.py -k writer migrations"),
             ("migrations", "python tests/runtests.py --exclude-tag=slow migrations"),
+            # Review R2-R2: a workspace file named like a runner is a plain script.
+            ("tests/test_bad.py", "./pytest tests/test_bad.py"),
         ],
     )
     def test_not_linked(self, claim: str, command: str) -> None:
@@ -1530,3 +1534,48 @@ class TestConfigurationNarrowing:
         assert not replay_allowed(
             ("uv", "run", "--env-file", ".env", "pytest"), workspace=str(workspace)
         )
+
+
+class TestReviewRoundTwoMinors:
+    """Round-2 minor R2-R2."""
+
+    def test_env_wrapper_assignment_outside_the_roots_is_refused(self, tmp_path: Path) -> None:
+        # R2-R2: assignments consumed by an ``env`` wrapper get the same check
+        # as leading ones.
+        workspace = _workspace(tmp_path / "ws")
+        evil = tmp_path / "evil"
+        for command, admitted in (
+            ("timeout 60 env FOO=1 make test", True),
+            (f"timeout 60 env PATH={evil} make test", False),
+            (f"nice env PYTHONPATH={evil} make test", False),
+            (f"uv run env PATH={evil} pytest", False),
+        ):
+            candidate = replay_candidate(command, str(workspace))
+            assert candidate is not None
+            assert (
+                command_replay.replay_admissible(
+                    candidate, str(workspace), {"PATH": "/usr/bin:/bin"}
+                )
+                is admitted
+            ), command
+
+    def test_workspace_file_named_like_a_runner_is_a_plain_script(self, tmp_path: Path) -> None:
+        # R2-R2: ``./pytest`` is replayed as a script, never as pytest, and a
+        # workspace ``./python`` is not an interpreter.
+        workspace = _workspace(tmp_path / "ws")
+        _executable(workspace / "pytest", "#!/bin/sh\nexit 0\n")
+        _executable(workspace / "python", "#!/bin/sh\nexit 0\n")
+        (workspace / ".venv" / "bin").mkdir(parents=True)
+        _executable(workspace / ".venv" / "bin" / "pytest", "#!/bin/sh\nexit 0\n")
+        ws = str(workspace)
+
+        assert resolve_replay_program(("./pytest", "tests/x.py"), workspace=ws) == (
+            ResolvedRunner("script", ("tests/x.py",))
+        )
+        assert resolve_replay_program(("./python", "-m", "pytest"), workspace=ws) is None
+        assert resolve_replay_program((".venv/bin/pytest", "tests/x.py"), workspace=ws) == (
+            ResolvedRunner("pytest", ("tests/x.py",))
+        )
+        assert claim_target_operands(("./pytest", "tests/x.py")) == frozenset()
+        assert claim_target_operands((".venv/bin/pytest", "tests/x.py")) == {"tests/x.py"}
+        assert claim_target_operands(("node_modules/.bin/jest", "a.test.js")) == {"a.test.js"}
