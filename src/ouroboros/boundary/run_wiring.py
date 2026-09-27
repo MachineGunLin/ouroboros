@@ -437,7 +437,7 @@ async def prepare_check_package(
         # A late binding is validated against the base after the worker has
         # stopped; keep the base outside every checkout until then.
         snapshot = snapshot_base(base, store)
-    return BoundaryRunState(
+    state = BoundaryRunState(
         execution_id=execution_id,
         boundary_id=bound,
         versions=tuple(versions),
@@ -454,6 +454,28 @@ async def prepare_check_package(
         base_manifest_path=snapshot[1] if snapshot else None,
         commitments=tuple(commitments),
     )
+    if state.admitted:
+        _LIVE_STATES[execution_id] = state
+    return state
+
+
+# The admitted boundary of each run still in progress in this process, with
+# its held-out cases. A run resumed in the same process (its controller task
+# died, the process did not) re-derives the full package decision from here;
+# a run resumed in another process finds nothing and decides on the visible
+# cases only (``boundary/resume.py``). Dropped at the run's final verdict.
+_LIVE_STATES: dict[str, BoundaryRunState] = {}
+
+
+def live_state(execution_id: str) -> BoundaryRunState | None:
+    """The in-memory boundary state of ``execution_id`` in this process, if any."""
+    return _LIVE_STATES.get(execution_id)
+
+
+def forget_live_state(state: BoundaryRunState | None) -> None:
+    """Drop ``state`` from the in-process registry (after the final verdict)."""
+    if state is not None and _LIVE_STATES.get(state.execution_id) is state:
+        del _LIVE_STATES[state.execution_id]
 
 
 def persist_commitment_salts(state: BoundaryRunState) -> list[Path]:

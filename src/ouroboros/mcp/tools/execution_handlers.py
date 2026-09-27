@@ -1817,6 +1817,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                             )
 
                         if _resume_existing:
+                            await check_package.prepare_resumed(_tracker.execution_id)
                             result = await _runner.resume_session(_tracker.session_id, _seed)
                         else:
                             await check_package.prepare_bound(_seed, _tracker.execution_id)

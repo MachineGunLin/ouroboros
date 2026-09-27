@@ -36,6 +36,7 @@ from typing import Any
 from ouroboros.boundary.admission import AdmissionResult, CandidateVerification
 from ouroboros.boundary.events import (
     ACCEPTANCE_RECONCILED,
+    ACCEPTANCE_RESUMED,
     ACTOR_STARTED,
     ADMISSION_COMPLETED,
     BINDING_RECORDED,
@@ -48,6 +49,7 @@ from ouroboros.boundary.events import (
     SELECTION_DECIDED,
     SUPERSEDED,
     acceptance_reconciled_event,
+    acceptance_resumed_event,
     actor_started_event,
     admission_completed_event,
     binding_recorded_event,
@@ -459,6 +461,37 @@ class BoundaryLedger:
         await self._store.append(event)
         return event
 
+    async def record_acceptance_resumed(
+        self, boundary_id: str, *, package_sha256: str, payload: dict[str, Any]
+    ) -> BaseEvent:
+        """Record a resumed run's recomputed package decision (one per resume).
+
+        Refused unless the frozen, admitted package is cited and a worker was
+        started on this boundary. The recomputation may run a visible-only
+        package, which has another digest; it therefore cites the frozen
+        reference here instead of recording a candidate verification.
+        """
+        events = await self.events(boundary_id)
+        frozen = _first(events, PACKAGE_FROZEN)
+        if frozen is None or _ref(frozen) != package_sha256:
+            raise BoundaryOrderError(
+                "a resumed decision must cite the boundary's frozen package",
+                details={"boundary_id": boundary_id},
+            )
+        if _first(events, ADMISSION_COMPLETED) is None or _first(events, ACTOR_STARTED) is None:
+            raise BoundaryOrderError(
+                "a resumed decision needs an admitted package and a started worker",
+                details={"boundary_id": boundary_id},
+            )
+        event = acceptance_resumed_event(
+            boundary_id,
+            package_sha256=package_sha256,
+            committed=_committed(frozen),
+            payload=payload,
+        )
+        await self._store.append(event)
+        return event
+
     async def record_legacy_fallback(self, boundary_id: str, *, reason: str) -> BaseEvent:
         """Record, once, that the legacy verifier decided a run whose worker started."""
         events = await self.events(boundary_id)
@@ -507,7 +540,7 @@ def verify_boundary_order(events: Sequence[BaseEvent]) -> tuple[str, ...]:
                 not admissions or position[id(admissions[0])] > position[id(event)]
             ):
                 violations.append("actor started before admission")
-        if event.type == BINDING_RECORDED:
+        if event.type in {BINDING_RECORDED, ACCEPTANCE_RESUMED}:
             if frozen_sha is None or _ref(event) != frozen_sha:
                 violations.append(f"{event.type} does not cite the frozen package")
             started = [e for e in events if e.type == ACTOR_STARTED]

@@ -386,10 +386,10 @@ def checkpoint_outcome(result: ACExecutionResult) -> str:
 
     With the check package on, the legacy verifier's rejection is advisory
     (``legacy_rejection``, on the result or on a sub-AC of a decomposed root)
-    and the package decides after the worker stops. A run resumed in another
-    process has no package (held-out cases are never persisted), so there
-    the legacy verdict decides: work the legacy verifier rejected is
-    checkpointed as failed and is never restored as succeeded.
+    and the package decides after the worker stops. A resumed run recomputes
+    the package decision (``boundary/resume.py``); work the legacy verifier
+    rejected is still checkpointed as failed, so it is never restored as
+    succeeded whatever the resumed run can decide.
     """
     if result.outcome is not None:
         outcome = result.outcome.value

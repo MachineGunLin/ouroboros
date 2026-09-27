@@ -9,6 +9,11 @@ status is persisted, and afterwards renders the outcome and the enumerated
 With the arm ``off`` nothing here calls a model, writes an event, or touches
 the runner: the run is the legacy run. The legacy failure-class dimensions are
 still derived (read-only) so the ``off`` arm is a baseline.
+
+On resume the arm is read from the journal, not resolved again: when the
+original run bound its worker to an admitted package, the resumed run
+recomputes the package decision (``boundary/resume.py``) instead of letting
+the legacy verifier decide the covered criteria.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import structlog
 
 from ouroboros.boundary.authority import CheckPackageAuthority, reveal_commitment_salts
 from ouroboros.boundary.ledger import BoundaryOrderError
+from ouroboros.boundary.resume import ResumedCheckPackageAuthority, load_resumed_boundary
 from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
 from ouroboros.boundary.run_wiring import (
     BoundaryRunState,
@@ -151,6 +157,7 @@ class CheckPackageRun:
     attempted: bool = False
     skipped_reason: str | None = None
     preparation_error: str | None = None
+    resumed: ResumedCheckPackageAuthority | None = None
     _binding: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -195,6 +202,8 @@ class CheckPackageRun:
         Any other preparation error is recorded and the run continues under
         the legacy verifier.
         """
+        if resume and execution_id:
+            return await self._prepare_resume(runner, event_store, execution_id, worker_dir)
         if not self.enabled:
             return []
         if resume or not execution_id:
@@ -252,6 +261,29 @@ class CheckPackageRun:
         runner.acceptance_authority = self.authority
         return [*lines, *render_preparation(state)]
 
+    async def _prepare_resume(
+        self, runner: Any, event_store: EventStore, execution_id: str, worker_dir: Path
+    ) -> list[str]:
+        """Install the resumed authority when the original run was bound to a package."""
+        self.skipped_reason = "resume"
+        try:
+            boundary = await load_resumed_boundary(event_store, execution_id)
+        except Exception as exc:  # noqa: BLE001 - reading the journal must not fail the run
+            log.warning("boundary.run_control.resume_unreadable", error_type=type(exc).__name__)
+            return [f"Check package state could not be read on resume ({type(exc).__name__})."]
+        if boundary is None:
+            if not self.enabled:
+                return []
+            return ["Check package is not applied on resume: no admitted package was bound."]
+        self.resumed = ResumedCheckPackageAuthority(
+            boundary, self.settings, event_store=event_store, candidate_checkout=worker_dir
+        )
+        runner.acceptance_authority = self.resumed
+        return [
+            "Check package: resumed run; the package decision is recomputed on the workspace "
+            f"({'held-out cases in memory' if boundary.source == 'memory' else 'visible cases only'})."
+        ]
+
     # ------------------------------------------------------------------
     # Compact entry points for the MCP ``execute_seed`` handler
 
@@ -286,6 +318,15 @@ class CheckPackageRun:
         for line in lines:
             log.info("boundary.run_control.prepared", execution_id=execution_id, line=line)
 
+    async def prepare_resumed(self, execution_id: str) -> None:
+        """``prepare`` for a resumed run with the bound context; lines go to the log."""
+        binding = self._binding
+        lines = await self._prepare_resume(
+            binding["runner"], binding["event_store"], execution_id, binding["worker_dir"]
+        )
+        for line in lines:
+            log.info("boundary.run_control.resumed", execution_id=execution_id, line=line)
+
     async def meta_for(self, tracker: Any, session_status: Any) -> dict[str, str]:
         """``outcome_meta`` for a finished MCP run; empty while it is still running."""
         status = getattr(session_status, "value", None)
@@ -318,6 +359,8 @@ class CheckPackageRun:
 
     def render_outcome(self) -> list[str]:
         """Lines describing what the package decided (empty when it did not run)."""
+        if self.resumed is not None:
+            return self.resumed.render()
         if self.authority is None:
             if self.state is not None and not self.state.admitted:
                 return [unavailable_line(self.state)]

@@ -81,6 +81,7 @@ from ouroboros.boundary.run_wiring import (
     CheckPackageSettings,
     _base_manifest,
     _counterexamples,
+    forget_live_state,
     persist_commitment_salts,
     plan_repair,
     verify_check_package,
@@ -711,9 +712,14 @@ class CheckPackageAuthority:
 
 
 def reveal_commitment_salts(state: BoundaryRunState | None) -> None:
-    """``persist_commitment_salts`` after the final verdict; never raises into the run."""
+    """``persist_commitment_salts`` after the final verdict; never raises into the run.
+
+    The run's in-process registry entry (``run_wiring.live_state``) is dropped
+    too: after the verdict nothing re-derives the held-out cases from memory.
+    """
     if state is None:
         return
+    forget_live_state(state)
     try:
         persist_commitment_salts(state)
     except Exception as exc:  # noqa: BLE001 - an unwritten salt only loses auditability

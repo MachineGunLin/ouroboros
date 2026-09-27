@@ -17,6 +17,9 @@ Event Types (aggregate_type ``boundary``, aggregate_id = boundary id):
     boundary.acceptance.legacy_fallback - the package could not decide the
         run (for example the acceptance authority raised); the legacy
         verifier's verdicts were restored and decided it (reason only)
+    boundary.acceptance.resumed - a run resumed after its controller died:
+        the package decision recomputed on the current workspace (visible
+        cases only when the held-out cases were lost with the controller)
 
 Payloads never carry generated file contents, check argv, or check output, so
 the shared journal does not expose check code or counterexamples. The package
@@ -46,6 +49,7 @@ ACCEPTANCE_RECONCILED = "boundary.acceptance.reconciled"
 BINDING_RECORDED = "boundary.binding.recorded"
 CASE_REVEALED = "boundary.oracle.case_revealed"
 LEGACY_FALLBACK = "boundary.acceptance.legacy_fallback"
+ACCEPTANCE_RESUMED = "boundary.acceptance.resumed"
 
 
 def _event(boundary_id: str, event_type: str, data: dict[str, Any]) -> BaseEvent:
@@ -201,3 +205,12 @@ def case_revealed_event(
 def legacy_fallback_event(boundary_id: str, *, reason: str) -> BaseEvent:
     """The legacy verifier decided this run because the package could not."""
     return _event(boundary_id, LEGACY_FALLBACK, {"reason": reason})
+
+
+def acceptance_resumed_event(
+    boundary_id: str, *, package_sha256: str, committed: bool, payload: dict[str, Any]
+) -> BaseEvent:
+    """The package decision a resumed run recomputed (statuses and reasons, no case values)."""
+    return _event(
+        boundary_id, ACCEPTANCE_RESUMED, {**cite(package_sha256, committed=committed), **payload}
+    )
