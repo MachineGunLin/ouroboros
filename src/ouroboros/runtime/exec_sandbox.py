@@ -99,9 +99,19 @@ environment is still built the same way). ``enabled`` defaults to ``True``.
 This module never reads configuration: the caller owns where its policy comes
 from, keeps it fixed for the life of its run, and records it.
 
+Precondition: the caller owns its writable roots for the life of the
+command (for example, directories under a private ``mkdtemp``). The sandbox
+confines the command, not other processes: the roots are verified at
+activation (identity, no hard-linked file anywhere beneath them) and the
+command cannot create an alias to an outside file itself, but a different,
+unconfined process of the same user that links an outside file into a root
+while the command runs is outside the boundary. Such a process already holds
+the authority to change that file directly.
+
 Outside this boundary: effects the confined process asks another, unconfined
 process to perform over IPC (a user service manager, a desktop automation
-service, a container daemon), and reads of anything the user can read.
+service, a container daemon), changes other unconfined processes make to the
+roots while the command runs, and reads of anything the user can read.
 """
 
 from __future__ import annotations
