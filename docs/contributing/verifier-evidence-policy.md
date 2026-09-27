@@ -40,7 +40,8 @@ the plain pipeline, which replay supports:
 Replay runs `<test command>` alone and judges its own exit status, so the
 filter cannot mask a failure. A `set -o pipefail && ...` preamble is not
 replayable (`set` is a shell builtin), so claims resting on it keep the
-transcript-only rules.
+transcript-only rules. Those rules recognize `set -o pipefail` alone or with
+`-e`/`-u` beside it (`set -euo pipefail; ...`, `set -e -o pipefail && ...`).
 
 For richer result formats, prefer one of these approaches:
 

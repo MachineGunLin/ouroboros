@@ -949,8 +949,35 @@ def _is_pipefail_preamble(segment: str) -> bool:
     return _is_pipefail_parts(parts)
 
 
+# ``set`` options that may accompany ``pipefail`` in a recognized preamble:
+# each only makes a failure more visible, none prints or runs anything.
+_PIPEFAIL_COMPANION_OPTIONS = frozenset({"pipefail", "errexit", "nounset"})
+_SET_OPTION_CLUSTER_RE = re.compile(r"-[eu]*o?")
+
+
 def _is_pipefail_parts(parts: list[str]) -> bool:
-    return parts == ["set", "-o", "pipefail"]
+    """Return True for a ``set`` that enables pipefail.
+
+    ``set -o pipefail``, and the same with ``-e``/``-u`` or
+    ``-o errexit``/``-o nounset`` beside it, clustered or not
+    (``set -euo pipefail``, ``set -e -o pipefail``). Any other option is not
+    recognized.
+    """
+    if len(parts) < 3 or parts[0] != "set":
+        return False
+    pipefail = False
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token == "-" or not _SET_OPTION_CLUSTER_RE.fullmatch(token):
+            return False
+        index += 1
+        if token.endswith("o"):
+            if index >= len(parts) or parts[index] not in _PIPEFAIL_COMPANION_OPTIONS:
+                return False
+            pipefail = pipefail or parts[index] == "pipefail"
+            index += 1
+    return pipefail
 
 
 def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:

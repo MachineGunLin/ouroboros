@@ -45,6 +45,9 @@ from ouroboros.orchestrator.evidence.replay_policy import (
     replay_allowed,
     resolve_replay_program,
 )
+from ouroboros.orchestrator.evidence.shell_parsing import (
+    _output_filter_pipeline_is_pipefail_protected,
+)
 from ouroboros.orchestrator.evidence.verification import (
     _verify_atomic_evidence_against_runtime_messages,
 )
@@ -1537,7 +1540,7 @@ class TestConfigurationNarrowing:
 
 
 class TestReviewRoundTwoMinors:
-    """Round-2 minor R2-R2."""
+    """Round-2 minors R2-R2 and R2-R4."""
 
     def test_env_wrapper_assignment_outside_the_roots_is_refused(self, tmp_path: Path) -> None:
         # R2-R2: assignments consumed by an ``env`` wrapper get the same check
@@ -1579,3 +1582,20 @@ class TestReviewRoundTwoMinors:
         assert claim_target_operands(("./pytest", "tests/x.py")) == frozenset()
         assert claim_target_operands((".venv/bin/pytest", "tests/x.py")) == {"tests/x.py"}
         assert claim_target_operands(("node_modules/.bin/jest", "a.test.js")) == {"a.test.js"}
+
+    @pytest.mark.parametrize(
+        ("command", "protected"),
+        [
+            ("set -o pipefail && pytest -q | tail -5", True),
+            ("set -euo pipefail; pytest -q | tail -5", True),
+            ("set -e -o pipefail && pytest -q | tail -5", True),
+            ("set -eu -o nounset -o pipefail && pytest -q | tail -5", True),
+            ("set -eu; pytest -q | tail -5", False),
+            ("set -xo pipefail; pytest -q | tail -5", False),
+            ("set +o pipefail; pytest -q | tail -5", False),
+            ("pytest -q | tail -5", False),
+        ],
+    )
+    def test_set_option_clusters_enable_pipefail(self, command: str, protected: bool) -> None:
+        # R2-R4.
+        assert _output_filter_pipeline_is_pipefail_protected(command) is protected
