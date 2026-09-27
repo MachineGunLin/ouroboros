@@ -683,6 +683,20 @@ else:
 # more, so existing installs see an updated disclosure after a scope change.
 TELEMETRY_NOTICE_VERSION=4
 
+# Whether the notice printed on stdout reached a person: stdout is a
+# terminal and CI is unset or false. Mirrors telemetry.py
+# `_notice_reaches_a_person`; a notice printed into a pipe or a CI log is not
+# recorded as shown, so randomized defaults stay off until a person sees it.
+_telemetry_notice_reaches_a_person() {
+  local ci
+  ci=$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  case "$ci" in
+    "" | 0 | false | no) ;;
+    *) return 1 ;;
+  esac
+  [ -t 1 ]
+}
+
 _telemetry_notice() {
   _telemetry_enabled || return 0
   local f="$HOME/.ouroboros/telemetry.json" tmp id py already_shown
@@ -738,8 +752,15 @@ sys.exit(0 if version >= int(sys.argv[2]) else 1)
 
   # Persist the one-time notice before the first collection attempt. Failure
   # is harmless: this run was disclosed and a later run will disclose again.
+  # `notice_shown` records that the notice was printed; `notice_version`
+  # (what randomized defaults require) is recorded only when a person saw it
+  # (a terminal, outside CI), so a CI or piped install stays out of them.
   id=$(_telemetry_distinct_id) || return 0
   [ -n "$id" ] || return 0
+  local version=""
+  if _telemetry_notice_reaches_a_person; then
+    version="$TELEMETRY_NOTICE_VERSION"
+  fi
   tmp="${f}.notice.$$"
   if [ -n "$py" ]; then
     # Structural set: parses the file, sets the TOP-LEVEL `notice_shown` to
@@ -762,11 +783,17 @@ try:
 except Exception:
     sys.exit(1)
 data["notice_shown"] = True
-data["notice_version"] = int(sys.argv[3])
+if sys.argv[3]:
+    data["notice_version"] = int(sys.argv[3])
 with open(sys.argv[2], "w", encoding="utf-8") as fh:
     json.dump(data, fh)
     fh.write("\n")
-' "$f" "$tmp" "$TELEMETRY_NOTICE_VERSION" 2>/dev/null; then
+' "$f" "$tmp" "$version" 2>/dev/null; then
+      mv "$tmp" "$f" 2>/dev/null || true
+    fi
+  elif [ -z "$version" ]; then
+    if sed -e 's/"notice_shown"[[:space:]]*:[[:space:]]*false/"notice_shown": true/' \
+      "$f" > "$tmp" 2>/dev/null; then
       mv "$tmp" "$f" 2>/dev/null || true
     fi
   elif grep -q '"notice_version"' "$f" 2>/dev/null; then

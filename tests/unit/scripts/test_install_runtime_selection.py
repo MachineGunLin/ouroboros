@@ -1357,8 +1357,11 @@ def _installer_notice_version() -> int:
 
 def test_installer_redisplays_notice_for_state_without_notice_version(tmp_path: Path) -> None:
     """A state written before notice versioning (``notice_shown: true`` and no
-    ``notice_version``) must see the updated notice once, and the installer
-    must record the version it showed so the next run stays quiet."""
+    ``notice_version``) must see the updated notice once. This install's
+    output is captured (no terminal), so the version is not recorded: a
+    person has not been shown the notice yet, and randomized defaults stay
+    off until one is (``test_install_telemetry_notice.py`` covers the
+    terminal case)."""
     state_dir = tmp_path / "home" / ".ouroboros"
     state_dir.mkdir(parents=True)
     state = state_dir / "telemetry.json"
@@ -1380,7 +1383,7 @@ def test_installer_redisplays_notice_for_state_without_notice_version(tmp_path: 
     assert "randomized product defaults" in result.stdout
     final_state = json.loads(state.read_text(encoding="utf-8"))
     assert final_state.get("notice_shown") is True
-    assert final_state.get("notice_version") == _installer_notice_version()
+    assert "notice_version" not in final_state
     assert final_state.get("distinct_id") == top_level_uuid
 
 
@@ -1416,8 +1419,9 @@ def test_installer_skips_notice_at_current_notice_version(tmp_path: Path) -> Non
 )
 def test_installer_notice_version_without_python3(tmp_path: Path, state_text: str) -> None:
     """The NO_PYTHON3 fallback reads and writes ``notice_version`` with sed:
-    an older or missing version shows the notice and records the current
-    version, and a second call then stays quiet."""
+    an older or missing version shows the notice and, when a person saw it
+    (simulated terminal), records the current version, and a second call
+    then stays quiet."""
     home = tmp_path / "home"
     state_dir = home / ".ouroboros"
     state_dir.mkdir(parents=True)
@@ -1435,6 +1439,7 @@ def test_installer_notice_version_without_python3(tmp_path: Path, state_text: st
 BOLD=""
 RESET=""
 _telemetry_enabled() { return 0; }
+_telemetry_notice_reaches_a_person() { return 0; }
 _blank() { :; }
 _say() { printf '%s\\n' "$*"; }
 _info() { printf '%s\\n' "$*"; }
