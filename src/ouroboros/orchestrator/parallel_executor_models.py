@@ -404,6 +404,45 @@ def _legacy_rejected(result: ACExecutionResult) -> bool:
     return bool(result.legacy_rejection) or any(_legacy_rejected(sub) for sub in result.sub_results)
 
 
+# Check-package annotations a Routing D record keeps across resume (R3-A1).
+_CHECK_PACKAGE_FIELDS = ("legacy_rejection", "check_package_repair", "check_package_failure_class")
+_CHECK_PACKAGE_FIELD_CHARS = 20_000
+
+
+def check_package_record(result: ACExecutionResult) -> dict[str, object]:
+    """``{"check_package": {...}}`` for a result carrying arm-on annotations, else ``{}``.
+
+    A gate-passed, legacy-rejected attempt is a provisional success whose
+    ``legacy_rejection`` must survive a resume; otherwise the resumed run
+    restores it as a clean success. Arm off sets none of these fields, so
+    its records keep their earlier bytes.
+    """
+    fields: dict[str, str] = {}
+    for name in _CHECK_PACKAGE_FIELDS:
+        value = getattr(result, name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("check package annotation is malformed")
+        fields[name] = value[:_CHECK_PACKAGE_FIELD_CHARS]
+    return {"check_package": fields} if fields else {}
+
+
+def restore_check_package_record(value: object) -> dict[str, str | None]:
+    """The annotations of a ``check_package_record`` block; fail closed on anything else."""
+    if (
+        not isinstance(value, dict)
+        or not value
+        or not set(value) <= set(_CHECK_PACKAGE_FIELDS)
+        or any(
+            not isinstance(item, str) or not item or len(item) > _CHECK_PACKAGE_FIELD_CHARS
+            for item in value.values()
+        )
+    ):
+        raise RuntimeError("check package annotation is malformed")
+    return {name: value.get(name) for name in _CHECK_PACKAGE_FIELDS}
+
+
 __all__ = [
     "ACExecutionOutcome",
     "ACExecutionResult",
@@ -411,6 +450,8 @@ __all__ = [
     "ParallelExecutionResult",
     "ParallelExecutionStageResult",
     "StageExecutionOutcome",
+    "check_package_record",
     "checkpoint_outcome",
     "collect_decomposition_depth_warning_paths",
+    "restore_check_package_record",
 ]
