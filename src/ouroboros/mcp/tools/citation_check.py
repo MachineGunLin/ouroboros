@@ -19,10 +19,13 @@ the source *supports* the claim stays a synthesis-level judgment.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+import ipaddress
 import json
 import re
+import string
 import time
 from typing import Any
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +41,90 @@ _MAX_URLS = 8
 _MAX_URL_LEN = 2000
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+_SUB_DELIMS = frozenset("!$&'()*+,;=")
+_REG_NAME_CHARS = _UNRESERVED | _SUB_DELIMS
+_PCHAR = _REG_NAME_CHARS | frozenset(":@")
+_HEX = frozenset(string.hexdigits)
+
+
+def _uri_component_is_syntactic(value: str, allowed: frozenset[str]) -> bool:
+    """Recognize URI delimiters, safe IRI characters, and complete percent triplets."""
+    index = 0
+    while index < len(value):
+        if value[index] == "%":
+            if index + 2 >= len(value) or not all(
+                digit in _HEX for digit in value[index + 1 : index + 3]
+            ):
+                return False
+            index += 3
+        elif value[index] in allowed or (
+            ord(value[index]) > 127
+            and not value[index].isspace()
+            and not unicodedata.category(value[index]).startswith("C")
+        ):
+            index += 1
+        else:
+            return False
+    return True
+
+
+def _eligible_http_citation(url: str) -> bool:
+    """Fail closed on malformed URI syntax before URL budgets or fetches."""
+    if len(url) > _MAX_URL_LEN or any(
+        char.isspace() or unicodedata.category(char).startswith("C") for char in url
+    ):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        authority = parsed.netloc
+        if "@" in authority:
+            if authority.count("@") != 1:
+                return False
+            userinfo, authority = authority.split("@", 1)
+            if not _uri_component_is_syntactic(userinfo, _REG_NAME_CHARS | frozenset(":")):
+                return False
+        if authority.startswith("["):
+            closing = authority.find("]")
+            if closing < 0:
+                return False
+            literal = authority[1:closing]
+            if literal[:1].lower() == "v":
+                version, separator, address = literal[1:].partition(".")
+                if (
+                    not separator
+                    or not version
+                    or not set(version) <= _HEX
+                    or not address
+                    or not all(char in _REG_NAME_CHARS or char == ":" for char in address)
+                ):
+                    return False
+            else:
+                ipaddress.IPv6Address(literal)
+            port_suffix = authority[closing + 1 :]
+            if port_suffix and not port_suffix.startswith(":"):
+                return False
+        else:
+            host, separator, port = authority.partition(":")
+            if not host or not _uri_component_is_syntactic(host, _REG_NAME_CHARS):
+                return False
+            if separator and ":" in port:
+                return False
+            port_suffix = separator + port
+        if port_suffix and (len(port_suffix) == 1 or not port_suffix[1:].isdigit()):
+            return False
+        if parsed.hostname is None:
+            return False
+        _ = parsed.port  # urlsplit defers port range validation.
+        return (
+            _uri_component_is_syntactic(parsed.path, _PCHAR | frozenset("/"))
+            and _uri_component_is_syntactic(parsed.query, _PCHAR | frozenset("/?"))
+            and _uri_component_is_syntactic(parsed.fragment, _PCHAR | frozenset("/?"))
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def extract_cited_urls(text: str) -> tuple[str, ...]:
@@ -113,7 +200,7 @@ def audit_citations(
 
     Returns ``{"checked": n, "urls": {url: verdict}, "unverified_present":
     bool}`` where each verdict is one of ``verified`` / ``unreachable`` /
-    ``invalid`` (non-http(s) or oversized URL — never fetched) / ``unchecked``
+    ``invalid`` (malformed, non-http(s), or oversized URL — never fetched) / ``unchecked``
     (budget or count cap reached before this URL's turn). Never raises.
     """
     urls: list[str] = []
@@ -130,26 +217,7 @@ def audit_citations(
     deadline = time.monotonic() + total_budget_seconds
     checked = 0
     for url in urls:
-        # urlparse strips embedded CR/LF/TAB, so reject raw controls first.
-        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
-            verdicts[url] = INVALID
-            continue
-        try:
-            parsed = urllib.parse.urlparse(url)
-            hostname = parsed.hostname
-            # urlparse defers malformed-port errors until this property is read.
-            _ = parsed.port
-            authority = parsed.netloc.rsplit("@", 1)[-1]
-            valid_url = (
-                parsed.scheme in ("http", "https")
-                and hostname is not None
-                and hostname != ""
-                and not any(char.isspace() for char in hostname)
-                and not authority.endswith(":")
-            )
-        except (TypeError, ValueError):
-            valid_url = False
-        if not valid_url or len(url) > _MAX_URL_LEN:
+        if not _eligible_http_citation(url):
             verdicts[url] = INVALID
             continue
         if checked >= max_urls or time.monotonic() >= deadline:

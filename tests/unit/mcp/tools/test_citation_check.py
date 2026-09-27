@@ -115,6 +115,9 @@ def test_malformed_authorities_are_invalid_without_stopping_later_urls() -> None
         "https://bad\nhost.example/doc",
         "https://bad\rhost.example/doc",
         "https://bad\thost.example/doc",
+        "https://bad\x80host.example/doc",
+        "https://%zz.example/doc",
+        "https://ok.example/%zz",
     )
     valid = "https://ok.example/doc"
     calls: list[str] = []
@@ -131,3 +134,38 @@ def test_malformed_authorities_are_invalid_without_stopping_later_urls() -> None
     assert audit["urls"][valid] == VERIFIED
     assert audit["checked"] == 1
     assert calls == [valid]
+
+
+def test_malformed_urls_do_not_consume_the_valid_url_limit() -> None:
+    malformed = [f"https://%z{index}.example/doc" for index in range(8)]
+    valid = "https://ok.example/a%20b?q=ok"
+    calls: list[str] = []
+
+    def fetch(url: str, _timeout: float) -> bool:
+        calls.append(url)
+        return True
+
+    text = "```json\n" + json.dumps({"external_sources": [*malformed, valid]}) + "\n```"
+    audit = audit_citations([text], fetch=fetch, max_urls=8)
+
+    assert audit is not None
+    assert all(audit["urls"][url] == INVALID for url in malformed)
+    assert audit["urls"][valid] == VERIFIED
+    assert audit["checked"] == 1
+    assert calls == [valid]
+
+
+def test_internationalized_and_ipvfuture_urls_remain_auditable() -> None:
+    urls = ("https://bücher.example/über", "https://[v1.fe80]/doc")
+    calls: list[str] = []
+
+    def fetch(candidate: str, _timeout: float) -> bool:
+        calls.append(candidate)
+        return True
+
+    text = "```json\n" + json.dumps({"external_sources": urls}, ensure_ascii=False) + "\n```"
+    audit = audit_citations([text], fetch=fetch)
+
+    assert audit is not None
+    assert all(audit["urls"][url] == VERIFIED for url in urls)
+    assert calls == list(urls)
