@@ -1,4 +1,4 @@
-"""Review round 3 (R3-R1, R3-R4): configuration that changes what a run
+"""Review round 3 (R3-R1, R3-R3, R3-R4): configuration that changes what a run
 imports or selects never lets that run back a test-target claim.
 
 A command that assigns ``PYTHONPATH``, ``DJANGO_SETTINGS_MODULE``,
@@ -27,6 +27,9 @@ from ouroboros.orchestrator.evidence.replay_policy import (
     claim_target_operands,
     excludes_tests,
     narrowing_variable,
+)
+from ouroboros.orchestrator.evidence.shell_parsing import (
+    _output_filter_pipeline_is_pipefail_protected,
 )
 from tests.unit.orchestrator.evidence.test_command_replay import (
     DJANGO_WRITER_CLAIM,
@@ -440,3 +443,17 @@ class TestEndToEnd:
             "NODE_OPTIONS",
             "PYTHONPATH",
         )
+
+
+@pytest.mark.parametrize(
+    ("command", "protected"),
+    [
+        ("set -o pipefail; set +o pipefail; pytest | tail -5", False),
+        ("set -o pipefail && set +euo pipefail && pytest | tail -5", False),
+        ("set -o pipefail; pytest | tail -5", True),
+        ("set +o pipefail; set -o pipefail; pytest | tail -5", True),
+    ],
+)
+def test_a_later_set_plus_o_pipefail_removes_the_protection(command: str, protected: bool) -> None:
+    # R3-R3.
+    assert _output_filter_pipeline_is_pipefail_protected(command) is protected

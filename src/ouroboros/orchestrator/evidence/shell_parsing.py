@@ -915,7 +915,11 @@ def _has_trailing_output_filter_pipeline(command: str) -> bool:
 
 
 def _output_filter_pipeline_is_pipefail_protected(command: str) -> bool:
-    """Return True when pipefail is enabled before the first stripped pipeline."""
+    """Return True when pipefail is enabled before the first stripped pipeline.
+
+    A later ``set`` that names ``pipefail`` without enabling it
+    (``set +o pipefail``) turns the protection off again.
+    """
     pipefail_enabled = False
     for segment in re.split(r"\s*(?:&&|;)\s*", command.strip()):
         normalized_segment = segment.strip()
@@ -923,6 +927,9 @@ def _output_filter_pipeline_is_pipefail_protected(command: str) -> bool:
             continue
         if _is_pipefail_preamble(normalized_segment):
             pipefail_enabled = True
+            continue
+        if _may_disable_pipefail(normalized_segment):
+            pipefail_enabled = False
             continue
         if _has_trailing_output_filter_pipeline(normalized_segment):
             return pipefail_enabled
@@ -939,6 +946,16 @@ def _uses_pipefail(command: str) -> bool:
         if _is_pipefail_parts(parts):
             return True
     return False
+
+
+def _may_disable_pipefail(segment: str) -> bool:
+    """Return True for a ``set`` naming ``pipefail`` that does not enable it
+    (``set +o pipefail``, ``set +euo pipefail``, unparseable text)."""
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return "pipefail" in segment
+    return bool(parts) and parts[0] == "set" and "pipefail" in parts
 
 
 def _is_pipefail_preamble(segment: str) -> bool:
