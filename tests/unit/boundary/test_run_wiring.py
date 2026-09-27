@@ -356,9 +356,12 @@ async def test_product_regeneration_supersedes_the_rejected_version(
     assert any("reproduction_passed_on_base" in item for item in constructor.calls[1])
     v1 = await store.replay(BOUNDARY_AGGREGATE_TYPE, "exec_regen/check_package/v1")
     assert [e.type for e in v1] == [PACKAGE_FROZEN, ADMISSION_COMPLETED, SUPERSEDED]
-    assert v1[0].data["package_sha256"] == vacuous.sha256
+    # Each version is cited by its salted commitment, never its unkeyed digest.
+    assert "package_sha256" not in v1[0].data
+    assert len(v1[0].data["package_commitment"]) == 64
+    assert v1[0].data["package_commitment"] not in (vacuous.sha256, good.sha256)
     assert v1[-1].data["superseded_by"] == "exec_regen/check_package/v2"
-    assert v1[-1].data["successor_package_sha256"] == good.sha256
+    assert v1[-1].data["successor_package_commitment"] == state.package.commitment
     assert verify_boundary_order(v1) == ()
     v2 = await store.replay(BOUNDARY_AGGREGATE_TYPE, "exec_regen/check_package/v2")
     assert [e.type for e in v2] == [PACKAGE_FROZEN, ADMISSION_COMPLETED, ACTOR_STARTED]
@@ -873,9 +876,11 @@ async def test_reconciliation_must_follow_a_verification_and_is_single(
         store_dir=tmp_path / "store",
     )
     ledger = BoundaryLedger(store)
+    assert state.package is not None
+    reference = state.package.reference  # the commitment the journal cites
     with pytest.raises(BoundaryOrderError):
         await ledger.record_acceptance_reconciled(
-            state.boundary_id, package_sha256=package.sha256, reconciliation={}
+            state.boundary_id, package_sha256=reference, reconciliation={}
         )
     (repo / "calc.py").write_text(FIXED)
     verdict = await verify_check_package(
@@ -883,11 +888,11 @@ async def test_reconciliation_must_follow_a_verification_and_is_single(
     )
     assert verdict.criteria == {seed_criterion_keys(seed)[0]: "unverified"}
     await ledger.record_acceptance_reconciled(
-        state.boundary_id, package_sha256=package.sha256, reconciliation={}
+        state.boundary_id, package_sha256=reference, reconciliation={}
     )
     with pytest.raises(BoundaryOrderError):
         await ledger.record_acceptance_reconciled(
-            state.boundary_id, package_sha256=package.sha256, reconciliation={}
+            state.boundary_id, package_sha256=reference, reconciliation={}
         )
 
 

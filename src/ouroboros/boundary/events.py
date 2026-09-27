@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 from ouroboros.boundary.admission import AdmissionResult, CandidateVerification
-from ouroboros.boundary.package import CheckPackage
+from ouroboros.boundary.package import CheckPackage, persisted_citation
 from ouroboros.boundary.selection import SelectionDecision
 from ouroboros.events.base import BaseEvent
 
@@ -57,13 +57,23 @@ def _event(boundary_id: str, event_type: str, data: dict[str, Any]) -> BaseEvent
     )
 
 
+def cite(reference: str | None, *, committed: bool, prefix: str = "") -> dict[str, str | None]:
+    """``{"<prefix>package_commitment": ref}`` on a committed boundary, else ``..._sha256``."""
+    return {f"{prefix}package_{'commitment' if committed else 'sha256'}": reference}
+
+
 def package_frozen_event(boundary_id: str, package: CheckPackage) -> BaseEvent:
-    """Package SHA-256 plus the event-safe manifest summary."""
+    """The package reference (I2) plus the event-safe manifest summary.
+
+    For a committed package the reference is the commitment
+    SHA-256(salt || canonical bytes); the unkeyed digest is not recorded.
+    """
     summary = package.manifest_summary()
+    extra = {"commitment_scheme": summary["commitment_scheme"]} if package.commitment else {}
     return _event(
         boundary_id,
         PACKAGE_FROZEN,
-        {"package_sha256": summary["package_sha256"], "manifest": summary},
+        {**package.citation(), **extra, "manifest": summary},
     )
 
 
@@ -89,12 +99,17 @@ def actor_started_event(
     actor_id: str,
     package_sha256: str | None,
     runtime: str | None,
+    committed: bool = False,
 ) -> BaseEvent:
     """A worker bound to this boundary started after the boundary was sealed."""
     return _event(
         boundary_id,
         ACTOR_STARTED,
-        {"actor_id": actor_id, "package_sha256": package_sha256, "runtime": runtime},
+        {
+            "actor_id": actor_id,
+            **cite(package_sha256, committed=committed),
+            "runtime": runtime,
+        },
     )
 
 
@@ -110,6 +125,8 @@ def superseded_event(
     package_sha256: str | None,
     successor_package_sha256: str | None,
     reason: str,
+    committed: bool = False,
+    successor_committed: bool = False,
 ) -> BaseEvent:
     """Mark a sealed boundary version as replaced by a later version."""
     return _event(
@@ -117,8 +134,8 @@ def superseded_event(
         SUPERSEDED,
         {
             "superseded_by": superseded_by,
-            "package_sha256": package_sha256,
-            "successor_package_sha256": successor_package_sha256,
+            **cite(package_sha256, committed=committed),
+            **cite(successor_package_sha256, committed=successor_committed, prefix="successor_"),
             "reason": reason,
         },
     )
@@ -126,25 +143,33 @@ def superseded_event(
 
 def selection_decided_event(boundary_id: str, decision: SelectionDecision) -> BaseEvent:
     """Selection reason plus incumbent, candidate, selected, and package digests."""
-    return _event(boundary_id, SELECTION_DECIDED, decision.model_dump(mode="json"))
+    return _event(
+        boundary_id, SELECTION_DECIDED, persisted_citation(decision.model_dump(mode="json"))
+    )
 
 
 def acceptance_reconciled_event(
-    boundary_id: str, *, package_sha256: str | None, reconciliation: dict[str, Any]
+    boundary_id: str,
+    *,
+    package_sha256: str | None,
+    reconciliation: dict[str, Any],
+    committed: bool = False,
 ) -> BaseEvent:
     """Per-criterion acceptance: package verdict, existing verdict (advisory), decision."""
     return _event(
         boundary_id,
         ACCEPTANCE_RECONCILED,
-        {"package_sha256": package_sha256, **reconciliation},
+        {**cite(package_sha256, committed=committed), **reconciliation},
     )
 
 
 def binding_recorded_event(
-    boundary_id: str, *, package_sha256: str, payload: dict[str, Any]
+    boundary_id: str, *, package_sha256: str, payload: dict[str, Any], committed: bool = False
 ) -> BaseEvent:
     """Tiers and bindings of every check, recorded after the worker stopped."""
-    return _event(boundary_id, BINDING_RECORDED, {"package_sha256": package_sha256, **payload})
+    return _event(
+        boundary_id, BINDING_RECORDED, {**cite(package_sha256, committed=committed), **payload}
+    )
 
 
 def case_revealed_event(
@@ -156,13 +181,14 @@ def case_revealed_event(
     case_id: str,
     root_ac_index: int | None = None,
     retry_attempt: int | None = None,
+    committed: bool = False,
 ) -> BaseEvent:
     """A held-out case revealed in a repair message (case id, never its values)."""
     return _event(
         boundary_id,
         CASE_REVEALED,
         {
-            "package_sha256": package_sha256,
+            **cite(package_sha256, committed=committed),
             "check_id": check_id,
             "criterion_key": criterion_key,
             "case_id": case_id,

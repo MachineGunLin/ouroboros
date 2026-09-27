@@ -59,6 +59,7 @@ from ouroboros.boundary.package import (
     CheckRole,
     CheckSpec,
     canonical_json_bytes,
+    persisted_citation,
     sha256_bytes,
 )
 from ouroboros.boundary.tree import (
@@ -130,6 +131,9 @@ class AdmissionResult(BaseModel, frozen=True):
 
     schema_version: Literal["ouroboros.check_admission.v1"] = "ouroboros.check_admission.v1"
     package_sha256: str
+    # The package's commitment when it was committed (``commit_package``); a
+    # stored receipt or journal event then cites only this, never the digest.
+    package_commitment: str | None = None
     seed_digest: str
     base_tree_digest: str
     base_tree_digest_after: str
@@ -156,6 +160,7 @@ class CandidateVerification(BaseModel, frozen=True):
         "ouroboros.candidate_verification.v1"
     )
     package_sha256: str
+    package_commitment: str | None = None
     artifact_tree_digest: str
     artifact_tree_digest_after: str
     verdict: CandidateVerdict
@@ -187,7 +192,7 @@ _OPTIONAL_CHECK_KEYS = ("tier", "binding", "oracle_result")
 
 
 def _receipt_dump(receipt: BaseModel) -> dict[str, Any]:
-    data = receipt.model_dump(mode="json")
+    data = persisted_citation(receipt.model_dump(mode="json"))
     for key in _OPTIONAL_RECEIPT_FIELDS:
         if data.get(key) is None:
             data.pop(key, None)
@@ -669,6 +674,7 @@ async def admit_check_package(
         verdict = PackageVerdict.ADMITTED
     return AdmissionResult(
         package_sha256=package.sha256,
+        package_commitment=package.commitment,
         seed_digest=package.seed_digest,
         base_tree_digest=run.source_digest_before,
         base_tree_digest_after=run.source_digest_after,
@@ -751,6 +757,7 @@ async def verify_candidate(
         verdict = CandidateVerdict.PASS
     return CandidateVerification(
         package_sha256=package.sha256,
+        package_commitment=package.commitment,
         artifact_tree_digest=run.source_digest_before,
         artifact_tree_digest_after=run.source_digest_after,
         verdict=verdict,

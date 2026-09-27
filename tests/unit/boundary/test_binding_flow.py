@@ -406,7 +406,7 @@ async def test_reveal_one_held_out_case_and_retire_it(
         verdict="fail",
         reasons=(),
         boundary_id=state.boundary_id,
-        package_sha256=state.package.sha256,
+        package_sha256=state.package.reference,
         verdicts=verdicts,
         oracle_results={
             c.check_id: c.oracle_result for c in bound.effective.checks if c.oracle_result
@@ -427,7 +427,7 @@ async def test_reveal_one_held_out_case_and_retire_it(
     ledger = BoundaryLedger(store)
     await ledger.record_case_revealed(
         state.boundary_id,
-        package_sha256=state.package.sha256,
+        package_sha256=state.package.reference,
         check_id="oracle_1",
         criterion_key=keys[0],
         case_id="held",
@@ -437,7 +437,7 @@ async def test_reveal_one_held_out_case_and_retire_it(
     with pytest.raises(BoundaryOrderError):  # once per case
         await ledger.record_case_revealed(
             state.boundary_id,
-            package_sha256=state.package.sha256,
+            package_sha256=state.package.reference,
             check_id="oracle_1",
             criterion_key=keys[0],
             case_id="held",

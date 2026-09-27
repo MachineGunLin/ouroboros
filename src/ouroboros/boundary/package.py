@@ -30,9 +30,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from ouroboros.boundary.binding import BINDING_GRAMMAR
 from ouroboros.boundary.oracle import (
@@ -45,7 +46,10 @@ from ouroboros.boundary.oracle import (
 from ouroboros.core.seed import AcceptanceCriterionSpec, Seed, derive_semantic_ac_key
 
 CHECK_PACKAGE_SCHEMA = "ouroboros.check_package.v1"
-PACKAGE_RECORD_SCHEMA = "ouroboros.check_package_record.v1"
+PACKAGE_RECORD_SCHEMA = "ouroboros.check_package_record.v2"
+REVEAL_RECORD_SCHEMA = "ouroboros.check_package_reveal.v1"
+COMMITMENT_SCHEME = "sha256(salt || canonical package bytes)"
+COMMITMENT_SALT_BYTES = 32
 ORACLE_PACKAGE_SCHEMA = "ouroboros.check_package.v2"
 # Fields added with the oracle split. They are left out of the canonical
 # bytes while empty, so a package without oracles keeps its v1 bytes and
@@ -229,6 +233,9 @@ class CheckPackage(BaseModel, frozen=True):
     uncovered: tuple[UncoveredObligation, ...] = ()
     oracles: tuple[OracleSpec, ...] = ()
     binding_grammar: str | None = None
+    # Set by ``commit_package``: SHA-256(salt || canonical bytes). Never part
+    # of the canonical bytes; the salt itself is not kept on the package.
+    _commitment: str | None = PrivateAttr(default=None)
 
     @field_validator("seed_digest", "input_digest")
     @classmethod
@@ -344,18 +351,38 @@ class CheckPackage(BaseModel, frozen=True):
 
     @property
     def sha256(self) -> str:
-        """SHA-256 of the canonical serialized package."""
+        """SHA-256 of the canonical serialized package (unkeyed; see ``commitment``)."""
         return sha256_bytes(self.to_json_bytes())
+
+    @property
+    def commitment(self) -> str | None:
+        """The salted commitment set by ``commit_package``, or ``None``."""
+        return self._commitment
+
+    @property
+    def reference(self) -> str:
+        """What receipts and events cite: the commitment when set, else ``sha256``."""
+        return self._commitment or self.sha256
+
+    def citation(self) -> dict[str, str]:
+        """``{"package_commitment": ...}`` when committed, else ``{"package_sha256": ...}``."""
+        return package_citation(self.sha256, self._commitment)
 
     def manifest_summary(self) -> dict[str, Any]:
         """Return an event-safe summary: digests, roles, links, no check code.
 
         File contents and argv are excluded so the summary can be persisted in
-        the shared event journal without exposing generated check code.
+        the shared event journal without exposing generated check code. For a
+        committed package the summary names the commitment instead of the
+        unkeyed package digest, and the oracle data file (which carries the
+        held-out cases) is listed by path only: an unkeyed digest of it would
+        let anyone confirm guessed held-out values offline.
         """
+        committed = self._commitment is not None
         return {
             "schema_version": self.schema_version,
-            "package_sha256": self.sha256,
+            **self.citation(),
+            **({"commitment_scheme": COMMITMENT_SCHEME} if committed else {}),
             "seed_digest": self.seed_digest,
             "input_digest": self.input_digest,
             "generated_at": self.generated_at.isoformat(),
@@ -371,11 +398,15 @@ class CheckPackage(BaseModel, frozen=True):
                 for check in self.checks
             ],
             "files": [
-                {
-                    "path": item.path,
-                    "sha256": item.sha256,
-                    "size": len(item.content.encode("utf-8")),
-                }
+                (
+                    {"path": item.path, "held_out_redacted": True}
+                    if committed and item.path == ORACLE_DATA_PATH
+                    else {
+                        "path": item.path,
+                        "sha256": item.sha256,
+                        "size": len(item.content.encode("utf-8")),
+                    }
+                )
                 for item in self.files
             ],
             "base_files": [item.model_dump(mode="json") for item in self.base_files],
@@ -494,6 +525,154 @@ def write_check_package(package: CheckPackage, directory: Path) -> Path:
     return target
 
 
+# --------------------------------------------------------------------------
+# Salted commit-reveal of the package identity (I2)
+
+
+def package_citation(package_sha256: str, package_commitment: str | None) -> dict[str, str]:
+    """The package identity a persisted receipt or event carries.
+
+    A committed package is cited by its commitment only: an unkeyed digest of
+    the full package would let anyone who can read the store or the journal
+    confirm guessed held-out values offline. An uncommitted package (the
+    study API without a salt) is cited by its SHA-256, as before.
+    """
+    if package_commitment:
+        return {"package_commitment": package_commitment}
+    return {"package_sha256": package_sha256}
+
+
+def persisted_citation(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop from a dumped receipt or decision the citation field it must not persist."""
+    if data.get("package_commitment"):
+        data.pop("package_sha256", None)
+    else:
+        data.pop("package_commitment", None)
+    return data
+
+
+def cited_reference(data: Mapping[str, Any] | Any) -> str | None:
+    """The package reference a dumped event payload or receipt object cites."""
+    if isinstance(data, Mapping):
+        return data.get("package_commitment") or data.get("package_sha256")
+    return getattr(data, "package_commitment", None) or getattr(data, "package_sha256", None)
+
+
+def new_commitment_salt() -> bytes:
+    """A fresh 256-bit salt; one per package, kept in controller memory."""
+    return secrets.token_bytes(COMMITMENT_SALT_BYTES)
+
+
+def _salt(salt: bytes) -> bytes:
+    if not isinstance(salt, bytes | bytearray) or len(salt) != COMMITMENT_SALT_BYTES:
+        raise CheckPackageError(f"a commitment salt is {COMMITMENT_SALT_BYTES} random bytes")
+    return bytes(salt)
+
+
+def commitment_digest(package: CheckPackage, salt: bytes) -> str:
+    """SHA-256(salt || canonical package bytes), hex."""
+    return sha256_bytes(_salt(salt) + package.to_json_bytes())
+
+
+def verify_commitment(package: CheckPackage, salt: bytes, digest: str) -> bool:
+    """Whether ``digest`` (the recorded commitment) commits to ``package`` under ``salt``."""
+    try:
+        expected = commitment_digest(package, salt)
+    except CheckPackageError:
+        return False
+    return isinstance(digest, str) and hmac.compare_digest(expected, digest)
+
+
+def commit_package(package: CheckPackage, salt: bytes) -> CheckPackage:
+    """A copy of ``package`` that receipts, events and records cite by its commitment.
+
+    The salt is not stored on the copy; the caller keeps it (in memory) until
+    the final verdict and reveals it afterwards (``reveal_record``).
+    """
+    committed = package.model_copy()
+    committed._commitment = commitment_digest(package, salt)
+    return committed
+
+
+def reveal_record(package: CheckPackage, salt: bytes) -> dict[str, Any]:
+    """Everything an auditor needs to check the pre-dispatch commitment.
+
+    Holds the full package (held-out cases included) and the salt, so it is
+    written only after the run's final verdict, and only to a
+    controller-private location.
+    """
+    return {
+        "schema_version": REVEAL_RECORD_SCHEMA,
+        "commitment_scheme": COMMITMENT_SCHEME,
+        "package_commitment": commitment_digest(package, salt),
+        "salt": _salt(salt).hex(),
+        "package_sha256": package.sha256,
+        "package": package.canonical_dict(),
+    }
+
+
+def private_directory(directory: Path) -> Path:
+    """Create ``directory`` (and missing parents) owner-only (0700)."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def _write_private(target: Path, data: bytes) -> Path:
+    if target.exists():
+        if target.read_bytes() != data:
+            raise CheckPackageError(f"a different record already exists: {target}")
+        return target
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    return target
+
+
+def write_reveal_record(package: CheckPackage, salt: bytes, directory: Path) -> Path:
+    """Write ``reveal_record`` to ``<directory>/<commitment>.reveal.json`` (0600, dir 0700).
+
+    Call only after the final verdict, with a directory the worker cannot read.
+    """
+    record = reveal_record(package, salt)
+    target = private_directory(directory) / f"{record['package_commitment']}.reveal.json"
+    return _write_private(target, canonical_json_bytes(record))
+
+
+def write_commitment_salt(salt: bytes, commitment: str, directory: Path) -> Path:
+    """Persist only the salt of ``commitment``: ``<directory>/<commitment>.salt.json`` (0600).
+
+    The product keeps no full package on disk (held-out cases stay in
+    memory), so this is what it reveals after the final verdict; a caller
+    that retains the package checks it with ``verify_commitment``.
+    """
+    _require_sha256(commitment)
+    data = canonical_json_bytes(
+        {
+            "commitment_scheme": COMMITMENT_SCHEME,
+            "package_commitment": commitment,
+            "salt": _salt(salt).hex(),
+        }
+    )
+    return _write_private(private_directory(directory) / f"{commitment}.salt.json", data)
+
+
+def load_reveal_record(path: Path) -> tuple[CheckPackage, bytes, str]:
+    """Load a reveal record: ``(package, salt, commitment)``, verified or ``CheckPackageError``."""
+    try:
+        record = json.loads(path.read_bytes())
+        salt = bytes.fromhex(record["salt"])
+        package = CheckPackage.model_validate(record["package"])
+        commitment = record["package_commitment"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise CheckPackageError(f"unreadable reveal record: {path}") from exc
+    if canonical_json_bytes(record["package"]) != package.to_json_bytes():
+        raise CheckPackageError("revealed package bytes are not canonical")
+    if not verify_commitment(package, salt, commitment):
+        raise CheckPackageError("revealed package and salt do not match the commitment")
+    return package, salt, commitment
+
+
 def _held_out_digest(key: bytes, check_id: str, case: dict[str, Any]) -> str:
     message = canonical_json_bytes({"check_id": check_id, "case": case})
     return hmac.new(key, message, hashlib.sha256).hexdigest()
@@ -505,11 +684,14 @@ def package_record(package: CheckPackage, key: bytes) -> dict[str, Any]:
     Held-out cases are reduced to their case id and an HMAC-SHA256 of the
     case under ``key``, a per-run secret kept in memory only (a plain hash of
     a small expected value could be reversed by enumeration). The oracle data
-    file is stored in the same reduced form, without its full-content digest.
-    Everything else is the canonical package. ``package_sha256`` names the
-    full package (as recorded in the journal); the record itself cannot be
-    loaded back as a package.
+    file is stored in the same reduced form, without its digest. The record
+    names the package by its commitment only (``package_commitment``), so a
+    package must be committed first (``commit_package``); no unkeyed digest
+    of the full package or of held-out-bearing content is kept. The record
+    cannot be loaded back as a package.
     """
+    if package.commitment is None:
+        raise CheckPackageError("only a committed package is recorded (commit_package)")
     data = package.canonical_dict()
     held_out: list[dict[str, str]] = []
     oracles = []
@@ -545,24 +727,26 @@ def package_record(package: CheckPackage, key: bytes) -> dict[str, Any]:
         ]
     return {
         "schema_version": PACKAGE_RECORD_SCHEMA,
-        "package_sha256": package.sha256,
+        "commitment_scheme": COMMITMENT_SCHEME,
+        "package_commitment": package.commitment,
         "held_out": held_out,
         "package": data,
     }
 
 
 def write_package_record(package: CheckPackage, directory: Path, key: bytes) -> Path:
-    """Write ``package_record`` to ``<directory>/<package sha256>.json`` (create-only).
+    """Write ``package_record`` to ``<directory>/<commitment>.json`` (create-only).
 
     The product's store uses this instead of ``write_check_package`` so that
     held-out expected values never reach the disk. An existing record is kept.
     """
+    record = package_record(package, key)
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{package.sha256}.json"
+    target = directory / f"{record['package_commitment']}.json"
     if target.exists():
         return target
     with open(target, "xb") as handle:
-        handle.write(canonical_json_bytes(package_record(package, key)))
+        handle.write(canonical_json_bytes(record))
     return target
 
 
@@ -626,7 +810,8 @@ def find_workspace_leaks(
     paths = {entry["path"] for entry in manifests}
     digests_by_size: dict[int, set[str]] = {}
     for entry in manifests:
-        digests_by_size.setdefault(int(entry["size"]), set()).add(entry["sha256"])
+        if "sha256" in entry:  # a redacted oracle data entry is matched by path only
+            digests_by_size.setdefault(int(entry["size"]), set()).add(entry["sha256"])
     root = workspace.resolve()
     leaks: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):

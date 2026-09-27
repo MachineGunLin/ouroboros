@@ -15,10 +15,14 @@ from ouroboros.boundary.acceptance import PackageCriterionStatus
 from ouroboros.boundary.authority import CheckPackageAuthority, existing_outcomes_from_results
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import ConstructionOutcome, package_from_reply
-from ouroboros.boundary.package import seed_criterion_keys
+from ouroboros.boundary.package import seed_criterion_keys, verify_commitment
 from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
 from ouroboros.boundary.run_control import CheckPackageRun, tier_summary_value
-from ouroboros.boundary.run_wiring import CheckPackageSettings, prepare_check_package
+from ouroboros.boundary.run_wiring import (
+    CheckPackageSettings,
+    controller_private_dir,
+    prepare_check_package,
+)
 from ouroboros.core.seed import OntologySchema, Seed, SeedMetadata
 from ouroboros.orchestrator.evidence_schema import EvidenceRecord
 from ouroboros.orchestrator.parallel_executor import ParallelACExecutor
@@ -994,11 +998,17 @@ async def test_held_out_values_never_reach_the_boundary_store(
     assert [token for token in secrets if found(token, journal)] == []
     # The matcher does find a value where it would be leaked.
     assert found("4409", b'{"value": 4409}') and not found("4409", b"ab4409cd")
-    # The record names the full package and keeps held-out cases as ids.
+    # The record names the package by its commitment and keeps held-out cases as ids.
     (record_path,) = (tmp_path / "store" / "packages").iterdir()
     record = json.loads(record_path.read_text())
-    assert record["package_sha256"] == state.package.sha256
+    assert record["package_commitment"] == state.package.commitment
+    assert "package_sha256" not in record
     assert [(item["check_id"], item["case_id"]) for item in record["held_out"]] == [
         ("oracle_1", "held"),
         ("oracle_2", "held"),
     ]
+    # The authority reached the final verdict, so it revealed the salt beside
+    # the store (never inside it), and the pre-dispatch commitment verifies.
+    (salt_path,) = controller_private_dir(tmp_path / "store").iterdir()
+    salt = bytes.fromhex(json.loads(salt_path.read_text())["salt"])
+    assert verify_commitment(state.package, salt, record["package_commitment"])

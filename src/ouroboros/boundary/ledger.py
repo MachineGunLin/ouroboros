@@ -3,8 +3,9 @@
 A boundary is one (Seed, verifier source) slot, for example one task and one
 check variant. Its lifecycle is enforced at write time:
 
-1. exactly one seal: ``record_package_frozen`` (package SHA-256 persisted) or
-   ``record_construction_failed``; a second package for the same boundary is
+1. exactly one seal: ``record_package_frozen`` (the package reference
+   persisted: for a committed package the commitment SHA-256(salt ||
+   canonical bytes), else its SHA-256) or ``record_construction_failed``; a second package for the same boundary is
    refused, so admission feedback can never produce a regenerated package;
 2. for a frozen package, exactly one ``record_admission`` whose receipt names
    the frozen digest, recorded before any actor starts;
@@ -60,6 +61,7 @@ from ouroboros.boundary.events import (
 )
 from ouroboros.boundary.package import (
     CheckPackage,
+    cited_reference,
     find_workspace_leaks,
     validate_package_for_seed,
 )
@@ -87,6 +89,15 @@ def _first(events: Sequence[BaseEvent], event_type: str) -> BaseEvent | None:
     return next((event for event in events if event.type == event_type), None)
 
 
+def _ref(event: BaseEvent | None) -> str | None:
+    """The package reference an event cites (commitment or plain digest)."""
+    return None if event is None else cited_reference(event.data)
+
+
+def _committed(seal: BaseEvent | None) -> bool:
+    return seal is not None and bool(seal.data.get("package_commitment"))
+
+
 class BoundaryLedger:
     """Write-time ordering guard over an initialized ``EventStore``."""
 
@@ -112,7 +123,12 @@ class BoundaryLedger:
         *,
         seed: Seed | None = None,
     ) -> BaseEvent:
-        """Persist the package SHA-256 and manifest; the boundary's only seal."""
+        """Persist the package reference and manifest; the boundary's only seal.
+
+        The reference is what I2 orders before any worker start: the
+        commitment of a committed package (``commit_package``), else the
+        package SHA-256. Every later receipt and event must cite the same one.
+        """
         if seed is not None:
             validate_package_for_seed(package, seed)
         await self._require_unsealed(boundary_id)
@@ -144,7 +160,7 @@ class BoundaryLedger:
             raise BoundaryOrderError(
                 "admission requires a frozen package", details={"boundary_id": boundary_id}
             )
-        if frozen.data.get("package_sha256") != result.package_sha256:
+        if _ref(frozen) != cited_reference(result):
             raise BoundaryOrderError(
                 "admission receipt names a different package",
                 details={"boundary_id": boundary_id},
@@ -182,6 +198,7 @@ class BoundaryLedger:
         seals: list[BaseEvent] = []
         manifests: list[dict] = []
         package_by_boundary: dict[str, str | None] = {}
+        committed: dict[str, bool] = {}
         for boundary_id in boundary_ids:
             events = await self.events(boundary_id)
             frozen = _first(events, PACKAGE_FROZEN)
@@ -200,7 +217,8 @@ class BoundaryLedger:
             seals.extend(event for event in (frozen, failed, admitted) if event is not None)
             if frozen is not None:
                 manifests.append(frozen.data["manifest"])
-                package_by_boundary[boundary_id] = frozen.data["package_sha256"]
+                package_by_boundary[boundary_id] = _ref(frozen)
+                committed[boundary_id] = _committed(frozen)
             else:
                 package_by_boundary[boundary_id] = None
         if workspace is not None:
@@ -216,6 +234,7 @@ class BoundaryLedger:
                 actor_id=actor_id,
                 package_sha256=package_by_boundary[boundary_id],
                 runtime=runtime,
+                committed=committed.get(boundary_id, False),
             )
             for boundary_id in boundary_ids
         ]
@@ -266,9 +285,11 @@ class BoundaryLedger:
         event = superseded_event(
             boundary_id,
             superseded_by=superseded_by,
-            package_sha256=old_seal.data.get("package_sha256"),
-            successor_package_sha256=new_seal.data.get("package_sha256"),
+            package_sha256=_ref(old_seal),
+            successor_package_sha256=_ref(new_seal),
             reason=reason,
+            committed=_committed(old_seal),
+            successor_committed=_committed(new_seal),
         )
         await self._store.append(event)
         return event
@@ -278,6 +299,8 @@ class BoundaryLedger:
     ) -> BaseEvent:
         """Record every check's tier and binding once the worker has stopped.
 
+        ``package_sha256`` is the package reference (``CheckPackage.reference``).
+
         Refused unless the frozen, admitted package is cited and an actor
         (the worker) was recorded as started on this boundary: a late binding
         exists only after the oracle hash and the dispatch. A ``final``
@@ -286,7 +309,7 @@ class BoundaryLedger:
         """
         events = await self.events(boundary_id)
         frozen = _first(events, PACKAGE_FROZEN)
-        if frozen is None or frozen.data.get("package_sha256") != package_sha256:
+        if frozen is None or _ref(frozen) != package_sha256:
             raise BoundaryOrderError(
                 "bindings must cite the boundary's frozen package",
                 details={"boundary_id": boundary_id},
@@ -303,7 +326,12 @@ class BoundaryLedger:
             raise BoundaryOrderError(
                 "final bindings already recorded", details={"boundary_id": boundary_id}
             )
-        event = binding_recorded_event(boundary_id, package_sha256=package_sha256, payload=payload)
+        event = binding_recorded_event(
+            boundary_id,
+            package_sha256=package_sha256,
+            payload=payload,
+            committed=_committed(frozen),
+        )
         await self._store.append(event)
         return event
 
@@ -321,7 +349,7 @@ class BoundaryLedger:
         """Record that one held-out case was revealed to the worker (once per case)."""
         events = await self.events(boundary_id)
         frozen = _first(events, PACKAGE_FROZEN)
-        if frozen is None or frozen.data.get("package_sha256") != package_sha256:
+        if frozen is None or _ref(frozen) != package_sha256:
             raise BoundaryOrderError(
                 "a reveal must cite the boundary's frozen package",
                 details={"boundary_id": boundary_id},
@@ -348,6 +376,7 @@ class BoundaryLedger:
             case_id=case_id,
             root_ac_index=root_ac_index,
             retry_attempt=retry_attempt,
+            committed=_committed(frozen),
         )
         await self._store.append(event)
         return event
@@ -363,7 +392,7 @@ class BoundaryLedger:
                 "candidate verification requires a frozen, admitted package",
                 details={"boundary_id": boundary_id},
             )
-        if frozen.data.get("package_sha256") != verification.package_sha256:
+        if _ref(frozen) != cited_reference(verification):
             raise BoundaryOrderError(
                 "verification ran a package other than the frozen one",
                 details={"boundary_id": boundary_id},
@@ -376,7 +405,7 @@ class BoundaryLedger:
         """Persist the selection reason and all digests."""
         events = await self.events(boundary_id)
         frozen = _first(events, PACKAGE_FROZEN)
-        if frozen is None or frozen.data.get("package_sha256") != decision.package_sha256:
+        if frozen is None or _ref(frozen) != cited_reference(decision):
             raise BoundaryOrderError(
                 "selection must cite the boundary's frozen package",
                 details={"boundary_id": boundary_id},
@@ -408,7 +437,7 @@ class BoundaryLedger:
                 event
                 for event in events
                 if event.type in {CANDIDATE_VERIFIED, BINDING_RECORDED}
-                and event.data.get("package_sha256") == package_sha256
+                and _ref(event) == package_sha256
             ]
             if not any(event.type == CANDIDATE_VERIFIED for event in cited) and not any(
                 event.data.get("phase") == "final" for event in cited
@@ -422,7 +451,10 @@ class BoundaryLedger:
                 "acceptance already reconciled", details={"boundary_id": boundary_id}
             )
         event = acceptance_reconciled_event(
-            boundary_id, package_sha256=package_sha256, reconciliation=reconciliation
+            boundary_id,
+            package_sha256=package_sha256,
+            reconciliation=reconciliation,
+            committed=_committed(_first(events, PACKAGE_FROZEN)),
         )
         await self._store.append(event)
         return event
@@ -455,7 +487,7 @@ def verify_boundary_order(events: Sequence[BaseEvent]) -> tuple[str, ...]:
     if len(seals) != 1:
         violations.append(f"expected exactly one seal, found {len(seals)}")
     seal = seals[0] if seals else None
-    frozen_sha = seal.data.get("package_sha256") if seal and seal.type == PACKAGE_FROZEN else None
+    frozen_sha = _ref(seal) if seal and seal.type == PACKAGE_FROZEN else None
     admissions = [e for e in events if e.type == ADMISSION_COMPLETED]
     if frozen_sha is not None and len(admissions) != 1:
         violations.append(f"expected exactly one admission, found {len(admissions)}")
@@ -464,7 +496,7 @@ def verify_boundary_order(events: Sequence[BaseEvent]) -> tuple[str, ...]:
     position = {id(event): index for index, event in enumerate(events)}
     for event in events:
         if event.type in {ADMISSION_COMPLETED, CANDIDATE_VERIFIED, SELECTION_DECIDED}:
-            if frozen_sha is None or event.data.get("package_sha256") != frozen_sha:
+            if frozen_sha is None or _ref(event) != frozen_sha:
                 violations.append(f"{event.type} does not cite the frozen package")
         if event.type == ACTOR_STARTED:
             if seal is None or position[id(seal)] > position[id(event)]:
@@ -476,11 +508,13 @@ def verify_boundary_order(events: Sequence[BaseEvent]) -> tuple[str, ...]:
             ):
                 violations.append("actor started before admission")
         if event.type == BINDING_RECORDED:
-            if frozen_sha is None or event.data.get("package_sha256") != frozen_sha:
+            if frozen_sha is None or _ref(event) != frozen_sha:
                 violations.append(f"{event.type} does not cite the frozen package")
             started = [e for e in events if e.type == ACTOR_STARTED]
             if not started or position[id(started[0])] > position[id(event)]:
                 violations.append("bindings recorded before the worker started")
+    if _committed(seal) and any("package_sha256" in event.data for event in events):
+        violations.append("a committed boundary records an unkeyed package digest")
     finals = [e for e in events if e.type == BINDING_RECORDED and e.data.get("phase") == "final"]
     verified = [e for e in events if e.type == CANDIDATE_VERIFIED]
     if finals and verified and position[id(finals[0])] > position[id(verified[-1])]:

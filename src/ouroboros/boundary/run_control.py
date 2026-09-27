@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ouroboros.boundary.authority import CheckPackageAuthority
+from ouroboros.boundary.authority import CheckPackageAuthority, reveal_commitment_salts
 from ouroboros.boundary.ledger import BoundaryOrderError
 from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
 from ouroboros.boundary.run_wiring import (
@@ -401,6 +401,12 @@ class CheckPackageRun:
         verdict_available: bool = True,
     ) -> dict[str, str]:
         """The enumerated ``workflow_outcome`` dimensions for this run."""
+        if terminal_status in ("completed", "failed", "cancelled") and (
+            self.authority is None or self.authority.outcome is not None
+        ):
+            # The run's final verdict exists: reveal the commitment salts of
+            # every frozen version (the authority already did for its own).
+            reveal_commitment_salts(self.state)
         legacy_verdict = self._legacy_verdict(terminal_status, verdict_available=verdict_available)
         meta = {
             "check_package_arm": self.assignment.arm.value,

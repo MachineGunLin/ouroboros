@@ -74,6 +74,8 @@ class SelectionDecision(BaseModel, frozen=True):
     incumbent: ArtifactRef
     candidate: ArtifactRef | None
     package_sha256: str
+    # Set for a committed package; the journal then records only this.
+    package_commitment: str | None = None
     admission_verdict: PackageVerdict
     verification_verdict: CandidateVerdict | None
     verified_tree_digest: str | None
@@ -101,6 +103,7 @@ def select_incumbent(
             incumbent=incumbent,
             candidate=candidate,
             package_sha256=package.sha256,
+            package_commitment=package.commitment,
             admission_verdict=admission.verdict,
             verification_verdict=verification.verdict if verification else None,
             verified_tree_digest=verification.artifact_tree_digest if verification else None,

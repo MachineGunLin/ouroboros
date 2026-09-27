@@ -33,8 +33,16 @@ keyed hash only (``package.package_record``; the key is per run and in
 memory), constructor partial replies keep case ids only, and a stored
 receipt keeps a held-out case's id and pass/fail only until the case is
 revealed (``oracle.redact_held_out``). The store directory is owner-only
-(0700). A run that resumes in another process cannot recover the held-out
-cases, so the package is not applied on resume.
+(0700).
+
+Every package is committed before it is frozen (``package.commit_package``,
+a fresh 256-bit salt per package): the journal, the record and every receipt
+cite SHA-256(salt || canonical package bytes), never the unkeyed digest, so
+nothing in the store or the journal lets held-out values be confirmed by
+enumeration. The salts stay in memory until the run's final verdict and are
+then written to a controller-private directory (``persist_commitment_salts``).
+A run that resumes in another process cannot recover the held-out cases; it
+recomputes the package decision from the visible cases (``boundary/resume.py``).
 """
 
 from __future__ import annotations
@@ -85,8 +93,12 @@ from ouroboros.boundary.ledger import BoundaryLedger
 from ouroboros.boundary.oracle import apply_reveals, first_failing_heldout, repair_lines
 from ouroboros.boundary.package import (
     CheckPackage,
+    commit_package,
+    new_commitment_salt,
+    private_directory,
     seed_criterion_keys,
     seed_digest,
+    write_commitment_salt,
     write_package_record,
 )
 from ouroboros.boundary.rollout import (
@@ -175,6 +187,17 @@ def default_store_dir(execution_id: str) -> Path:
     return get_config_dir() / "boundary" / execution_id
 
 
+def controller_private_dir(store: Path) -> Path:
+    """Where the commitment salts go after the final verdict: beside the store, not in it.
+
+    The store must never hold enough to confirm a held-out value; a salt next
+    to the recorded commitment would. Owner-only (0700) and outside every
+    checkout; code running as the same user can still read it (no OS
+    sandbox), which is why it is written only after the final verdict.
+    """
+    return store.parent / f"{store.name}.controller-private"
+
+
 def private_store_dir(store: Path) -> Path:
     """Create ``store`` owner-only (0700); the ``boundary`` parent too when it is one.
 
@@ -197,6 +220,15 @@ def private_store_dir(store: Path) -> Path:
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenCommitment:
+    """One frozen package version and the salt of its commitment (controller memory only)."""
+
+    boundary_id: str
+    commitment: str
+    salt: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class BoundaryRunState:
     """What the run holds between worker dispatch and candidate verification."""
 
@@ -214,6 +246,7 @@ class BoundaryRunState:
     criterion_keys: tuple[str, ...] = ()
     base_snapshot: Path | None = None
     base_manifest_path: Path | None = None
+    commitments: tuple[FrozenCommitment, ...] = field(default=(), repr=False)
 
     @property
     def admitted(self) -> bool:
@@ -238,6 +271,8 @@ class BoundaryVerdict:
     verdict: str
     reasons: tuple[str, ...]
     boundary_id: str
+    # The package reference the journal cites (``CheckPackage.reference``: the
+    # commitment of a committed package); ``None`` without an admitted package.
     package_sha256: str | None
     counterexamples: tuple[Counterexample, ...] = ()
     selection: SelectionDecision | None = None
@@ -258,7 +293,7 @@ class BoundaryVerdict:
             "tiers": {key: item.tier.value for key, item in self.verdicts.items()},
             "reasons": list(self.reasons),
             "boundary_id": self.boundary_id,
-            "package_sha256": self.package_sha256,
+            "package_reference": self.package_sha256,
             "failing_checks": [example.check_id for example in self.counterexamples],
             "uncovered_criteria": list(self.uncovered),
             "criteria": {key: status.value for key, status in self.criteria.items()},
@@ -320,6 +355,7 @@ async def prepare_check_package(
     interpreter = resolve_check_interpreter(base)
     # Keys the held-out case hashes of the stored package record; never stored.
     record_key = secrets.token_bytes(32)
+    commitments: list[FrozenCommitment] = []
 
     for attempt in range(1, settings.attempts + 1):
         boundary_id = f"{execution_id}/check_package/v{attempt}"
@@ -339,6 +375,12 @@ async def prepare_check_package(
             )
             feedback = [failure_reason]
         else:
+            # A fresh salt per package; the record, the journal and every
+            # receipt cite the commitment (I2 orders it before the worker).
+            salt = new_commitment_salt()
+            package = commit_package(package, salt)
+            assert package.commitment is not None
+            commitments.append(FrozenCommitment(boundary_id, package.commitment, salt))
             package_path = write_package_record(package, store / "packages", record_key)
             await ledger.record_package_frozen(boundary_id, package, seed=seed)
             admission = await admit_check_package(
@@ -410,7 +452,23 @@ async def prepare_check_package(
         criterion_keys=seed_criterion_keys(seed),
         base_snapshot=snapshot[0] if snapshot else None,
         base_manifest_path=snapshot[1] if snapshot else None,
+        commitments=tuple(commitments),
     )
+
+
+def persist_commitment_salts(state: BoundaryRunState) -> list[Path]:
+    """Reveal every frozen version's salt, after the run's final verdict (idempotent).
+
+    Written to ``controller_private_dir(store)`` (0700, files 0600), never to
+    the store. With the package retained by the caller, an auditor checks the
+    pre-dispatch commitment with ``package.verify_commitment``.
+    """
+    if not state.commitments:
+        return []
+    directory = private_directory(controller_private_dir(state.store_dir))
+    return [
+        write_commitment_salt(item.salt, item.commitment, directory) for item in state.commitments
+    ]
 
 
 def _counterexamples(verification: CandidateVerification) -> tuple[Counterexample, ...]:
@@ -502,7 +560,7 @@ async def verify_check_package(
     )
     await ledger.record_bindings(
         state.boundary_id,
-        package_sha256=package.sha256,
+        package_sha256=package.reference,
         payload=bindings_payload(assignments, results, phase="final"),
     )
     bound = await verify_with_bindings(
@@ -552,7 +610,7 @@ async def verify_check_package(
         verdict=overall.value,
         reasons=reasons,
         boundary_id=state.boundary_id,
-        package_sha256=package.sha256,
+        package_sha256=package.reference,
         counterexamples=_counterexamples(verification) if verification is not None else (),
         selection=decision,
         receipt_path=receipt,
@@ -669,7 +727,9 @@ def render_preparation(state: BoundaryRunState) -> list[str]:
     if state.admitted and state.package is not None:
         package = state.package
         roles = ", ".join(f"{check.check_id} ({check.role.value})" for check in package.checks)
-        lines.append(f"Package {package.sha256[:16]} admitted on the base: {roles}")
+        # The commitment, never the unkeyed digest: even a 64-bit prefix of
+        # that digest would confirm guessed held-out values.
+        lines.append(f"Package {package.reference[:16]} admitted on the base: {roles}")
         if state.interpreter is not None:
             lines.append(
                 f"Checks run with {state.interpreter.path} ({state.interpreter.source}) "

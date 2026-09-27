@@ -81,6 +81,7 @@ from ouroboros.boundary.run_wiring import (
     CheckPackageSettings,
     _base_manifest,
     _counterexamples,
+    persist_commitment_salts,
     plan_repair,
     verify_check_package,
 )
@@ -396,7 +397,7 @@ class CheckPackageGate:
         item = verdicts[key]
         await BoundaryLedger(authority.event_store).record_bindings(
             state.boundary_id,
-            package_sha256=package.sha256,
+            package_sha256=package.reference,
             payload={
                 **bindings_payload(
                     subset,
@@ -423,7 +424,7 @@ class CheckPackageGate:
             verdict="fail",
             reasons=(),
             boundary_id=state.boundary_id,
-            package_sha256=package.sha256,
+            package_sha256=package.reference,
             counterexamples=_counterexamples(verification) if verification is not None else (),
             verdicts=verdicts,
             oracle_results={
@@ -449,7 +450,7 @@ class CheckPackageGate:
             authority.revealed_criteria.add(key)
             await BoundaryLedger(authority.event_store).record_case_revealed(
                 state.boundary_id,
-                package_sha256=package.sha256,
+                package_sha256=package.reference,
                 check_id=plan.revealed_check_id,
                 criterion_key=key,
                 case_id=plan.revealed_case_id,
@@ -587,6 +588,13 @@ class CheckPackageAuthority:
             # One verdict per run: a second call (for example a resumed
             # parallel pass on the same runner) keeps the first decision.
             return parallel_result
+        try:
+            return await self._decide_run(seed, execution_id, parallel_result)
+        finally:
+            if self.outcome is not None:
+                reveal_commitment_salts(self._state)
+
+    async def _decide_run(self, seed: Seed, execution_id: str, parallel_result: Any) -> Any:
         legacy = existing_outcomes_from_results(parallel_result, gated=self.installed)
         legacy_accepted = bool(legacy) and all(item.passed for item in legacy.values())
         try:
@@ -689,6 +697,16 @@ class CheckPackageAuthority:
         except Exception:  # noqa: BLE001 - the fallback itself must stand
             log.warning("boundary.authority.fallback_not_recorded", reason=reason)
         return decided
+
+
+def reveal_commitment_salts(state: BoundaryRunState | None) -> None:
+    """``persist_commitment_salts`` after the final verdict; never raises into the run."""
+    if state is None:
+        return
+    try:
+        persist_commitment_salts(state)
+    except Exception as exc:  # noqa: BLE001 - an unwritten salt only loses auditability
+        log.warning("boundary.commitment_salts_not_written", error_type=type(exc).__name__)
 
 
 def _fail_attempted(parallel_result: Any, legacy: Mapping[int, ExistingOutcome]) -> Any:
