@@ -13,7 +13,9 @@ before confinement. The command's environment arrives as JSON in
 
 - on every platform, each writable root (``--root DIR DEV INO``) is opened
   without following a symlink and must still be the directory ``confine``
-  validated (same device and inode), or nothing runs;
+  validated (same device and inode), or nothing runs; and once the
+  restriction below is in place, no regular file beneath a root may have
+  another hard link (it may be outside), or nothing runs;
 - on Linux (``--landlock``), a Landlock ruleset that handles every filesystem
   right that creates, changes, truncates or removes something and grants them
   only beneath those verified root descriptors (plus writing to ``/dev/null`` and a
@@ -37,6 +39,7 @@ from collections.abc import Callable
 import ctypes
 import json
 import os
+import stat
 import struct
 import sys
 from typing import Any
@@ -205,6 +208,29 @@ def open_verified_roots(roots: list[tuple[str, int, int]]) -> list[int]:
             os.close(fd)
         raise
     return opened
+
+
+def refuse_hard_linked_files(root_fds: list[int]) -> None:
+    """Refuse to run when any regular file beneath a verified root has another link.
+
+    The other link may be outside the roots, and writing through the root
+    would change that file. Walked from the verified descriptors, without
+    following symlinks, after the restriction is in place and immediately
+    before exec, so a link added after ``confine`` is seen; the confined
+    command itself cannot add one (linking an outside file in is denied).
+    """
+    for fd in root_fds:
+        for dirpath, _dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, follow_symlinks=False):
+            for name in filenames:
+                try:
+                    status = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
+                    raise SandboxError(
+                        f"{os.path.join(dirpath, name)} in a writable root has "
+                        f"{status.st_nlink} hard links"
+                    )
 
 
 def restrict_writes(root_fds: list[int]) -> int:
@@ -463,6 +489,7 @@ def main(arguments: list[str]) -> int:
             if landlock:
                 restrict_writes(root_fds)
                 deny_metadata_changes()
+            refuse_hard_linked_files(root_fds)
         finally:
             for fd in root_fds:
                 os.close(fd)

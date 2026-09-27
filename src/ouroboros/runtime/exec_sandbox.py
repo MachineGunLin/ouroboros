@@ -24,8 +24,11 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   device and inode, and the helper opens it without following a symlink and
   refuses to run the command unless it is still that directory (on Linux the
   Landlock rule is bound to that very descriptor). A root holding a regular
-  file with another hard link is refused (``aliased_writable_root``): the
-  other link may be outside, and writing through the root would change it.
+  file with another hard link is refused: the other link may be outside, and
+  writing through the root would change it. ``confine`` reports that early as
+  ``aliased_writable_root``; the helper checks again from the verified
+  descriptors after the restriction is in place, immediately before exec, and
+  runs nothing if a link appeared in between.
   "Read-only" covers content, names (create, remove, rename, link) and
   metadata the process sets (mode, ownership, timestamps, extended
   attributes, inode flags). The access time the kernel records when a

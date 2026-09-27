@@ -193,6 +193,26 @@ class TestRealBackend:
         assert result.reason is SandboxUnavailableReason.ALIASED_WRITABLE_ROOT
         assert result.detail.endswith("alias.txt")
 
+    def test_a_hard_link_added_after_confine_runs_nothing(self, layout: dict[str, Path]) -> None:
+        _require_backend()
+        copy = layout["copy"].resolve()
+        victim = layout["outside"].resolve() / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        command = confine(
+            _python("open('alias.txt', 'w').write('ESCAPED')"),
+            cwd=str(copy),
+            writable_roots=(str(copy),),
+            temp_dir=str(layout["temp"]),
+            deny_network=False,
+        )
+        assert isinstance(command, ConfinedCommand)
+        os.link(victim, copy / "alias.txt")
+
+        result = _run(command)
+
+        assert result.returncode == _confine_exec.EXIT_SANDBOX_FAILED, result.stderr
+        assert victim.read_text(encoding="utf-8") == "KEEP"
+
     def test_writable_root_with_quote_and_backslash_in_its_name(self, tmp_path: Path) -> None:
         _require_backend()
         root = tmp_path / 'we"ird\\dir'
