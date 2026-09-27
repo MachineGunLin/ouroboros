@@ -22,10 +22,20 @@ status once the worker has stopped:
 - ``uncovered``: no executable check exists for the criterion (tier ``U``).
 
 ``unverified`` and ``uncovered`` are both "unverified": they never count as a
-pass in any aggregate, and they never fail a run. A criterion is accepted
-when the worker attempted it and its status is ``pass``, ``unverified`` or
-``uncovered``. A criterion nobody attempted (blocked, invalid, cancelled, or
-missing on a failed run) is not accepted, whatever the package says.
+pass in any aggregate. A criterion is accepted when the worker attempted it
+and its status is ``pass``, ``unverified`` or ``uncovered``. A criterion
+nobody attempted (blocked, invalid, cancelled, or missing on a failed run)
+is not accepted, whatever the package says.
+
+With ``legacy_decides_unverified`` (the product with the check package on,
+user decision 2026-09-27) an unverified or uncovered criterion, including a
+non-behavioral one, is decided by the legacy verifier instead: its rejection
+fails the criterion and the run (``governed_by: existing_verifier``,
+"legacy-decided"). Only a criterion for which the legacy verifier has no
+evidence either (``ExistingOutcome.no_evidence``: transcript unavailable,
+environment unverifiable, no verifier verdict) stays ``unverified`` and is
+accepted; the run then reports insufficient verification
+(``verification_coverage``).
 
 Artifact verdict (precedence): ``fail`` if any criterion fails; else
 ``indeterminate`` if any is indeterminate; else ``pass`` if at least one
@@ -47,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 from ouroboros.boundary.admission import CandidateVerification, CheckExecution, CheckStatus
 from ouroboros.boundary.binding import CheckTier, TierAssignment, tier_summary
 from ouroboros.boundary.oracle import failed_heldout_only
+from ouroboros.boundary.per_check import criteria_without_admitted_check
 
 if TYPE_CHECKING:
     from ouroboros.boundary.package import CheckPackage
@@ -54,6 +65,9 @@ if TYPE_CHECKING:
 
 ACCEPTANCE_FINAL_EVENT_TYPE = "execution.ac.acceptance_finalized"
 RECONCILIATION_SCHEMA = "ouroboros.acceptance_reconciliation.v2"
+LEGACY_RULE_SCHEMA = "ouroboros.acceptance_reconciliation.v3"
+NON_BEHAVIORAL_REASON = "uncovered:non_behavioral"
+LOW_COVERAGE_SHARE = 0.5
 _EXISTING_PASS_OUTCOMES = frozenset({"succeeded", "satisfied_externally"})
 
 
@@ -77,9 +91,20 @@ class Governor(StrEnum):
 
     CHECK_PACKAGE = "check_package"
     EXECUTION = "execution"
-    # Kept for reading receipts recorded before the legacy verifier became
-    # advisory; no decision made by this module uses it.
+    # The legacy (existing) verifier: decides an unverified, uncovered or
+    # non-behavioral criterion under ``legacy_decides_unverified``.
     EXISTING_VERIFIER = "existing_verifier"
+
+
+class VerificationCoverage(StrEnum):
+    """How much of a run the package decided (``verification_coverage``)."""
+
+    FULL = "full"
+    """The package decided every criterion."""
+    PARTIAL = "partial"
+    """Some criteria were not decided by the package, under half, none unverified."""
+    LOW = "low"
+    """Half or more were not decided by the package, or a criterion is unverified."""
 
 
 class ArtifactVerdict(StrEnum):
@@ -156,6 +181,7 @@ def criterion_verdicts(
     one is tier ``A`` and was expected to run. A check assigned ``U`` is not
     run: ``status_hint`` ``unverified`` makes the criterion unverified and
     ``indeterminate`` (an invalid declared binding) makes it indeterminate.
+    A check assigned ``C`` was excluded at admission and does not count.
     A protected-byte mutation, a precondition failure (no check executed), a
     package digest mismatch, or a candidate tree that changed under
     verification makes every check that should have run indeterminate.
@@ -176,8 +202,24 @@ def criterion_verdicts(
         and verification.package_sha256 == package.sha256
         and bool(verification.checks)
     )
+    # Checks excluded at admission (tier ``C``, ``boundary/per_check.py``) do
+    # not count for their criterion; a criterion left without an admitted
+    # check (or a reproduction-type one without an admitted reproduction
+    # check) is uncovered.
+    excluded = {check_id for check_id, item in assignments.items() if item.tier is CheckTier.C}
+    lost = criteria_without_admitted_check(package, excluded) if excluded else {}
     verdicts: dict[str, CriterionVerdict] = {}
-    for key, check_ids in linked.items():
+    for key, all_check_ids in linked.items():
+        check_ids = [check_id for check_id in all_check_ids if check_id not in excluded]
+        if key in lost:
+            verdicts[key] = CriterionVerdict(
+                key,
+                PackageCriterionStatus.UNCOVERED,
+                CheckTier.U,
+                f"uncovered:{lost[key]}",
+                tuple(all_check_ids),
+            )
+            continue
         if not check_ids:
             verdicts[key] = CriterionVerdict(
                 key,
@@ -301,6 +343,9 @@ class ExistingOutcome:
     disposition: str
     terminal_status: str
     failure_class: str | None = None
+    no_evidence: bool = False
+    """The legacy verifier accepted without evidence (no verdict, transcript
+    unavailable, environment unverifiable); never set on a rejection."""
 
     @property
     def passed(self) -> bool:
@@ -362,8 +407,18 @@ class CriterionDecision:
     binding: dict[str, Any] | None = None
 
     @property
+    def legacy_decided(self) -> bool:
+        """The legacy verifier decided this criterion (``legacy_decides_unverified``)."""
+        return self.governed_by is Governor.EXISTING_VERIFIER
+
+    @property
+    def non_behavioral(self) -> bool:
+        return self.reason == NON_BEHAVIORAL_REASON
+
+    @property
     def unverified(self) -> bool:
-        return self.package_status.is_unverified
+        """No verifier had evidence for it: the package did not, and no legacy decision."""
+        return self.package_status.is_unverified and not self.legacy_decided
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -391,6 +446,8 @@ class AcceptanceReconciliation:
     existing_run_accepted: bool
     verdict: ArtifactVerdict = ArtifactVerdict.UNVERIFIED
     tiers: dict[str, int] = field(default_factory=dict)
+    legacy_rule: bool = False
+    """Decided under ``legacy_decides_unverified`` (schema v3)."""
 
     @property
     def overridden(self) -> tuple[CriterionDecision, ...]:
@@ -405,9 +462,43 @@ class AcceptanceReconciliation:
     def verified_pass_count(self) -> int:
         return sum(1 for d in self.decisions if d.package_status is PackageCriterionStatus.PASS)
 
+    @property
+    def legacy_decided(self) -> tuple[CriterionDecision, ...]:
+        return tuple(d for d in self.decisions if d.legacy_decided)
+
+    @property
+    def non_behavioral(self) -> tuple[CriterionDecision, ...]:
+        return tuple(d for d in self.decisions if d.non_behavioral)
+
+    @property
+    def not_package_decided(self) -> tuple[CriterionDecision, ...]:
+        """Criteria the package did not decide (unverified, uncovered, non-behavioral)."""
+        return tuple(
+            d
+            for d in self.decisions
+            if d.governed_by is not Governor.EXECUTION and d.package_status.is_unverified
+        )
+
+    @property
+    def accepted_unverified(self) -> tuple[CriterionDecision, ...]:
+        """Attempted criteria accepted with no evidence from any verifier."""
+        return tuple(
+            d for d in self.decisions if d.unverified and d.governed_by is not Governor.EXECUTION
+        )
+
+    @property
+    def coverage(self) -> VerificationCoverage:
+        return verification_coverage(
+            len(self.decisions), len(self.not_package_decided), len(self.accepted_unverified)
+        )
+
+    @property
+    def insufficient_verification(self) -> bool:
+        return self.coverage is VerificationCoverage.LOW
+
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": RECONCILIATION_SCHEMA,
+        data = {
+            "schema_version": LEGACY_RULE_SCHEMA if self.legacy_rule else RECONCILIATION_SCHEMA,
             "run_accepted": self.run_accepted,
             "existing_run_accepted": self.existing_run_accepted,
             "artifact_verdict": self.verdict.value,
@@ -417,6 +508,24 @@ class AcceptanceReconciliation:
             "tier_summary": dict(self.tiers),
             "criteria": [decision.to_dict() for decision in self.decisions],
         }
+        if self.legacy_rule:
+            data.update(
+                {
+                    "legacy_decided_count": len(self.legacy_decided),
+                    "non_behavioral_count": len(self.non_behavioral),
+                    "verification_coverage": self.coverage.value,
+                }
+            )
+        return data
+
+
+def verification_coverage(total: int, not_decided: int, unverified: int) -> VerificationCoverage:
+    """``low`` when half or more of ``total`` were not decided by the package or any is unverified."""
+    if unverified or (total and not_decided / total >= LOW_COVERAGE_SHARE):
+        return VerificationCoverage.LOW
+    if not_decided:
+        return VerificationCoverage.PARTIAL
+    return VerificationCoverage.FULL
 
 
 def reconcile_acceptance(
@@ -425,11 +534,15 @@ def reconcile_acceptance(
     existing: Mapping[int, ExistingOutcome],
     *,
     existing_run_accepted: bool,
+    legacy_decides_unverified: bool = False,
 ) -> AcceptanceReconciliation:
     """Apply the authority rule to every root criterion, in Seed order.
 
     The existing verifier's verdict is kept per criterion as advisory; it
-    decides nothing. ``existing_run_accepted`` only tells whether a missing
+    decides nothing, except with ``legacy_decides_unverified``: then it
+    decides every attempted criterion the package left unverified or
+    uncovered (non-behavioral included) for which it has evidence (see the
+    module docstring). ``existing_run_accepted`` only tells whether a missing
     per-criterion record means the criterion was attempted (a completed run
     attempted every root criterion).
     """
@@ -454,6 +567,13 @@ def reconcile_acceptance(
             accepted, governor = False, Governor.EXECUTION
         elif status in (PackageCriterionStatus.FAIL, PackageCriterionStatus.INDETERMINATE):
             accepted, governor = False, Governor.CHECK_PACKAGE
+        elif (
+            legacy_decides_unverified
+            and status.is_unverified
+            and prior is not None
+            and not prior.no_evidence
+        ):
+            accepted, governor = prior.passed, Governor.EXISTING_VERIFIER
         else:
             accepted, governor = True, Governor.CHECK_PACKAGE
         decisions.append(
@@ -479,6 +599,7 @@ def reconcile_acceptance(
         existing_run_accepted=existing_run_accepted,
         verdict=artifact_verdict(d.package_status for d in decisions),
         tiers=tier_summary(d.tier for d in decisions),
+        legacy_rule=legacy_decides_unverified,
     )
 
 
@@ -494,6 +615,13 @@ def render_reconciliation(reconciliation: AcceptanceReconciliation) -> list[str]
                 f"({existing}); check package: {decision.package_status.value}"
             )
             continue
+        if decision.legacy_decided:
+            kind = "non-behavioral" if decision.non_behavioral else "no admitted check"
+            lines.append(
+                f"AC {decision.root_ac_index + 1}: {verdict} by the legacy verifier "
+                f"(legacy-decided, {kind}: {decision.reason}); legacy verdict: {existing}"
+            )
+            continue
         label = "unverified" if decision.unverified else decision.package_status.value
         lines.append(
             f"AC {decision.root_ac_index + 1}: {verdict} by the check package ({label}, "
@@ -501,10 +629,31 @@ def render_reconciliation(reconciliation: AcceptanceReconciliation) -> list[str]
         )
     unverified = reconciliation.unverified
     total = len(reconciliation.decisions)
-    lines.append(
-        f"Verified: {reconciliation.verified_pass_count} of {total} passed; "
-        f"unverified: {len(unverified)} (never counted as a pass)"
-    )
+    if not reconciliation.legacy_rule:
+        lines.append(
+            f"Verified: {reconciliation.verified_pass_count} of {total} passed; "
+            f"unverified: {len(unverified)} (never counted as a pass)"
+        )
+    else:
+        lines.append(
+            f"Verified by the check package: {reconciliation.verified_pass_count} of {total} "
+            f"passed; legacy-decided: {len(reconciliation.legacy_decided)} "
+            f"(non_behavioral: {len(reconciliation.non_behavioral)}); "
+            f"unverified: {len(unverified)} (never counted as a pass)"
+        )
     for decision in unverified:
         lines.append(f"- unverified AC {decision.root_ac_index + 1}: {decision.reason}")
+    if reconciliation.legacy_rule and reconciliation.insufficient_verification:
+        lines.append(insufficient_verification_line(reconciliation))
     return lines
+
+
+def insufficient_verification_line(reconciliation: AcceptanceReconciliation) -> str:
+    """The warning printed when ``verification_coverage`` is ``low``."""
+    total = len(reconciliation.decisions)
+    return (
+        "WARNING: insufficient verification: the check package decided "
+        f"{total - len(reconciliation.not_package_decided)} of {total} criteria; "
+        f"{len(reconciliation.accepted_unverified)} had no evidence from any verifier "
+        "(verification_coverage=low)."
+    )

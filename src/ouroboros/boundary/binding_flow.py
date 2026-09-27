@@ -56,6 +56,7 @@ from ouroboros.boundary.binding import (
 from ouroboros.boundary.oracle import apply_reveals
 from ouroboros.boundary.oracle_build import criterion_text
 from ouroboros.boundary.package import CheckPackage, seed_criterion_keys
+from ouroboros.boundary.per_check import EXCLUDED_STATUS_HINT, exclusion_reason_for_role
 from ouroboros.boundary.tree import copy_checkout, tree_digest, tree_manifest
 from ouroboros.core.seed import Seed
 
@@ -236,7 +237,8 @@ async def assign_tiers(
     declared for it; the first entry is used. A declared binding is consulted
     only where the default binding does not resolve. Without a usable base
     (``base`` is ``None``) a declared binding cannot be admitted and is
-    indeterminate (``base_unavailable``).
+    indeterminate (``base_unavailable``). A check whose admitted tier is
+    ``C`` (excluded by the per-check rule) is assigned ``C`` and never run.
     """
     declared = declared or {}
     admitted = dict(admitted_tiers or {})
@@ -245,6 +247,19 @@ async def assign_tiers(
     for check in package.checks:
         oracle = package.oracle_for(check.check_id)
         key = next(iter(link.criterion_key for link in check.assertions))
+        if admitted.get(check.check_id) == CheckTier.C.value:
+            # Excluded at admission (per-check rule, ``boundary/per_check.py``):
+            # never run, never counted for its criterion.
+            assignments[check.check_id] = TierAssignment(
+                key,
+                check.check_id,
+                CheckTier.C,
+                None,
+                None,
+                EXCLUDED_STATUS_HINT,
+                exclusion_reason_for_role(check.role),
+            )
+            continue
         if oracle is None:
             tier = CheckTier(admitted.get(check.check_id, CheckTier.A.value))
             assignments[check.check_id] = TierAssignment(

@@ -152,6 +152,9 @@ class AdmissionResult(BaseModel, frozen=True):
     interpreter: str | None = None
     interpreter_source: str | None = None
     check_tiers: dict[str, str] | None = None
+    # Per-check admission (``boundary/per_check.py``): check id to the reason
+    # it was excluded while the rest of the package was admitted.
+    excluded_checks: dict[str, str] | None = None
 
     def event_summary(self) -> dict[str, Any]:
         """Return the journal payload: statuses and digests, no argv or output."""
@@ -189,7 +192,13 @@ _JOURNAL_EXCLUDED_CHECK_FIELDS = frozenset({"argv", "output_tail"})
 # Optional receipt fields: omitted when unset (callers that pass no
 # interpreter keep byte-identical receipts), and the interpreter's absolute
 # path stays in the stored receipt only, never in the journal.
-_OPTIONAL_RECEIPT_FIELDS = ("interpreter", "interpreter_source", "check_tiers", "bindings")
+_OPTIONAL_RECEIPT_FIELDS = (
+    "interpreter",
+    "interpreter_source",
+    "check_tiers",
+    "bindings",
+    "excluded_checks",
+)
 _JOURNAL_EXCLUDED_RECEIPT_FIELDS = frozenset({"interpreter"})
 # Fields added with the oracle split: omitted while unset, so receipts and
 # events of a package without oracles keep their earlier bytes.
@@ -653,6 +662,7 @@ async def admit_check_package(
     reject_prose_only_checks: bool = False,
     reject_unsafe_checks: bool = False,
     check_tiers: Mapping[str, CheckTier | str] | None = None,
+    exclude_checks_individually: bool = False,
 ) -> AdmissionResult:
     """Run the whole package on isolated copies of the pinned base checkout.
 
@@ -677,6 +687,12 @@ async def admit_check_package(
     ``indeterminate`` with ``protected_bytes_mutated``; any violated check is
     ``rejected``; any other indeterminate check is ``indeterminate``; otherwise
     ``admitted``.
+
+    With ``exclude_checks_individually`` the per-check rule
+    (``boundary/per_check.py``, A29) is applied to that verdict: a
+    reproduction check that passes on the base, or a preservation check that
+    fails on it, is excluded (tier ``C``, ``excluded_checks``) and the rest
+    of the package is admitted.
     """
     prose = prose_only_checks(package) if reject_prose_only_checks else ()
     unsafe = unsafe_checks(package) if reject_unsafe_checks else ()
@@ -717,7 +733,7 @@ async def admit_check_package(
         verdict = PackageVerdict.INDETERMINATE
     else:
         verdict = PackageVerdict.ADMITTED
-    return AdmissionResult(
+    result = AdmissionResult(
         package_sha256=package.sha256,
         package_commitment=package.commitment,
         seed_digest=package.seed_digest,
@@ -734,6 +750,11 @@ async def admit_check_package(
         interpreter_source=interpreter_source,
         check_tiers=tiers or None,
     )
+    if not exclude_checks_individually:
+        return result
+    from ouroboros.boundary.per_check import per_check_admission
+
+    return per_check_admission(result)
 
 
 async def verify_candidate(
