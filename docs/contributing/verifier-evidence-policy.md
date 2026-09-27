@@ -195,7 +195,8 @@ command text a second way. The rules:
   manager, a desktop automation service, a container daemon) are outside
   this boundary.
 - **Network.** Network access must be denied: in the `sandbox-exec` profile
-  on macOS (loopback allowed), by an unprivileged network namespace on Linux,
+  on macOS (loopback allowed), by an unprivileged network namespace on Linux
+  (with its loopback interface brought up, so loopback stays available),
   or not at all when the Linux process already has only a loopback interface
   (a container started with `--network none`). Unix-domain sockets stay
   available. Where none of these works, nothing is replayed and the

@@ -206,6 +206,29 @@ class TestRealBackend:
 
         assert result.returncode == 0, result.stderr
 
+    def test_loopback_stays_available_when_network_is_denied(self, layout: dict[str, Path]) -> None:
+        _require_backend(deny_network=True)
+        code = (
+            "import socket, sys\n"
+            "server = socket.create_server(('127.0.0.1', 0))\n"
+            "client = socket.create_connection(server.getsockname(), timeout=3)\n"
+            "peer, _ = server.accept()\n"
+            "client.sendall(b'ping')\n"
+            "sys.exit(0 if peer.recv(4) == b'ping' else 1)\n"
+        )
+        command = confine(
+            _python(code),
+            cwd=str(layout["copy"]),
+            writable_roots=(str(layout["copy"]),),
+            temp_dir=str(layout["temp"]),
+            deny_network=True,
+        )
+        assert isinstance(command, ConfinedCommand) and command.network_denied
+
+        result = _run(command)
+
+        assert result.returncode == 0, result.stderr
+
     def test_child_environment_is_the_allowlist(
         self, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:

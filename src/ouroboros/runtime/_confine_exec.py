@@ -2,7 +2,7 @@
 
 Run as a standalone script, never imported into the controller:
 
-    python -I -S -B _confine_exec.py [--landlock --write DIR ...] -- ARGV...
+    python -I -S -B _confine_exec.py [--loopback-up] [--landlock --write DIR ...] -- ARGV...
 
 It is the last step of every ``ouroboros.runtime.exec_sandbox`` backend. It is
 started with a fixed bootstrap environment, so nothing the command's own
@@ -353,7 +353,31 @@ def deny_metadata_changes() -> None:
     )
 
 
-def _parse(arguments: list[str]) -> tuple[bool, list[str], list[str]]:
+_SIOCGIFFLAGS = 0x8913
+_SIOCSIFFLAGS = 0x8914
+_IFF_UP = 0x1
+
+
+def bring_loopback_up() -> None:
+    """Bring ``lo`` up in this process's (new, empty) network namespace.
+
+    ``unshare --net`` creates the namespace with ``lo`` down, which would deny
+    loopback along with every other address. Needs ``CAP_NET_ADMIN`` in the
+    namespace, which the mapped root of ``unshare --map-root-user`` has.
+    """
+    import fcntl
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        request = struct.pack("16sH14s", b"lo", 0, b"")
+        current = struct.unpack("16sH", fcntl.ioctl(sock, _SIOCGIFFLAGS, request)[:18])[1]
+        fcntl.ioctl(sock, _SIOCSIFFLAGS, struct.pack("16sH14s", b"lo", current | _IFF_UP, b""))
+
+
+def _parse(arguments: list[str]) -> tuple[bool, bool, list[str], list[str]]:
+    loopback = bool(arguments) and arguments[0] == "--loopback-up"
+    if loopback:
+        arguments = arguments[1:]
     landlock = bool(arguments) and arguments[0] == "--landlock"
     index = 1 if landlock else 0
     writable: list[str] = []
@@ -366,7 +390,7 @@ def _parse(arguments: list[str]) -> tuple[bool, list[str], list[str]]:
         raise SandboxError("usage: [--landlock --write DIR ...] -- ARGV...")
     if writable and not landlock:
         raise SandboxError("--write needs --landlock")
-    return landlock, writable, arguments[index + 1 :]
+    return loopback, landlock, writable, arguments[index + 1 :]
 
 
 def _command_environment() -> dict[str, str]:
@@ -386,8 +410,10 @@ def _command_environment() -> dict[str, str]:
 
 def main(arguments: list[str]) -> int:
     try:
-        landlock, writable, command = _parse(arguments)
+        loopback, landlock, writable, command = _parse(arguments)
         env = _command_environment()
+        if loopback:
+            bring_loopback_up()
         if landlock:
             restrict_writes(writable)
             deny_metadata_changes()

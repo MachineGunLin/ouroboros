@@ -275,7 +275,10 @@ def _backend_argv(
         params = [part for index, root in enumerate(roots) for part in ("-D", f"W{index}={root}")]
         return (executable, "-p", profile, *params, "--", *helper, "--", *argv)
     writes = [part for root in roots for part in ("--write", root)]
-    return (*(network_prefix or ()), *helper, "--landlock", *writes, "--", *argv)
+    # A fresh network namespace starts with ``lo`` down; bring it up so only
+    # non-loopback traffic is denied.
+    loopback = ("--loopback-up",) if network_prefix else ()
+    return (*(network_prefix or ()), *helper, *loopback, "--landlock", *writes, "--", *argv)
 
 
 def _bootstrap_environment(command_env: Mapping[str, str]) -> dict[str, str]:
