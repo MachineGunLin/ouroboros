@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -782,3 +783,65 @@ async def test_a_criterion_takes_its_tier_from_the_checks_that_decided_it(base: 
     verification = await verify_candidate(package, base, only_checks=["oracle_a"])
     verdict = criterion_verdicts(package, verification, assignments=assignments)[key]
     assert (verdict.status, verdict.tier) == (PackageCriterionStatus.FAIL, CheckTier.A)
+
+
+async def test_a_script_check_pass_under_a_planted_sitecustomize_is_only_advisory(
+    base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A model-written script check imports the workspace in the process whose
+    # exit code is its verdict, so a planted sitecustomize (or the code under
+    # test) can make it exit 0. Its pass is therefore advisory: only oracle
+    # checks, compared in the controller's interpreter, are verified passes.
+    # A script check's failure still fails the criterion.
+    import venv
+
+    from ouroboros.boundary.acceptance import (
+        SCRIPT_CHECK_ADVISORY,
+        ArtifactVerdict,
+        PackageCriterionStatus,
+        artifact_verdict,
+        criterion_verdicts,
+    )
+    from ouroboros.boundary.package import AssertionLink, CheckSpec, seed_criterion_keys
+
+    seed = _seed()
+    (key,) = seed_criterion_keys(seed)
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, '.')\n"
+        "from mathutils import clamp\n"
+        "if clamp(15, 0, 10) != 10:\n"
+        "    print('OUROBOROS_CHECK_FAILED:script_1')\n"
+        "    sys.exit(1)\n"
+    )
+    package = assemble_package(
+        seed,
+        input_digest="1" * 64,
+        generator="test",
+        script_checks=[
+            CheckSpec(
+                check_id="script_1",
+                role=CheckRole.REPRODUCTION,
+                argv=("python3", ".ouroboros_checks/check_clamp.py"),
+                assertions=(AssertionLink(assertion_id="script_1.a1", criterion_key=key),),
+                failure_signature="OUROBOROS_CHECK_FAILED:script_1",
+            )
+        ],
+        script_files=[PackageFile.from_content(".ouroboros_checks/check_clamp.py", script)],
+    )
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": BUGGY})
+    honest = await verify_candidate(package, candidate)
+    assert criterion_verdicts(package, honest)[key].status is PackageCriterionStatus.FAIL
+
+    venv.create(candidate / ".venv", with_pip=False, symlinks=True)
+    (site,) = (candidate / ".venv/lib").glob("python*/site-packages")
+    (site / "sitecustomize.py").write_text("import os\nos._exit(0)\n")
+    monkeypatch.setenv("PATH", f"{candidate / '.venv/bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    forged = await verify_candidate(package, candidate)
+    assert forged.verdict is CandidateVerdict.PASS  # the forged exit code
+    verdict = criterion_verdicts(package, forged)[key]
+    assert (verdict.status, verdict.reason) == (
+        PackageCriterionStatus.UNVERIFIED,
+        SCRIPT_CHECK_ADVISORY,
+    )
+    assert artifact_verdict([verdict.status]) is ArtifactVerdict.UNVERIFIED

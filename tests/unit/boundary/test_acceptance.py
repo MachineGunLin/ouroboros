@@ -114,7 +114,9 @@ def test_statuses_follow_the_linked_checks() -> None:
     statuses = package_criterion_statuses(
         package, _verification(package, CheckStatus.EXPECTED, CheckStatus.VIOLATED)
     )
-    assert statuses == {add_key: PASS, sub_key: FAIL, docs_key: UNCOVERED}
+    # A passing script check is advisory (only an oracle check is a verified
+    # pass), so the criterion is unverified; a failing one still fails.
+    assert statuses == {add_key: UNVERIFIED, sub_key: FAIL, docs_key: UNCOVERED}
 
     partial = package_criterion_statuses(
         package, _verification(package, CheckStatus.EXPECTED, CheckStatus.INDETERMINATE)

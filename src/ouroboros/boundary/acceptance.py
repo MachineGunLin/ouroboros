@@ -14,7 +14,11 @@ status once the worker has stopped:
   a worker-declared binding was invalid (``binding_invalid:*``,
   ``binding_admission_timeout``);
 - ``unverified``: a check exists but no binding reaches the target
-  (``no_binding``), or a linked check was not run for that reason;
+  (``no_binding``), or a linked check was not run for that reason, or every
+  passing check is a model-written script check (``script_check_advisory``:
+  a script check runs the workspace in the process that decides its exit
+  code, so its pass is advisory; only an oracle check is a verified pass,
+  while a script check's fail still fails the criterion);
 - ``uncovered``: no executable check exists for the criterion (tier ``U``).
 
 ``unverified`` and ``uncovered`` are both "unverified": they never count as a
@@ -118,6 +122,10 @@ _TRANSIENT_REASONS = frozenset(
 )
 
 
+SCRIPT_CHECK_ADVISORY = "script_check_advisory"
+"""Reason of a criterion whose only passing checks are model-written scripts."""
+
+
 def rerunnable_checks(verification: CandidateVerification) -> tuple[str, ...]:
     """Checks whose indeterminate result one zero-model re-run may resolve (R3)."""
     return tuple(
@@ -187,6 +195,7 @@ def criterion_verdicts(
         undecided: list[str] = []
         unverified: list[str] = []
         passed = 0
+        advisory = 0
         binding: dict[str, Any] | None = None
         source: str | None = None
         for check_id in check_ids:
@@ -212,7 +221,16 @@ def criterion_verdicts(
                 failed.append(execution)
                 decided_by["fail"].append(check_tier)
             elif execution.status is CheckStatus.EXPECTED:
-                passed += 1
+                if package.oracle_for(check_id) is None:
+                    # A model-written script check imports the workspace in
+                    # the process whose exit code is its verdict, so the code
+                    # under test (or a forged interpreter or sitecustomize)
+                    # can produce that exit code. Its pass is advisory; only
+                    # an oracle check, compared in the controller's own
+                    # interpreter, is a verified pass. Its fail still counts.
+                    advisory += 1
+                else:
+                    passed += 1
             else:
                 undecided.append(execution.reason)
                 decided_by["undecided"].append(check_tier)
@@ -223,9 +241,10 @@ def criterion_verdicts(
         elif undecided:
             status, reason, heldout_only = PackageCriterionStatus.INDETERMINATE, undecided[0], False
             tier = _weakest(decided_by["undecided"])
-        elif unverified:
-            status, reason, heldout_only = PackageCriterionStatus.UNVERIFIED, unverified[0], False
-            tier = _weakest(decided_by["unverified"])
+        elif unverified or not passed:
+            reason = unverified[0] if unverified else SCRIPT_CHECK_ADVISORY
+            status, heldout_only = PackageCriterionStatus.UNVERIFIED, False
+            tier = _weakest(decided_by["unverified"]) if unverified else CheckTier.U
         else:
             status, reason, heldout_only = PackageCriterionStatus.PASS, "passed", False
             tier = _weakest(tiers)

@@ -180,13 +180,14 @@ async def test_mcp_execute_seed_prepares_verifies_and_reconciles(
     tool = result.value
     assert tool.is_error is False
     assert tool.meta["status"] == "completed"
-    assert "Check package verdict: pass" in tool.text_content
+    # Script-check package: its pass is advisory (only oracle checks verify).
+    assert "Check package verdict: unverified" in tool.text_content
     assert {key: tool.meta[key] for key in ("check_package_arm", "check_package_assignment")} == {
         "check_package_arm": "on",
         "check_package_assignment": "user_forced_on",
     }
     assert tool.meta["check_package_status"] == "admitted"
-    assert tool.meta["package_verdict"] == "pass"
+    assert tool.meta["package_verdict"] == "unverified"
     assert tool.meta["legacy_verdict"] == "reject"
     assert tool.meta["reconciliation"] == "package_accepted_over_legacy_reject"
 

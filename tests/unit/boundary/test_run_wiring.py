@@ -197,7 +197,9 @@ async def test_package_is_frozen_and_admitted_before_the_actor_starts(
         state, event_store=store, candidate_checkout=repo, settings=settings
     )
 
-    assert verdict.verdict == "pass"
+    # Script-check package: its pass is advisory, so the artifact verdict is
+    # "unverified"; the candidate verification itself passed.
+    assert verdict.verdict == "unverified"
     assert verdict.selection is not None and verdict.selection.replaced
     events = await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
     assert [e.type for e in events][-2:] == [CANDIDATE_VERIFIED, SELECTION_DECIDED]
@@ -709,13 +711,13 @@ async def test_cli_flag_on_admits_before_dispatch_and_verifies_after(
         "check_package_arm": "on",
         "check_package_assignment": "user_forced_on",
         "check_package_status": "admitted",
-        "package_verdict": "pass",
+        "package_verdict": "unverified",
         "legacy_verdict": "accept",
         "reconciliation": "agree",
         "legacy_failure_class": "accepted",
         "legacy_failure_class_count": "0",
-        "unverified_count": "0",
-        "check_tier_summary": "A:1,A_prime:0,U:0",
+        "unverified_count": "1",
+        "check_tier_summary": "A:0,A_prime:0,U:1",
     }
     await store.close()
 
@@ -787,7 +789,7 @@ async def test_cli_package_pass_overrides_an_evidence_form_rejection(
     assert reconciled.data["existing_run_accepted"] is False
     (criterion,) = reconciled.data["criteria"]
     assert criterion["governed_by"] == "check_package"
-    assert criterion["package_status"] == "pass"
+    assert criterion["package_status"] == "unverified"
     assert criterion["existing_outcome"] == "failed"
     assert verify_boundary_order(events) == ()
     # The runner receives the reconciled result, so the terminal status it
@@ -879,7 +881,7 @@ async def test_reconciliation_must_follow_a_verification_and_is_single(
     verdict = await verify_check_package(
         state, event_store=store, candidate_checkout=repo, settings=settings
     )
-    assert verdict.criteria == {seed_criterion_keys(seed)[0]: "pass"}
+    assert verdict.criteria == {seed_criterion_keys(seed)[0]: "unverified"}
     await ledger.record_acceptance_reconciled(
         state.boundary_id, package_sha256=package.sha256, reconciliation={}
     )
