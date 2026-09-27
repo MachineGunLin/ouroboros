@@ -67,15 +67,7 @@ def restrict_reply(reply: Mapping[str, Any], criterion: int) -> dict[str, Any]:
         if isinstance(item, Mapping) and item.get("path") in paths
     ]
     uncovered = [item for item in reply.get("uncovered") or () if number(item) == criterion]
-    # The criterion's kind label (``boundary/behavioral.py``), no values.
-    labels = [item for item in reply.get("labels") or () if number(item) == criterion]
-    return {
-        "oracles": oracles,
-        "checks": checks,
-        "files": files,
-        "uncovered": uncovered,
-        "labels": labels,
-    }
+    return {"oracles": oracles, "checks": checks, "files": files, "uncovered": uncovered}
 
 
 def merge_pieces(pieces: Sequence[CriterionPiece]) -> tuple[dict[str, Any], dict[int, str]]:
@@ -84,13 +76,7 @@ def merge_pieces(pieces: Sequence[CriterionPiece]) -> tuple[dict[str, Any], dict
     A piece whose check id or file path collides with an earlier piece is
     dropped (its criterion becomes uncovered, ``constructor_conflict``).
     """
-    merged: dict[str, list[Any]] = {
-        "oracles": [],
-        "checks": [],
-        "files": [],
-        "uncovered": [],
-        "labels": [],
-    }
+    merged: dict[str, list[Any]] = {"oracles": [], "checks": [], "files": [], "uncovered": []}
     missing: dict[int, str] = {}
     check_ids: set[str] = set()
     paths: set[str] = set()

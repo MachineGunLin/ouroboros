@@ -1,4 +1,4 @@
-"""A29 per-check admission, one replacement call, the behavioral filter, coverage."""
+"""A29 per-check admission, one replacement call, routing by admitted check, coverage."""
 
 from __future__ import annotations
 
@@ -9,12 +9,10 @@ from typing import Any
 import pytest
 
 from ouroboros.boundary.acceptance import (
+    ExistingOutcome,
     PackageCriterionStatus,
-)
-from ouroboros.boundary.behavioral import (
-    NON_BEHAVIORAL,
-    criterion_labels,
-    non_behavioral_criteria,
+    VerificationCoverage,
+    reconcile_acceptance,
 )
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import (
@@ -123,9 +121,7 @@ class _Constructor:
         package = package_from_reply(
             reply, self.seed, input_digest="1" * 64, generator="fake", base_checkout=self.base
         )
-        return ConstructionOutcome(
-            package, None, "1" * 64, "fake", labels=criterion_labels(reply, self.seed)
-        )
+        return ConstructionOutcome(package, None, "1" * 64, "fake")
 
     async def construct(self, seed: Seed, base: Path, *, feedback=()):
         self.construct_calls.append({"feedback": list(feedback)})
@@ -418,21 +414,76 @@ async def test_the_replacement_call_is_one_single_call_for_the_targets_only(
 
 
 # ----------------------------------------------------------------------
-# Behavioral filter
+# Routing: an admitted check decides; labels and reasons never route
 
 
 WILLING = "The user is willing to assist with debugging the issue."
+# What an older prompt produced: a kind label and the reason it implied.
+STALE_REASON = "non_behavioral"
 
 
-async def test_a_criterion_labeled_non_behavioral_gets_no_check(
+async def test_an_uncovered_reason_never_skips_the_replacement_call(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
-    """The label comes from the constructor's own reply; no extra model call."""
-    seed = _seed("clamp(15, 0, 10) returns 10", WILLING)
-    # The constructor wrote a check for the context criterion anyway: it is removed.
-    stray = _oracle(2, "oracle_2", "preservation", (-5, 0, 10), 0)
+    """A criterion left uncovered with any reason is a replacement target.
+
+    Still uncovered after the replacement call, it is uncovered in the
+    verdict, the legacy verifier decides it, and coverage counts it.
+    """
+    seed = _seed()
     reply = {
-        "oracles": [GOOD_REPRO_1, stray],
+        "oracles": [GOOD_REPRO_1, GOOD_PRESERVE_3],
+        "uncovered": [{"criterion": 2, "reason": STALE_REASON}],
+        "labels": [{"criterion": 2, "kind": "context", "evidence_span": "returns 5"}],
+    }
+    replacement = {"uncovered": [{"criterion": 2, "reason": STALE_REASON}]}
+    constructor = _Constructor(seed, repo, reply, replacement)
+    state = await _prepare(store, repo, tmp_path, constructor, seed)
+    assert len(constructor.construct_calls) == 1
+    assert constructor.replacement_calls == [{2: why_excluded(STALE_REASON)}]
+    assert state.replacement_calls == 1 and state.replacement_outcome == "construction_failed"
+    assert state.admitted and state.boundary_id == "exec_u/check_package/v1"
+    keys = seed_criterion_keys(seed)
+    assert {item.criterion_key for item in state.package.uncovered} == {keys[1]}
+    assert not any("labels" in line.lower() for line in render_preparation(state))
+    (repo / "mathutils.py").write_text(FIXED)
+    verdict = await verify_check_package(
+        state, event_store=store, candidate_checkout=repo, settings=CheckPackageSettings(True)
+    )
+    assert verdict.uncovered == (keys[1],)
+    assert [verdict.verdicts[k].status for k in keys] == [
+        PackageCriterionStatus.PASS,
+        PackageCriterionStatus.UNCOVERED,
+        PackageCriterionStatus.PASS,
+    ]
+    rejected = {1: ExistingOutcome(1, "failed", "failed", "failed")}
+    decided = reconcile_acceptance(
+        keys,
+        verdict.verdicts,
+        rejected,
+        existing_run_accepted=True,
+        legacy_decides_unverified=True,
+    )
+    assert [(d.accepted, d.governed_by.value) for d in decided.decisions] == [
+        (True, "check_package"),
+        (False, "existing_verifier"),
+        (True, "check_package"),
+    ]
+    assert [d.criterion_key for d in decided.not_package_decided] == [keys[1]]
+    assert decided.coverage is VerificationCoverage.PARTIAL
+    meta = await _meta(state)
+    assert meta["replacement_call_count"] == "1" and meta["excluded_check_count"] == "0"
+    assert not {"non_behavioral_count", "label_parse_failure_count"} & set(meta)
+
+
+async def test_a_criterion_with_a_working_check_is_never_stripped(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    """A label in the reply (any kind) never removes a check the constructor wrote."""
+    seed = _seed("clamp(15, 0, 10) returns 10", WILLING)
+    keep = _oracle(2, "oracle_2", "preservation", (-5, 0, 10), 0)
+    reply = {
+        "oracles": [GOOD_REPRO_1, keep],
         "labels": [
             {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
             {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
@@ -440,53 +491,16 @@ async def test_a_criterion_labeled_non_behavioral_gets_no_check(
     }
     constructor = _Constructor(seed, repo, reply)
     state = await _prepare(store, repo, tmp_path, constructor, seed)
-    assert len(constructor.construct_calls) == 1  # the only model call
-    keys = seed_criterion_keys(seed)
-    assert state.non_behavioral == (keys[1],) and state.label_parse_failures == ()
-    assert [check.check_id for check in state.package.checks] == ["oracle_1"]
-    assert {item.criterion_key: item.reason for item in state.package.uncovered} == {
-        keys[1]: NON_BEHAVIORAL
-    }
-    assert non_behavioral_criteria(state.package) == (1,)
-    assert constructor.replacement_calls == []  # never a replacement target
-    assert any("Non-behavioral criteria" in line for line in render_preparation(state))
-    meta = await _meta(state)
-    assert meta["non_behavioral_count"] == "1" and meta["label_parse_failure_count"] == "0"
-
-
-async def test_an_invalid_label_keeps_the_check_path(
-    store: EventStore, repo: Path, tmp_path: Path
-) -> None:
-    seed = _seed("clamp(15, 0, 10) returns 10", "clamp(-5, 0, 10) returns 0")
-    reply = {
-        "oracles": [GOOD_REPRO_1, GOOD_PRESERVE_3 | {"criterion": 2}],
-        "labels": [
-            {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
-            # A quote that is not in the Seed: a parse failure, treated as behavior.
-            {"criterion": 2, "kind": "context", "evidence_span": "made up"},
-        ],
-    }
-    state = await _prepare(store, repo, tmp_path, _Constructor(seed, repo, reply), seed)
-    keys = seed_criterion_keys(seed)
-    assert state.non_behavioral == () and state.label_parse_failures == (keys[1],)
-    assert {check.check_id for check in state.package.checks} == {"oracle_1", "oracle_3"}
-    assert any("labels missing or invalid" in line for line in render_preparation(state))
-    assert (await _meta(state))["label_parse_failure_count"] == "1"
-
-
-async def test_a_reply_labeling_every_criterion_non_behavioral_is_the_legacy_run(
-    store: EventStore, repo: Path, tmp_path: Path
-) -> None:
-    seed = _seed(WILLING)
-    reply = {
-        "oracles": [_oracle(1, "oracle_1", "preservation", (-5, 0, 10), 0)],
-        "labels": [{"criterion": 1, "kind": "context", "evidence_span": "willing to assist"}],
-    }
-    constructor = _Constructor(seed, repo, reply)
-    state = await _prepare(store, repo, tmp_path, constructor, seed)
     assert len(constructor.construct_calls) == 1
-    assert not state.admitted and state.failure_reason == "constructor_all_criteria_uncovered"
-    assert await _types(store, "exec_u/check_package/v1") == [CONSTRUCTION_FAILED, ACTOR_STARTED]
+    assert {check.check_id for check in state.package.checks} == {"oracle_1", "oracle_2"}
+    assert state.package.uncovered == ()
+    assert constructor.replacement_calls == [] and state.replacement_calls == 0
+    (repo / "mathutils.py").write_text(FIXED)
+    verdict = await verify_check_package(
+        state, event_store=store, candidate_checkout=repo, settings=CheckPackageSettings(True)
+    )
+    assert verdict.uncovered == ()
+    assert all(v.status is PackageCriterionStatus.PASS for v in verdict.verdicts.values())
 
 
 # ----------------------------------------------------------------------
@@ -509,7 +523,6 @@ async def test_the_arm_off_sends_none_of_the_new_properties() -> None:
         _NoEvents(), execution_id="e", session_id="s", terminal_status="completed"
     )  # type: ignore[arg-type]
     assert not {
-        "non_behavioral_count",
         "excluded_check_count",
         "replacement_call_count",
         "verification_coverage",
@@ -537,16 +550,11 @@ async def _meta(state: Any) -> dict[str, str]:
     )  # type: ignore[arg-type]
 
 
-async def test_the_incremental_constructor_carries_each_criterions_label(repo: Path) -> None:
-    """One call per criterion; each reply's label is kept for its own criterion only."""
-    from ouroboros.boundary.behavioral import CriterionKind
+async def test_the_incremental_constructor_asks_for_every_criterion(repo: Path) -> None:
+    """One call per criterion; a ``labels`` entry in a reply is ignored."""
     from ouroboros.boundary.constructor import load_constructor_system_prompt
 
     seed = _seed("clamp(15, 0, 10) returns 10", WILLING)
-    labels = [
-        {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
-        {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
-    ]
 
     class _Runtime:
         _runtime_backend = "codex"
@@ -557,8 +565,8 @@ async def test_the_incremental_constructor_carries_each_criterions_label(repo: P
             type(self).calls += 1
             reply = {
                 "oracles": [GOOD_REPRO_1],
-                "uncovered": [{"criterion": 2, "reason": NON_BEHAVIORAL}],
-                "labels": labels,
+                "uncovered": [{"criterion": 2, "reason": STALE_REASON}],
+                "labels": [{"criterion": 1, "kind": "context", "evidence_span": "returns 10"}],
             }
             return Result.ok(TaskResult(success=True, final_message=json.dumps(reply), messages=()))
 
@@ -569,10 +577,14 @@ async def test_the_incremental_constructor_carries_each_criterions_label(repo: P
         system_prompt="SYSTEM",
     )
     outcome = await constructor.construct(seed, repo)
-    assert _Runtime.calls == 2  # the per-criterion calls; no call for the labels
-    assert [label.kind for label in outcome.labels.values()] == [
-        CriterionKind.BEHAVIOR,
-        CriterionKind.CONTEXT,
+    assert _Runtime.calls == 2  # every criterion gets its call
+    assert outcome.package is not None
+    assert [check.check_id for check in outcome.package.checks] == ["oracle_1"]
+    keys = seed_criterion_keys(seed)
+    assert [(item.criterion_key, item.reason) for item in outcome.package.uncovered] == [
+        (keys[1], STALE_REASON)
     ]
+    assert not hasattr(outcome, "labels")
     prompt = load_constructor_system_prompt()
-    assert '"evidence_span"' in prompt and "implementation_preference" in prompt
+    assert "Attempt an oracle or a script check for every criterion." in prompt
+    assert "evidence_span" not in prompt and "## Labels" not in prompt

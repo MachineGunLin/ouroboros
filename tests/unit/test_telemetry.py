@@ -864,22 +864,23 @@ class TestCapture:
             "reference_contradiction_count": "0",
             "reference_unavailable_count": "3+",
             "binding_request_count": "1",
-            "non_behavioral_count": "2",
-            "label_parse_failure_count": "1",
             "excluded_check_count": "3+",
             "replacement_call_count": "1",
             "verification_coverage": "low",
         }
+        # Criterion kind labels were removed from routing; their counts are not sent.
+        removed = {"non_behavioral_count": "2", "label_parse_failure_count": "1"}
         telemetry.capture_job_outcome(
             "job-private-id",
             "execute_seed",
             terminal_status="completed",
-            result_meta={"success": True, **dimensions},
+            result_meta={"success": True, **dimensions, **removed},
         )
         telemetry.flush(timeout=2.0)
 
         props = sent[0]["properties"]
         assert {key: props[key] for key in dimensions} == dimensions
+        assert not set(removed) & set(props)
         assert set(props) <= telemetry._WORKFLOW_OUTCOME_KEYS
 
     def test_unaudited_check_package_values_are_dropped_or_folded(

@@ -12,8 +12,8 @@ While the worker runs (``CheckPackageGate``, installed as the executor's
   verifier) no longer rejects an attempt of a criterion an admitted check
   covers; its verdict stays on the result as an annotation (advisory reason
   and failure class for telemetry), so it triggers no retry. For a criterion
-  no admitted check covers (uncovered, non-behavioral, or every check
-  excluded at admission) the legacy verifier decides: its rejection fails
+  no admitted check covers (uncovered, or every check excluded at
+  admission) the legacy verifier decides: its rejection fails
   the attempt and drives the retry, as with the check package off;
 - after each attempt of a root criterion the gate runs that criterion's
   checks on the workspace, through the default binding or the entry point
@@ -28,7 +28,7 @@ After the worker stops (``CheckPackageAuthority.__call__``):
    finished workspace, and records verification and selection;
 2. ``reconcile_acceptance`` decides every criterion (pass accepts, fail and
    indeterminate reject, a criterion the worker never attempted is not
-   accepted; an unverified, uncovered or non-behavioral criterion is decided
+   accepted; an unverified or uncovered criterion is decided
    by the legacy verifier, and stays unverified and accepted only when the
    legacy verifier has no evidence either); the legacy verdict is kept per
    criterion; ``boundary.acceptance.reconciled`` records it;
@@ -427,8 +427,8 @@ class CheckPackageGate:
         key = keys[ac_index]
         check_ids = authority.admitted_check_ids(key)
         if not check_ids or key in authority.legacy_decided_keys():
-            # No admitted check covers it (uncovered, non-behavioral, or
-            # every check excluded at admission): the legacy verifier decides
+            # No admitted check covers it (uncovered, or every check
+            # excluded at admission): the legacy verifier decides
             # it, so its rejection fails the attempt and drives the retry,
             # exactly as with the check package off.
             return self._legacy_decides(result)

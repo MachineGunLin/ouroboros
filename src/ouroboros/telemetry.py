@@ -295,8 +295,6 @@ _WORKFLOW_OUTCOME_KEYS = frozenset(
         "reference_contradiction_count",
         "reference_unavailable_count",
         "binding_request_count",
-        "non_behavioral_count",
-        "label_parse_failure_count",
         "excluded_check_count",
         "replacement_call_count",
         "verification_coverage",
@@ -353,9 +351,7 @@ _CHECK_PACKAGE_PROPERTY_VALUES: dict[str, frozenset[str]] = {
     "reference_unavailable_count": frozenset({"0", "1", "2", "3+"}),
     # Criteria asked once for an entry_points declaration (boundary/authority.py).
     "binding_request_count": frozenset({"0", "1", "2", "3+"}),
-    # Pre-dispatch coverage: constructor labels (boundary/behavioral.py), per_check.py, coverage.py.
-    "non_behavioral_count": frozenset({"0", "1", "2", "3+"}),
-    "label_parse_failure_count": frozenset({"0", "1", "2", "3+"}),
+    # Pre-dispatch coverage (boundary/per_check.py, coverage.py).
     "excluded_check_count": frozenset({"0", "1", "2", "3+"}),
     "replacement_call_count": frozenset({"0", "1", "2", "3+"}),
     "verification_coverage": frozenset({"full", "partial", "low"}),

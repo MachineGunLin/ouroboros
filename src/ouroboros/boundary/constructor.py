@@ -38,7 +38,6 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ouroboros.boundary.behavioral import CriterionLabel, criterion_labels
 from ouroboros.boundary.constructor_session import disable_session_persistence
 from ouroboros.boundary.incremental import construct_pieces, merge_pieces, restrict_reply
 from ouroboros.boundary.oracle import is_oracle_file
@@ -88,10 +87,6 @@ class ConstructionOutcome:
     constructor always sets it, and an oracle without a usable reference is
     then uncovered (``reference_unavailable``).
     """
-    labels: Mapping[str, CriterionLabel] | None = None
-    """Each criterion's kind label from the same reply (``behavioral.py``);
-    ``None`` when this constructor writes no labels (callers that assemble
-    packages themselves)."""
 
 
 def load_constructor_system_prompt() -> str:
@@ -361,13 +356,7 @@ RuntimeFactory = Callable[..., Any]
 
 def _restricted(reply: Mapping[str, Any], numbers: Collection[int]) -> dict[str, Any]:
     """The part of ``reply`` that concerns the 1-based criteria ``numbers``."""
-    merged: dict[str, list[Any]] = {
-        "oracles": [],
-        "checks": [],
-        "files": [],
-        "uncovered": [],
-        "labels": [],
-    }
+    merged: dict[str, list[Any]] = {"oracles": [], "checks": [], "files": [], "uncovered": []}
     for number in sorted(numbers):
         part = restrict_reply(reply, number)
         for key in merged:
@@ -473,8 +462,7 @@ class CheckConstructor:
 
         By default (``per_criterion``) the attempt is incremental: one call
         per criterion under one shared deadline, each reply kept as produced
-        (``boundary/incremental.py``). The outcome carries each criterion's
-        kind label from the same reply(s) (``labels``).
+        (``boundary/incremental.py``).
         """
         if self._per_criterion:
             return await self._construct_incremental(seed, base_checkout, feedback=feedback)
@@ -592,7 +580,6 @@ class CheckConstructor:
             generator,
             reply_sha,
             references=references_from_reply(parsed),
-            labels=criterion_labels(parsed, seed),
         )
 
     async def _construct_incremental(
@@ -687,5 +674,4 @@ class CheckConstructor:
             generator,
             reply_sha,
             references=references_from_reply(merged),
-            labels=criterion_labels(merged, seed),
         )

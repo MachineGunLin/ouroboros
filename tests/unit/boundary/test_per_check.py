@@ -1,4 +1,4 @@
-"""A29 per-check admission, criterion labels, coverage buckets: the library API.
+"""A29 per-check admission, routing by admitted check, coverage buckets: the library API.
 
 These are the functions the study harness can call directly (one seal per
 boundary): ``per_check_admission`` on a recorded admission, then the usual
@@ -22,11 +22,6 @@ from ouroboros.boundary.acceptance import (
     verification_coverage,
 )
 from ouroboros.boundary.admission import PackageVerdict, admit_check_package
-from ouroboros.boundary.behavioral import (
-    CriterionKind,
-    criterion_labels,
-    non_behavioral_criteria,
-)
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.binding_flow import admission_tiers, assign_tiers, verify_with_bindings
 from ouroboros.boundary.constructor import package_from_reply
@@ -189,71 +184,66 @@ def _dev_seed() -> Seed:
     return _seed(DJANGO_UNDER, WILLING)
 
 
-def test_valid_labels_mark_only_non_behavior_as_non_behavioral() -> None:
-    seed = _dev_seed()
-    reply = {
-        "labels": [
-            {"criterion": 1, "kind": "behavior", "evidence_span": "do not raise a NameError"},
-            {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
-        ]
-    }
-    labels = criterion_labels(reply, seed)
-    assert [(label.kind, label.parse_failure) for label in labels.values()] == [
-        (CriterionKind.BEHAVIOR, None),
-        (CriterionKind.CONTEXT, None),
-    ]
-    assert non_behavioral_criteria(reply, seed) == (1,)
+def test_an_uncovered_reason_never_routes() -> None:
+    """Routing rests on one fact: whether an admitted check covers the criterion.
 
-
-@pytest.mark.parametrize(
-    ("entry", "failure"),
-    [
-        (None, "missing"),
-        ({"criterion": 2, "kind": "opinion", "evidence_span": "willing to assist"}, "invalid_kind"),
-        ({"criterion": 2, "kind": "context"}, "missing_evidence_span"),
-        (
-            {"criterion": 2, "kind": "context", "evidence_span": "not in the seed"},
-            "evidence_span_not_in_seed",
-        ),
-        (
-            {"criterion": 2, "kind": "context", "evidence_span": "WILLING TO ASSIST"},
-            "evidence_span_not_in_seed",
-        ),
-    ],
-)
-def test_a_missing_or_invalid_label_is_a_parse_failure_treated_as_behavior(
-    entry: dict[str, Any] | None, failure: str
-) -> None:
-    seed = _dev_seed()
-    first = {"criterion": 1, "kind": "behavior", "evidence_span": "NameError"}
-    labels = criterion_labels({"labels": [first, *([entry] if entry else [])]}, seed)
-    second = list(labels.values())[1]
-    assert second.kind is CriterionKind.BEHAVIOR and second.parse_failure == failure
-    assert non_behavioral_criteria({"labels": [first, *([entry] if entry else [])]}, seed) == ()
-
-
-def test_duplicate_labels_and_a_reply_without_labels_are_parse_failures() -> None:
-    seed = _dev_seed()
-    twice = {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"}
-    labels = criterion_labels({"labels": [twice, twice]}, seed)
-    assert list(labels.values())[1].parse_failure == "duplicate"
-    assert all(label.parse_failure == "missing" for label in criterion_labels({}, seed).values())
-
-
-def test_non_behavioral_criteria_reads_a_package() -> None:
+    The constructor's uncovered reason is descriptive text. A criterion left
+    uncovered with any reason, ``non_behavioral`` included, is uncovered, is
+    counted as not decided by the package, and the legacy verifier decides it.
+    """
     seed = _dev_seed()
     package = package_from_reply(
         {
             "uncovered": [
-                {"criterion": 1, "reason": "x"},
-                {"criterion": 2, "reason": "non_behavioral"},
+                {"criterion": 1, "reason": "non_behavioral"},
+                {"criterion": 2, "reason": "not executable"},
             ]
         },
         seed,
         input_digest="1" * 64,
         generator="fake",
     )
-    assert non_behavioral_criteria(package) == (1,)
+    verdicts = criterion_verdicts(package, None)
+    assert [v.status for v in verdicts.values()] == [PackageCriterionStatus.UNCOVERED] * 2
+    rejected = {i: ExistingOutcome(i, "failed", "failed", "failed") for i in range(2)}
+    decided = reconcile_acceptance(
+        package.criterion_keys,
+        verdicts,
+        rejected,
+        existing_run_accepted=False,
+        legacy_decides_unverified=True,
+    )
+    assert [d.legacy_decided and not d.accepted for d in decided.decisions] == [True, True]
+    assert len(decided.not_package_decided) == 2
+    assert decided.coverage is VerificationCoverage.LOW
+    assert "non_behavioral_count" not in decided.to_dict()
+
+
+async def test_a_linked_check_decides_whatever_else_the_reply_says(repo: Path) -> None:
+    """A reply may still carry a ``labels`` entry (an older prompt): it is ignored.
+
+    The criterion keeps its check, the check is admitted, and the package
+    decides the criterion.
+    """
+    seed = _seed("clamp(15, 0, 10) returns 10")
+    reply = {
+        "oracles": [GOOD_REPRO_1],
+        "labels": [{"criterion": 1, "kind": "context", "evidence_span": "returns 10"}],
+    }
+    package = package_from_reply(
+        reply, seed, input_digest="1" * 64, generator="fake", base_checkout=repo
+    )
+    assert [check.check_id for check in package.checks] == ["oracle_1"]
+    assert package.uncovered == ()
+    admission = await admit_check_package(package, repo, exclude_checks_individually=True)
+    assert admission.verdict is PackageVerdict.ADMITTED and admission.excluded_checks is None
+    (repo / "mathutils.py").write_text(FIXED)
+    assignments, _ = await assign_tiers(
+        package, artifact=repo, base=None, admitted_tiers=admission.check_tiers
+    )
+    bound = await verify_with_bindings(package, repo, assignments)
+    verdicts = criterion_verdicts(package, bound.effective, assignments=assignments)
+    assert [v.status for v in verdicts.values()] == [PackageCriterionStatus.PASS]
 
 
 @pytest.mark.parametrize(

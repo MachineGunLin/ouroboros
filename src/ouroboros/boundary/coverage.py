@@ -1,18 +1,14 @@
-"""Criterion coverage before the worker starts: non-behavioral criteria and replacements.
+"""Criterion coverage before the worker starts: the replacement call.
 
-Two steps of ``run_wiring.prepare_check_package`` that change which criteria
-the package covers, both before any worker starts:
-
-- ``strip_criteria``: a non-behavioral criterion (``boundary/behavioral.py``)
-  gets no check; any check the constructor linked to it is removed, and it is
-  uncovered with reason ``non_behavioral``.
-- One replacement call (product policy only). After per-check admission
-  (``boundary/per_check.py``), every behavioral criterion without an admitted
-  check is a replacement target (``replacement_targets``), with a plain-text
-  reason (``why_excluded``) that names no case value. The replacement checks
-  are merged with the admitted checks of the earlier version
-  (``merge_replacement``) into a new package that goes through the same
-  reference check, seal and admission.
+One replacement call (product policy only), a step of
+``run_wiring.prepare_check_package`` before any worker starts. After per-check
+admission (``boundary/per_check.py``), every criterion without an admitted
+check is a replacement target (``replacement_targets``), whatever reason the
+constructor gave for leaving it uncovered, with a plain-text reason
+(``why_excluded``) that names no case value. The replacement checks are merged
+with the admitted checks of the earlier version (``merge_replacement``) into a
+new package that goes through the same reference check, seal and admission.
+Reasons are descriptive only; none of them changes which criteria are targets.
 """
 
 from __future__ import annotations
@@ -20,11 +16,9 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
-from ouroboros.boundary.behavioral import NON_BEHAVIORAL
 from ouroboros.boundary.oracle import is_oracle_file
 from ouroboros.boundary.oracle_build import assemble_package
 from ouroboros.boundary.package import (
-    AssertionLink,
     CheckPackage,
     CheckRole,
     CheckSpec,
@@ -103,69 +97,15 @@ def _parts(
     return oracles, scripts, files
 
 
-def strip_criteria(package: CheckPackage, seed: Seed, reasons: Mapping[str, str]) -> CheckPackage:
-    """``package`` without any check linked to the criteria in ``reasons`` (key to reason).
+def replacement_targets(package: CheckPackage, excluded: Collection[str]) -> dict[str, str]:
+    """Every criterion of an admitted package without an admitted check, with the reason.
 
-    A script check that also covers another criterion keeps its other links.
-    The stripped criteria are uncovered with their reason. An unchanged
-    package is returned as is.
+    ``excluded`` are the check ids per-check admission excluded. Criteria the
+    constructor left uncovered are targets too, with its reason, whatever
+    that reason says.
     """
-    if not reasons:
-        return package
-    touched = any(_links(check) & set(reasons) for check in package.checks)
-    stated = {item.criterion_key: item.reason for item in package.uncovered}
-    if not touched and all(stated.get(key) == reason for key, reason in reasons.items()):
-        return package
-    oracles, _scripts, _files = _parts(package, lambda check: not (_links(check) & set(reasons)))
-    oracle_ids = {spec.check_id for spec in package.oracles}
-    scripts: list[CheckSpec] = []
-    for check in package.checks:
-        if check.check_id in oracle_ids:
-            continue
-        links = tuple(link for link in check.assertions if link.criterion_key not in reasons)
-        if links:
-            scripts.append(
-                check if len(links) == len(check.assertions) else _relinked(check, links)
-            )
-    paths = {arg for check in scripts for arg in check.argv[1:]}
-    files = [item for item in package.files if not is_oracle_file(item.path) and item.path in paths]
-    return assemble_package(
-        seed,
-        input_digest=package.input_digest,
-        generator=package.generator,
-        oracles=oracles,
-        script_checks=scripts,
-        script_files=files,
-        uncovered={
-            **{item.criterion_key: item.reason for item in package.uncovered},
-            **reasons,
-        },
-        generated_at=package.generated_at,
-    )
-
-
-def _relinked(check: CheckSpec, links: tuple[AssertionLink, ...]) -> CheckSpec:
-    return check.model_copy(update={"assertions": links})
-
-
-def replacement_targets(
-    package: CheckPackage, excluded: Collection[str], skip: Collection[str] = ()
-) -> dict[str, str]:
-    """Behavioral criteria of an admitted package without an admitted check, with the reason.
-
-    ``excluded`` are the check ids per-check admission excluded; ``skip`` are
-    criterion keys never to target (non-behavioral). Criteria the
-    constructor left uncovered are targets too, with its reason.
-    """
-    skipped = set(skip)
-    targets = {
-        item.criterion_key: item.reason
-        for item in package.uncovered
-        if item.reason != NON_BEHAVIORAL and item.criterion_key not in skipped
-    }
-    for key, reason in criteria_without_admitted_check(package, excluded).items():
-        if key not in skipped:
-            targets[key] = reason
+    targets = {item.criterion_key: item.reason for item in package.uncovered}
+    targets.update(criteria_without_admitted_check(package, excluded))
     return {key: targets[key] for key in package.criterion_keys if key in targets}
 
 
@@ -254,6 +194,5 @@ __all__ = [
     "REPLACEMENT_CONFLICT",
     "merge_replacement",
     "replacement_targets",
-    "strip_criteria",
     "why_excluded",
 ]

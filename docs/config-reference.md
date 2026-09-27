@@ -437,14 +437,13 @@ an admitted check covers it (for a bug-fix criterion, an admitted reproduction
 check). For the criteria left without an admitted check, one more constructor
 call, before the worker starts, asks for replacement checks and says why the
 earlier ones were excluded; the replacements go through the same admission.
-In the same reply the constructor labels each criterion `behavior`,
-`implementation_preference` or `context`, quoting the Seed text it relied on
-(the quote must appear verbatim in the Seed; no extra model call). A criterion
-labeled other than `behavior` gets no check and is reported as
-`non_behavioral`; a missing or invalid label counts as `behavior`.
+The constructor is asked for a check for every criterion. Whether an
+admitted check covers a criterion is the only thing that decides who judges
+it; nothing classifies criteria by kind, and the reason a criterion was left
+uncovered is descriptive only.
 
-Every criterion the package cannot verify (no admitted check, no binding, or
-non-behavioral) is decided by the existing verifier: its rejection fails the
+Every criterion the package cannot verify (no admitted check, or no binding)
+is decided by the existing verifier: its rejection fails the
 run (exit 1) and is shown as legacy-decided. Only a criterion neither verifier
 had evidence for (for example the existing verifier's transcript was
 unavailable) is accepted as unverified; the run then prints an

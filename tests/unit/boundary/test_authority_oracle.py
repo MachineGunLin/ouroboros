@@ -18,7 +18,6 @@ from ouroboros.boundary.authority import (
     existing_outcomes_from_results,
     legacy_verdict_in_tree,
 )
-from ouroboros.boundary.behavioral import criterion_labels
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import ConstructionOutcome, package_from_reply
 from ouroboros.boundary.package import seed_criterion_keys, verify_commitment
@@ -104,12 +103,9 @@ REPLY = {
             ],
         },
     ],
+    # The reason is descriptive text; it routes nothing (criterion 3 has no
+    # admitted check, so the legacy verifier decides it).
     "uncovered": [{"criterion": 3, "reason": "non_behavioral"}],
-    "labels": [
-        {"criterion": 1, "kind": "behavior", "evidence_span": "clamp(15, 0, 10) returns 10"},
-        {"criterion": 2, "kind": "behavior", "evidence_span": "gives 5"},
-        {"criterion": 3, "kind": "implementation_preference", "evidence_span": "documented"},
-    ],
 }
 
 
@@ -118,9 +114,7 @@ class _Constructor:
         package = package_from_reply(
             REPLY, seed, input_digest="1" * 64, generator="fake", base_checkout=base
         )
-        self.outcome = ConstructionOutcome(
-            package, None, "1" * 64, "fake", labels=criterion_labels(REPLY, seed)
-        )
+        self.outcome = ConstructionOutcome(package, None, "1" * 64, "fake")
 
     async def construct(self, seed: Seed, base: Path, *, feedback=()) -> ConstructionOutcome:
         return self.outcome
@@ -327,7 +321,7 @@ async def test_authority_matrix_and_exit_semantics(
     results = (
         _legacy_rejected(0),  # A, passes; the legacy rejection is advisory
         _legacy_rejected(1, entry=MIX_ENTRY),  # A', passes
-        _legacy_rejected(2),  # non-behavioral: the legacy rejection decides it
+        _legacy_rejected(2),  # no admitted check: the legacy rejection decides it
     )
     parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
     decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
@@ -361,13 +355,15 @@ async def test_authority_matrix_and_exit_semantics(
     run = _run_for_matrix(authority)
     lines = run.render_outcome()
     assert any(
-        line.startswith("AC 3: not accepted by the legacy verifier (legacy-decided, non-behavioral")
+        line.startswith(
+            "AC 3: not accepted by the legacy verifier (legacy-decided, no admitted check: "
+            "uncovered:non_behavioral)"
+        )
         for line in lines
     )
     assert any(
         line.startswith(
-            "Verified by the check package: 2 of 3 passed; legacy-decided: 1 "
-            "(non_behavioral: 1); unverified: 0"
+            "Verified by the check package: 2 of 3 passed; legacy-decided: 1; unverified: 0"
         )
         for line in lines
     )
@@ -381,12 +377,12 @@ async def test_authority_matrix_and_exit_semantics(
     assert meta["legacy_verdict"] == "reject"
     assert meta["reconciliation"] == "legacy_decided_unverified"
     assert meta["verification_coverage"] == "partial"
-    assert meta["non_behavioral_count"] == "1"
+    assert not {"non_behavioral_count", "label_parse_failure_count"} & set(meta)
     assert meta["legacy_failure_class"] == "evidence_form_mismatch"
     assert meta["legacy_failure_class_count"] == "3+"
     sent = _check_package_properties(meta)
     assert sent["reconciliation"] == "legacy_decided_unverified"
-    assert sent["verification_coverage"] == "partial" and sent["non_behavioral_count"] == "1"
+    assert sent["verification_coverage"] == "partial" and "non_behavioral_count" not in sent
 
 
 async def test_a_legacy_accepted_unverified_criterion_exits_zero(

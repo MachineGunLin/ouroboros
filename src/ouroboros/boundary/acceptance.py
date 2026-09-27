@@ -28,9 +28,9 @@ nobody attempted (blocked, invalid, cancelled, or missing on a failed run)
 is not accepted, whatever the package says.
 
 With ``legacy_decides_unverified`` (the product with the check package on,
-user decision 2026-09-27) an unverified or uncovered criterion, including a
-non-behavioral one, is decided by the legacy verifier instead: its rejection
-fails the criterion and the run (``governed_by: existing_verifier``,
+user decision 2026-09-27) an unverified or uncovered criterion, whatever the
+reason it has no admitted check, is decided by the legacy verifier instead:
+its rejection fails the criterion and the run (``governed_by: existing_verifier``,
 "legacy-decided"). Only a criterion for which the legacy verifier has no
 evidence either (``ExistingOutcome.no_evidence``: transcript unavailable,
 environment unverifiable, no verifier verdict) stays ``unverified`` and is
@@ -66,7 +66,6 @@ if TYPE_CHECKING:
 ACCEPTANCE_FINAL_EVENT_TYPE = "execution.ac.acceptance_finalized"
 RECONCILIATION_SCHEMA = "ouroboros.acceptance_reconciliation.v2"
 LEGACY_RULE_SCHEMA = "ouroboros.acceptance_reconciliation.v3"
-NON_BEHAVIORAL_REASON = "uncovered:non_behavioral"
 LOW_COVERAGE_SHARE = 0.5
 _EXISTING_PASS_OUTCOMES = frozenset({"succeeded", "satisfied_externally"})
 
@@ -91,8 +90,8 @@ class Governor(StrEnum):
 
     CHECK_PACKAGE = "check_package"
     EXECUTION = "execution"
-    # The legacy (existing) verifier: decides an unverified, uncovered or
-    # non-behavioral criterion under ``legacy_decides_unverified``.
+    # The legacy (existing) verifier: decides an unverified or uncovered
+    # criterion under ``legacy_decides_unverified``.
     EXISTING_VERIFIER = "existing_verifier"
 
 
@@ -412,10 +411,6 @@ class CriterionDecision:
         return self.governed_by is Governor.EXISTING_VERIFIER
 
     @property
-    def non_behavioral(self) -> bool:
-        return self.reason == NON_BEHAVIORAL_REASON
-
-    @property
     def unverified(self) -> bool:
         """No verifier had evidence for it: the package did not, and no legacy decision."""
         return self.package_status.is_unverified and not self.legacy_decided
@@ -467,12 +462,8 @@ class AcceptanceReconciliation:
         return tuple(d for d in self.decisions if d.legacy_decided)
 
     @property
-    def non_behavioral(self) -> tuple[CriterionDecision, ...]:
-        return tuple(d for d in self.decisions if d.non_behavioral)
-
-    @property
     def not_package_decided(self) -> tuple[CriterionDecision, ...]:
-        """Criteria the package did not decide (unverified, uncovered, non-behavioral)."""
+        """Criteria the package did not decide (unverified or uncovered)."""
         return tuple(
             d
             for d in self.decisions
@@ -512,7 +503,6 @@ class AcceptanceReconciliation:
             data.update(
                 {
                     "legacy_decided_count": len(self.legacy_decided),
-                    "non_behavioral_count": len(self.non_behavioral),
                     "verification_coverage": self.coverage.value,
                 }
             )
@@ -541,7 +531,7 @@ def reconcile_acceptance(
     The existing verifier's verdict is kept per criterion as advisory; it
     decides nothing, except with ``legacy_decides_unverified``: then it
     decides every attempted criterion the package left unverified or
-    uncovered (non-behavioral included) for which it has evidence (see the
+    uncovered for which it has evidence (see the
     module docstring). ``existing_run_accepted`` only tells whether a missing
     per-criterion record means the criterion was attempted (a completed run
     attempted every root criterion).
@@ -616,10 +606,9 @@ def render_reconciliation(reconciliation: AcceptanceReconciliation) -> list[str]
             )
             continue
         if decision.legacy_decided:
-            kind = "non-behavioral" if decision.non_behavioral else "no admitted check"
             lines.append(
                 f"AC {decision.root_ac_index + 1}: {verdict} by the legacy verifier "
-                f"(legacy-decided, {kind}: {decision.reason}); legacy verdict: {existing}"
+                f"(legacy-decided, no admitted check: {decision.reason}); legacy verdict: {existing}"
             )
             continue
         label = "unverified" if decision.unverified else decision.package_status.value
@@ -637,8 +626,7 @@ def render_reconciliation(reconciliation: AcceptanceReconciliation) -> list[str]
     else:
         lines.append(
             f"Verified by the check package: {reconciliation.verified_pass_count} of {total} "
-            f"passed; legacy-decided: {len(reconciliation.legacy_decided)} "
-            f"(non_behavioral: {len(reconciliation.non_behavioral)}); "
+            f"passed; legacy-decided: {len(reconciliation.legacy_decided)}; "
             f"unverified: {len(unverified)} (never counted as a pass)"
         )
     for decision in unverified:
