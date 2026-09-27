@@ -9187,9 +9187,10 @@ Respond with either ATOMIC or the structured JSON object only.
                     execution_id=execution_id,
                     ac_index=ac_index,
                 )
+            legacy_rejection = None
             if fat_harness_error is not None and getattr(self, "check_package_gate", None):
                 # Check package on: the legacy verdict is advisory (kept on the result).
-                fat_harness_error = None
+                legacy_rejection, fat_harness_error = fat_harness_error, None
             result_final_message = final_message
             if fat_harness_error is not None:
                 success = False
@@ -9340,6 +9341,7 @@ Respond with either ATOMIC or the structured JSON object only.
                 verify_gate_outcome=verify_gate_outcome,
                 error=fat_harness_error,
                 route_candidate=observed_route_candidate,
+                legacy_rejection=legacy_rejection,
             )
 
         except _BatchInterruptedForRecoverablePause:

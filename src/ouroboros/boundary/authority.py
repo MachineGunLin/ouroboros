@@ -33,7 +33,18 @@ After the worker stops (``CheckPackageAuthority.__call__``):
    status, the panel, the exit code, and ``workflow_outcome`` carry it.
 
 Neither part ever raises into the run: on an error the gate returns the
-attempt unchanged and the authority returns the executor result unchanged.
+attempt unchanged. When the authority cannot decide (it raised, or no package
+was admitted) while the gate was installed, the run falls back to the legacy
+verifier exactly as with no package: the legacy rejections the gate made
+advisory are restored (``ACExecutionResult.legacy_rejection``), attempts the
+gate alone failed are accepted again, the reason is recorded
+(``boundary.acceptance.legacy_fallback``) and printed. Without the gate the
+executor result is already the legacy result and is returned unchanged.
+
+Reveals (held-out reveal-and-retire): at most one per criterion per run, and
+never on an attempt after which no repair attempt follows
+(``retry_attempt >= ac_retry_attempts``), so a case is retired only when the
+worker is actually shown it.
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -85,6 +97,8 @@ PACKAGE_INDETERMINATE_ERROR = (
     "check_package: the frozen check package could not decide this criterion"
 )
 PACKAGE_FAILURE_CLASS_PREFIX = "CHECK_PACKAGE_FAIL"
+LEGACY_REJECTION_ERROR = "legacy verifier rejected this criterion"
+BINDING_REJECTED_PREFIX = "binding_invalid:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +110,8 @@ class AuthorityOutcome:
     reconciliation: AcceptanceReconciliation | None = None
     error: str | None = None
     legacy: dict[int, ExistingOutcome] = field(default_factory=dict)
+    fallback_reason: str | None = None
+    """Set when the legacy verifier decided the run instead of the package."""
 
     @property
     def package_decided(self) -> bool:
@@ -143,8 +159,11 @@ def existing_outcomes_from_results(
         if not isinstance(base, str):
             base = "succeeded" if getattr(result, "success", False) else "failed"
         verdict = getattr(result, "atomic_verifier_verdict", None)
-        legacy_rejected = verdict is not None and not bool(getattr(verdict, "passed", True))
-        failure_class = getattr(verdict, "failure_class", None) if legacy_rejected else None
+        verdict_rejected = verdict is not None and not bool(getattr(verdict, "passed", True))
+        failure_class = getattr(verdict, "failure_class", None) if verdict_rejected else None
+        # The executor keeps the rejection it made advisory (typed evidence or
+        # transcript verifier) on the result.
+        legacy_rejected = verdict_rejected or bool(getattr(result, "legacy_rejection", None))
         if gated:
             judged = bool(getattr(result, "success", False)) or bool(
                 getattr(result, "check_package_failure_class", None)
@@ -223,6 +242,65 @@ def apply_reconciliation(parallel_result: Any, reconciliation: AcceptanceReconci
     )
 
 
+def apply_legacy_fallback(parallel_result: Any, legacy: Mapping[int, ExistingOutcome]) -> Any:
+    """Return ``parallel_result`` as the legacy verifier decided it.
+
+    For the gated executor: a root result the legacy verifier rejected is
+    failed with that rejection, and one that only the package gate failed is
+    accepted again. Criteria the worker never attempted are left as they are.
+    """
+    from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+    accepted_outcomes = (ACExecutionOutcome.SUCCEEDED, ACExecutionOutcome.SATISFIED_EXTERNALLY)
+    cleared = {"check_package_repair": None, "check_package_failure_class": None}
+    results = []
+    success_delta = failure_delta = external_delta = 0
+    for result in parallel_result.results:
+        item = legacy.get(result.ac_index)
+        previous = result.outcome
+        gate_failed = bool(getattr(result, "check_package_failure_class", None))
+        if item is None or item.terminal_status == "not_attempted":
+            results.append(result)
+        elif item.passed and previous is ACExecutionOutcome.FAILED and gate_failed:
+            results.append(
+                replace(
+                    result,
+                    success=True,
+                    outcome=ACExecutionOutcome.SUCCEEDED,
+                    error=None,
+                    **cleared,
+                )
+            )
+            success_delta += 1
+            failure_delta -= 1
+        elif not item.passed and (previous in accepted_outcomes or gate_failed):
+            error = getattr(result, "legacy_rejection", None) or (
+                f"{LEGACY_REJECTION_ERROR} ({item.failure_class})"
+                if item.failure_class
+                else LEGACY_REJECTION_ERROR
+            )
+            results.append(
+                replace(
+                    result, success=False, outcome=ACExecutionOutcome.FAILED, error=error, **cleared
+                )
+            )
+            if previous is ACExecutionOutcome.SUCCEEDED:
+                success_delta -= 1
+                failure_delta += 1
+            elif previous is ACExecutionOutcome.SATISFIED_EXTERNALLY:
+                external_delta -= 1
+                failure_delta += 1
+        else:
+            results.append(result)
+    return replace(
+        parallel_result,
+        results=tuple(results),
+        success_count=parallel_result.success_count + success_delta,
+        failure_count=parallel_result.failure_count + failure_delta,
+        externally_satisfied_count=parallel_result.externally_satisfied_count + external_delta,
+    )
+
+
 class CheckPackageGate:
     """Per-attempt repair signal from the frozen package (see the module docstring)."""
 
@@ -256,7 +334,6 @@ class CheckPackageGate:
             return result
 
     async def _decide(self, ac_index: int, result: Any) -> Any:
-        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
 
         authority = self._authority
         state = authority.state
@@ -315,6 +392,12 @@ class CheckPackageGate:
         self.log.append(
             {"ac_index": ac_index, "status": item.status.value, "tier": item.tier.value}
         )
+        if item.status is PackageCriterionStatus.INDETERMINATE and item.reason.startswith(
+            BINDING_REJECTED_PREFIX
+        ):
+            # A rejected declaration is fixable within the retry budget; the
+            # reason names no oracle value.
+            return self._repair(result, _binding_rejected_message(item, package))
         if item.status is not PackageCriterionStatus.FAIL:
             return result
         partial = BoundaryVerdict(
@@ -330,12 +413,21 @@ class CheckPackageGate:
                 if check.oracle_result
             },
         )
-        plan = plan_repair(partial, key)
+        retry_attempt = int(getattr(result, "retry_attempt", 0) or 0)
+        # One reveal per criterion per run, and only when a repair attempt
+        # follows (otherwise the worker never sees the case).
+        plan = plan_repair(
+            partial,
+            key,
+            allow_reveal=key not in authority.revealed_criteria
+            and authority.repair_follows(retry_attempt),
+        )
         message = plan.message if plan is not None else PACKAGE_REJECTION_ERROR
         if plan is not None and plan.revealed_check_id and plan.revealed_case_id:
             # Only held-out cases failed: one of them is now shown to the
             # worker and retired from held-out statistics for this run.
             authority.revealed.setdefault(plan.revealed_check_id, set()).add(plan.revealed_case_id)
+            authority.revealed_criteria.add(key)
             await BoundaryLedger(authority.event_store).record_case_revealed(
                 state.boundary_id,
                 package_sha256=package.sha256,
@@ -346,6 +438,12 @@ class CheckPackageGate:
                 retry_attempt=getattr(result, "retry_attempt", 0),
             )
             self.log[-1]["revealed_case_id"] = plan.revealed_case_id
+        return self._repair(result, message)
+
+    @staticmethod
+    def _repair(result: Any, message: str) -> Any:
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
         return replace(
             result,
@@ -355,6 +453,27 @@ class CheckPackageGate:
             check_package_repair=message,
             check_package_failure_class=f"{PACKAGE_FAILURE_CLASS_PREFIX}:{digest}",
         )
+
+
+def _binding_rejected_message(item: Any, package: Any) -> str:
+    """Repair text for a declared entry point that was rejected (no oracle values)."""
+    binding = item.binding or {}
+    spec = next((o for o in package.oracles if o.check_id in item.check_ids), None)
+    params = ", ".join(spec.params) if spec is not None else ""
+    lines = [
+        f"Your declared entry point for this criterion was rejected: {item.reason}.",
+        f"Declared: {binding.get('call_kind')} {binding.get('symbol')}"
+        + (
+            f" with arg_map {json.dumps(binding.get('arg_map'), sort_keys=True)}"
+            if binding.get("arg_map")
+            else ""
+        )
+        + ".",
+        "Fix the entry_points declaration: name a function your change introduced or "
+        "changed (or one that exists at the base), outside .ouroboros_checks, whose "
+        f"inputs ({params}) are mapped only by name or position.",
+    ]
+    return "\n".join(lines)
 
 
 class CheckPackageAuthority:
@@ -382,8 +501,16 @@ class CheckPackageAuthority:
         # worker could turn a failing criterion into an unverified one by
         # omitting entry_points after a counterexample.
         self.declared: dict[str, list[Any]] = {}
-        # Held-out cases revealed in a repair message, per check id.
+        # Held-out cases revealed in a repair message, per check id, and the
+        # criteria that already had their one reveal in this run.
         self.revealed: dict[str, set[str]] = {}
+        self.revealed_criteria: set[str] = set()
+        # The executor's same-runtime retry budget (set by ``install``).
+        self.max_retry_attempts: int | None = None
+
+    def repair_follows(self, retry_attempt: int) -> bool:
+        """Whether a repair attempt follows ``retry_attempt`` (unknown budget: yes)."""
+        return self.max_retry_attempts is None or retry_attempt < self.max_retry_attempts
 
     def remember_declaration(self, key: str, entries: list[Any]) -> list[Any]:
         """Record ``entries`` for ``key`` when present; return the declaration in force."""
@@ -431,6 +558,9 @@ class CheckPackageAuthority:
         """Make the legacy verifier advisory and the package the repair signal."""
         executor.check_package_gate = self.gate
         executor.check_package_interfaces = self.interfaces()
+        budget = getattr(executor, "_ac_retry_attempts", None)
+        if isinstance(budget, int) and not isinstance(budget, bool):
+            self.max_retry_attempts = max(0, budget)
         self.installed = True
 
     async def __call__(self, *, seed: Seed, execution_id: str, parallel_result: Any) -> Any:
@@ -460,9 +590,13 @@ class CheckPackageAuthority:
                 revealed=self.revealed,
             )
             if verdict.package_sha256 is None:
-                # No admitted package: the legacy result stands untouched.
-                self.outcome = AuthorityOutcome(legacy_accepted, verdict=verdict, legacy=legacy)
-                return parallel_result
+                # No admitted package: the legacy verifier decides.
+                if not self.installed:
+                    self.outcome = AuthorityOutcome(legacy_accepted, verdict=verdict, legacy=legacy)
+                    return parallel_result
+                return await self._fall_back(
+                    parallel_result, legacy, legacy_accepted, "no_admitted_package", verdict=verdict
+                )
             reconciliation = reconcile_acceptance(
                 keys,
                 verdict.verdicts,
@@ -485,9 +619,49 @@ class CheckPackageAuthority:
                 boundary_id=self._state.boundary_id,
                 error_type=type(exc).__name__,
             )
-            self.outcome = AuthorityOutcome(
-                legacy_accepted, error=type(exc).__name__, legacy=legacy
+            if not self.installed:
+                # Nothing was made advisory: the executor result is the legacy one.
+                self.outcome = AuthorityOutcome(
+                    legacy_accepted, error=type(exc).__name__, legacy=legacy
+                )
+                return parallel_result
+            return await self._fall_back(
+                parallel_result,
+                legacy,
+                legacy_accepted,
+                f"authority_error:{type(exc).__name__}",
+                error=type(exc).__name__,
             )
+
+    async def _fall_back(
+        self,
+        parallel_result: Any,
+        legacy: dict[int, ExistingOutcome],
+        legacy_accepted: bool,
+        reason: str,
+        *,
+        error: str | None = None,
+        verdict: BoundaryVerdict | None = None,
+    ) -> Any:
+        """Decide the run with the legacy verdicts the gate made advisory (never raises)."""
+        self.outcome = AuthorityOutcome(
+            legacy_accepted, verdict=verdict, error=error, legacy=legacy, fallback_reason=reason
+        )
+        log.warning(
+            "boundary.authority.legacy_fallback",
+            boundary_id=self._state.boundary_id,
+            reason=reason,
+        )
+        try:
+            await BoundaryLedger(self._event_store).record_legacy_fallback(
+                self._state.boundary_id, reason=reason
+            )
+        except Exception:  # noqa: BLE001 - the fallback itself must stand
+            log.warning("boundary.authority.fallback_not_recorded", reason=reason)
+        try:
+            return apply_legacy_fallback(parallel_result, legacy)
+        except Exception:  # noqa: BLE001 - never raise into the run
+            log.warning("boundary.authority.fallback_failed", reason=reason)
             return parallel_result
 
 
@@ -498,6 +672,7 @@ __all__ = [
     "AuthorityOutcome",
     "CheckPackageAuthority",
     "CheckPackageGate",
+    "apply_legacy_fallback",
     "apply_reconciliation",
     "existing_outcomes_from_results",
 ]

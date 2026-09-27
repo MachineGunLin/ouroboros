@@ -536,3 +536,205 @@ async def test_held_out_only_failure_reveals_one_case_and_retires_it(
     keys = seed_criterion_keys(seed)
     final = authority.outcome.verdict.verdicts[keys[1]]
     assert final.status is PackageCriterionStatus.FAIL and final.failed_heldout_only is False
+
+
+def _run_for(authority: CheckPackageAuthority) -> CheckPackageRun:
+    return CheckPackageRun(
+        CheckPackageSettings(
+            enabled=True, assignment=CheckPackageAssignment(Arm.ON, AssignmentSource.USER_FORCED_ON)
+        ),
+        state=authority.state,
+        authority=authority,
+        attempted=True,
+    )
+
+
+class _NoEvents:
+    async def query_events(self, **_kwargs: Any) -> list[Any]:
+        return []
+
+
+async def test_authority_error_with_the_gate_installed_falls_back_to_the_legacy_verdicts(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A1: the gate made the legacy rejections advisory; when the authority
+    # then raises, the run must not complete. The legacy verdicts decide,
+    # exactly as with no admitted package, and the reason is recorded.
+    from ouroboros.boundary.events import BOUNDARY_AGGREGATE_TYPE, LEGACY_FALLBACK
+
+    seed, authority = await _authority(store, repo, tmp_path)
+    authority.install(_executor(repo))
+
+    async def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("ouroboros.boundary.authority.verify_check_package", broken)
+    gate_only = ACExecutionResult(
+        ac_index=0,
+        ac_content="criterion 0",
+        success=False,
+        outcome=ACExecutionOutcome.FAILED,
+        error="check_package: ...",
+        check_package_repair="counterexample",
+        check_package_failure_class="CHECK_PACKAGE_FAIL:abc",
+    )
+    rejected = [
+        replace(_legacy_rejected(index), legacy_rejection="evidence form mismatch")
+        for index in (1, 2)
+    ]
+    parallel = ParallelExecutionResult(
+        results=(gate_only, *rejected), success_count=2, failure_count=1
+    )
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert not decided.all_succeeded
+    assert [r.outcome for r in decided.results] == [
+        ACExecutionOutcome.SUCCEEDED,  # only the package gate had failed it
+        ACExecutionOutcome.FAILED,
+        ACExecutionOutcome.FAILED,
+    ]
+    assert decided.results[1].error == "evidence form mismatch"
+    assert decided.results[0].check_package_repair is None
+    assert (decided.success_count, decided.failure_count) == (1, 2)
+    assert authority.outcome.fallback_reason == "authority_error:OSError"
+    events = await store.replay(BOUNDARY_AGGREGATE_TYPE, authority.state.boundary_id)
+    assert [e.data["reason"] for e in events if e.type == LEGACY_FALLBACK] == [
+        "authority_error:OSError"
+    ]
+    run = _run_for(authority)
+    assert run.render_outcome() == [
+        "Check package could not decide this run (authority_error:OSError); "
+        "legacy verification decided this run."
+    ]
+    meta = await run.outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
+    )  # type: ignore[arg-type]
+    assert meta["reconciliation"] == "fallback_to_legacy"
+    assert meta["legacy_verdict"] == "reject"
+    assert "unverified_count" not in meta and "check_tier_summary" not in meta
+
+
+TWO_HELD = {
+    **REPLY,
+    "oracles": [
+        REPLY["oracles"][0],
+        {
+            **REPLY["oracles"][1],
+            "cases": [
+                *REPLY["oracles"][1]["cases"],
+                {
+                    "case_id": "held2",
+                    "args": {"a": 1, "b": 5, "t": 0.5},
+                    "expect": {"kind": "returns", "value": 3.0, "approx": 1e-9},
+                },
+            ],
+        },
+    ],
+}
+WRONG_MIX = "\ndef mix(start, end, weight):\n    return start + end * weight\n"
+SPECIAL_CASED_MIX = (
+    "\ndef mix(start, end, weight):\n"
+    "    if (start, end, weight) == (2, 4, 0.25):\n"
+    "        return 2.5\n"
+    "    return start + end * weight\n"
+)
+
+
+async def _two_held_authority(
+    store: EventStore, repo: Path, tmp_path: Path, retries: int
+) -> tuple[Seed, CheckPackageAuthority]:
+    seed = _seed()
+    constructor = _Constructor(seed, repo)
+    constructor.outcome = ConstructionOutcome(
+        package_from_reply(
+            TWO_HELD, seed, input_digest="1" * 64, generator="fake", base_checkout=repo
+        ),
+        None,
+        "1" * 64,
+        "fake",
+    )
+    settings = CheckPackageSettings(enabled=True)
+    state = await prepare_check_package(
+        seed,
+        event_store=store,
+        constructor=constructor,
+        execution_id="exec_two_held",
+        base_checkout=repo,
+        worker_workspace=repo,
+        runtime_label="codex",
+        settings=settings,
+        store_dir=tmp_path / "store",
+    )
+    authority = CheckPackageAuthority(state, settings, event_store=store, candidate_checkout=repo)
+    authority.install(_executor(repo, retries=retries))
+    return seed, authority
+
+
+async def _reveals(store: EventStore, authority: CheckPackageAuthority) -> list[str]:
+    from ouroboros.boundary.events import BOUNDARY_AGGREGATE_TYPE, CASE_REVEALED
+
+    events = await store.replay(BOUNDARY_AGGREGATE_TYPE, authority.state.boundary_id)
+    return [e.data["case_id"] for e in events if e.type == CASE_REVEALED]
+
+
+async def test_at_most_one_held_out_reveal_per_criterion_per_run(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # A3: after the first reveal the worker special-cases that input; the
+    # other held-out case, still failing, is not revealed on a later attempt.
+    seed, authority = await _two_held_authority(store, repo, tmp_path, retries=2)
+    (repo / "mathutils.py").write_text(FIXED + WRONG_MIX)
+    attempt = _legacy_rejected(1, entry=MIX_ENTRY)
+    first = await authority.gate(seed=seed, ac_index=1, result=attempt)
+    assert "revealed held-out case: mix(start=2, end=4, weight=0.25)" in first.check_package_repair
+    (repo / "mathutils.py").write_text(FIXED + SPECIAL_CASED_MIX)
+    second = await authority.gate(seed=seed, ac_index=1, result=replace(attempt, retry_attempt=1))
+    assert second.success is False
+    assert "start=1" not in second.check_package_repair
+    assert "1 held-out case(s) also failed" in second.check_package_repair
+    assert await _reveals(store, authority) == ["held"]
+    assert authority.revealed == {"oracle_2": {"held"}}
+
+
+@pytest.mark.parametrize(("retries", "attempt_number"), [(0, 0), (2, 2)])
+async def test_no_reveal_on_the_final_attempt(
+    store: EventStore, repo: Path, tmp_path: Path, retries: int, attempt_number: int
+) -> None:
+    # A4: no repair follows the final attempt, so nothing is revealed or
+    # retired, and the held-out-only diagnostic still counts the failure.
+    seed, authority = await _two_held_authority(store, repo, tmp_path, retries=retries)
+    (repo / "mathutils.py").write_text(FIXED + WRONG_MIX)
+    attempt = replace(_legacy_rejected(1, entry=MIX_ENTRY), retry_attempt=attempt_number)
+    gated = await authority.gate(seed=seed, ac_index=1, result=attempt)
+    assert gated.success is False
+    assert "revealed" not in gated.check_package_repair
+    assert "2 held-out case(s) also failed" in gated.check_package_repair
+    assert await _reveals(store, authority) == [] and authority.revealed == {}
+    parallel = ParallelExecutionResult(
+        results=(_legacy_rejected(0), gated), success_count=1, failure_count=1
+    )
+    await authority(seed=seed, execution_id="exec_two_held", parallel_result=parallel)
+    final = authority.outcome.verdict.verdicts[seed_criterion_keys(seed)[1]]
+    assert final.status is PackageCriterionStatus.FAIL and final.failed_heldout_only is True
+
+
+async def test_a_rejected_declaration_gets_a_repair_message_with_its_reason(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # A5: binding_invalid used to end the run indeterminate without telling
+    # the worker why; now the reason goes into the repair.
+    seed, authority = await _authority(store, repo, tmp_path)
+    authority.install(_executor(repo))
+    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
+    wrong = {"symbol": "mathutils.blend", "arg_map": MIX_ENTRY["arg_map"]}
+    gated = await authority.gate(seed=seed, ac_index=1, result=_legacy_rejected(1, entry=wrong))
+    assert gated.success is False
+    assert gated.check_package_failure_class.startswith("CHECK_PACKAGE_FAIL:")
+    repair = gated.check_package_repair
+    assert "rejected: binding_invalid:symbol_not_found" in repair
+    assert "function mathutils.blend" in repair and "(a, b, t)" in repair
+    assert "2.5" not in repair  # no oracle value
+    # The worker fixes its declaration within the retry budget.
+    fixed = await authority.gate(
+        seed=seed, ac_index=1, result=replace(_legacy_rejected(1, entry=MIX_ENTRY), retry_attempt=1)
+    )
+    assert fixed.success is True

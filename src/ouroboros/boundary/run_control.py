@@ -328,6 +328,11 @@ class CheckPackageRun:
                 "Check package was not consulted: this execution path does not support it; "
                 "the existing verifier decided the run."
             ]
+        if outcome.fallback_reason is not None:
+            return [
+                f"Check package could not decide this run ({outcome.fallback_reason}); "
+                "legacy verification decided this run."
+            ]
         if outcome.error is not None:
             return [
                 f"Check package verification failed ({outcome.error}); "

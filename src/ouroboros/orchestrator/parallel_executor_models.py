@@ -108,6 +108,9 @@ class ACExecutionResult:
     # drives the retry kill criterion instead of the advisory legacy class.
     check_package_repair: str | None = None
     check_package_failure_class: str | None = None
+    # The legacy verifier's rejection that the check package made advisory.
+    # If the package cannot decide the run, it is restored (legacy fallback).
+    legacy_rejection: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize outcome so callers do not infer from error strings."""

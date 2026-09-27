@@ -42,6 +42,7 @@ from ouroboros.boundary.events import (
     CANDIDATE_VERIFIED,
     CASE_REVEALED,
     CONSTRUCTION_FAILED,
+    LEGACY_FALLBACK,
     PACKAGE_FROZEN,
     SELECTION_DECIDED,
     SUPERSEDED,
@@ -52,6 +53,7 @@ from ouroboros.boundary.events import (
     candidate_verified_event,
     case_revealed_event,
     construction_failed_event,
+    legacy_fallback_event,
     package_frozen_event,
     selection_decided_event,
     superseded_event,
@@ -422,6 +424,22 @@ class BoundaryLedger:
         event = acceptance_reconciled_event(
             boundary_id, package_sha256=package_sha256, reconciliation=reconciliation
         )
+        await self._store.append(event)
+        return event
+
+    async def record_legacy_fallback(self, boundary_id: str, *, reason: str) -> BaseEvent:
+        """Record, once, that the legacy verifier decided a run whose worker started."""
+        events = await self.events(boundary_id)
+        if _first(events, ACTOR_STARTED) is None:
+            raise BoundaryOrderError(
+                "a fallback is recorded only for a started worker",
+                details={"boundary_id": boundary_id},
+            )
+        if _first(events, LEGACY_FALLBACK) is not None:
+            raise BoundaryOrderError(
+                "legacy fallback already recorded", details={"boundary_id": boundary_id}
+            )
+        event = legacy_fallback_event(boundary_id, reason=reason)
         await self._store.append(event)
         return event
 

@@ -14,6 +14,9 @@ Event Types (aggregate_type ``boundary``, aggregate_id = boundary id):
     boundary.oracle.case_revealed - one held-out case was shown to the worker
         in a repair message and is retired from held-out statistics (case id
         only; the inputs stay out of the journal)
+    boundary.acceptance.legacy_fallback - the package could not decide the
+        run (for example the acceptance authority raised); the legacy
+        verifier's verdicts were restored and decided it (reason only)
 
 Payloads never carry generated file contents, check argv, or check output, so
 the shared journal does not expose check code or counterexamples. The package
@@ -42,6 +45,7 @@ SUPERSEDED = "boundary.check_package.superseded"
 ACCEPTANCE_RECONCILED = "boundary.acceptance.reconciled"
 BINDING_RECORDED = "boundary.binding.recorded"
 CASE_REVEALED = "boundary.oracle.case_revealed"
+LEGACY_FALLBACK = "boundary.acceptance.legacy_fallback"
 
 
 def _event(boundary_id: str, event_type: str, data: dict[str, Any]) -> BaseEvent:
@@ -166,3 +170,8 @@ def case_revealed_event(
             "retry_attempt": retry_attempt,
         },
     )
+
+
+def legacy_fallback_event(boundary_id: str, *, reason: str) -> BaseEvent:
+    """The legacy verifier decided this run because the package could not."""
+    return _event(boundary_id, LEGACY_FALLBACK, {"reason": reason})
