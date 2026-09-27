@@ -899,6 +899,40 @@ class TestIsolationRecord:
         assert command_replay.replay_unavailable_reason() == reason.value
         assert not marker.exists()
 
+    @pytest.mark.parametrize("live", ["on", "off"])
+    async def test_the_sealed_sandbox_policy_wins_over_the_live_switch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: str
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        marker = workspace / "ran"
+        _executable(workspace / "run_tests.sh", "#!/bin/sh\ntouch ran\n")
+        candidate = replay_candidate("./run_tests.sh", str(workspace))
+        assert candidate is not None
+        monkeypatch.setenv(exec_sandbox.EXEC_SANDBOX_ENV_VAR, live)
+        monkeypatch.setattr(exec_sandbox, "filesystem_backend", lambda: None)
+
+        sealed_on = await replay_commands(
+            (candidate,),
+            workspace=str(workspace),
+            env=dict(os.environ),
+            timeout_seconds=30,
+            sandbox_enabled=True,
+        )
+        sealed_off = await replay_commands(
+            (candidate,),
+            workspace=str(workspace),
+            env=dict(os.environ),
+            timeout_seconds=30,
+            sandbox_enabled=False,
+        )
+
+        # Sealed on without a backend: nothing runs, whatever the live switch says.
+        assert sealed_on == ()
+        assert command_replay.replay_unavailable_reason(True) == "sandbox_unavailable"
+        # Sealed off: the run was confined by nothing, and says so.
+        assert len(sealed_off) == 1 and not sealed_off[0].network_isolated
+        assert not marker.exists()
+
     async def test_skip_is_recorded_and_claims_keep_transcript_rules(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_replay_isolation: None
     ) -> None:

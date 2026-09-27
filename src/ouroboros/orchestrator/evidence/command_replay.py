@@ -542,9 +542,13 @@ def select_replay_candidates(
     return tuple([*linked, *recognized][:MAX_REPLAYED_COMMANDS])
 
 
-def replay_unavailable_reason() -> str | None:
-    """Return why nothing can be replayed on this host, or None when it can."""
-    reason = sandbox_unavailable_reason(deny_network=True)
+def replay_unavailable_reason(sandbox_enabled: bool | None = None) -> str | None:
+    """Return why nothing can be replayed on this host, or None when it can.
+
+    ``sandbox_enabled`` is the caller's sealed sandbox policy; None reads the
+    live switch.
+    """
+    reason = sandbox_unavailable_reason(deny_network=True, enabled=sandbox_enabled)
     return None if reason is None else reason.value
 
 
@@ -681,6 +685,7 @@ async def _replay_one(
     workspace: str,
     env: Mapping[str, str],
     timeout_seconds: float,
+    sandbox_enabled: bool | None,
 ) -> CommandObservation | None:
     source = Path(workspace).resolve()
     scratch = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="ouroboros-replay-"))
@@ -717,6 +722,7 @@ async def _replay_one(
             env_passthrough=REPLAY_ENV_PASSTHROUGH,
             # No bytecode caches: they would be writes into linked live trees.
             env_set={**env_delta, "PYTHONDONTWRITEBYTECODE": "1"},
+            enabled=sandbox_enabled,
         )
         if isinstance(confined, SandboxUnavailable):
             return None
@@ -766,16 +772,19 @@ async def replay_commands(
     workspace: str,
     env: Mapping[str, str],
     timeout_seconds: float,
+    sandbox_enabled: bool | None = None,
 ) -> tuple[CommandObservation, ...]:
     """Replay each candidate in its own fresh copy of ``workspace``.
 
     Nothing runs when the execution sandbox is unavailable
     (``replay_unavailable_reason``) or for a candidate the allowlist and
-    denylist do not admit.
+    denylist do not admit. ``sandbox_enabled`` is the caller's sealed sandbox
+    policy (the executor's, from the execution-semantics contract); None
+    reads the live switch.
     """
     if not candidates:
         return ()
-    if await asyncio.to_thread(replay_unavailable_reason) is not None:
+    if await asyncio.to_thread(replay_unavailable_reason, sandbox_enabled) is not None:
         return ()
     observations: list[CommandObservation] = []
     for candidate in candidates[:MAX_REPLAYED_COMMANDS]:
@@ -786,6 +795,7 @@ async def replay_commands(
             workspace=workspace,
             env=env,
             timeout_seconds=timeout_seconds,
+            sandbox_enabled=sandbox_enabled,
         )
         if observation is not None:
             observations.append(observation)

@@ -156,11 +156,19 @@ command text a second way. The rules:
   live workspace, `HOME`, the system temp directory and every other path are
   read-only to it. Reading and executing are not restricted. On macOS this is
   `sandbox-exec` with a generated profile that denies `file-write*` outside
-  those roots; on Linux it is Landlock, applied in the child before it execs
-  the command (unprivileged, no mount or user namespace, so it works in
-  containers). Each backend is probed once per process: a probe program must
-  write inside a root and fail to write next to it. Where no backend works
-  (Windows, a kernel without Landlock, an already-sandboxed macOS process),
+  those roots; on Linux it is Landlock (ABI 3, Linux 6.2, or newer; below
+  it truncation cannot be denied), applied in the child before it execs the
+  command (unprivileged, no mount or user namespace, so it works in
+  containers). The launchers start with a fixed bootstrap environment; the
+  command's environment, including its own assignments such as
+  `LD_PRELOAD=...`, takes effect only when the command itself is exec'd
+  inside the sandbox. The sandbox policy is sealed in the run's
+  execution-semantics contract, so a resume with the switch changed is
+  refused rather than replaying under a different policy. Each backend is
+  probed once per process: a probe program must write inside a root and fail
+  to create, write or truncate anything next to it. Where no backend works
+  (Windows, a kernel without Landlock ABI 3, an already-sandboxed macOS
+  process),
   nothing is replayed, the claims keep the transcript-only rules, and the
   observation records `replay_skipped: sandbox_unavailable`. Under Landlock
   the command also cannot read `/proc/<pid>/environ`, `mem` or `maps` of the

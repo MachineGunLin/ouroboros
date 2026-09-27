@@ -1,17 +1,25 @@
-"""Confine this process with Landlock, then exec the command (Linux).
+"""Finish confining this process, then exec the command with its environment.
 
 Run as a standalone script, never imported into the controller:
 
-    python -I -S -B _landlock_exec.py --write DIR [--write DIR ...] -- ARGV...
+    python -I -S -B _confine_exec.py [--landlock --write DIR ...] -- ARGV...
 
-It is the Linux backend of ``ouroboros.runtime.exec_sandbox``. The ruleset
-handles every filesystem right that creates, changes or removes something
-(the rights the running kernel's Landlock ABI knows), and grants them only
-beneath each ``--write`` directory. Writing to a few character devices
-(``/dev/null`` and friends) is also granted. Reading and executing are not
-handled, so they stay governed by the ordinary file permissions. The
-restriction is applied to this process and inherited by everything it execs
-or forks; it cannot be lifted.
+It is the last step of every ``ouroboros.runtime.exec_sandbox`` backend. It is
+started with a fixed bootstrap environment, so nothing the command's own
+environment names (``LD_PRELOAD``, ``DYLD_INSERT_LIBRARIES``, ...) can run
+before confinement. The command's environment arrives as JSON in
+``OUROBOROS_SANDBOX_COMMAND_ENV`` and is applied only by the final
+``execvpe``, after:
+
+- on Linux (``--landlock``), a Landlock ruleset that handles every filesystem
+  right that creates, changes, truncates or removes something and grants them
+  only beneath each ``--write`` directory (plus writing to ``/dev/null`` and a
+  few other character devices). Reading and executing are not handled. Landlock
+  ABI 3 (Linux 6.2) is the minimum: below it, truncation cannot be denied.
+  The restriction is inherited by everything the command execs or forks, and
+  Landlock also denies ptrace-mode access (``/proc/<pid>/environ``, ``mem``,
+  ``maps``) to processes outside the domain;
+- on macOS, nothing more: ``sandbox-exec`` already confined this process.
 
 It depends on nothing but the standard library, so it starts with ``-S`` (no
 ``site``) and ``-I`` (no environment-controlled import paths). Every failure
@@ -23,6 +31,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import ctypes
+import json
 import os
 import struct
 import sys
@@ -75,6 +84,10 @@ WRITABLE_DEVICES = (
     "/dev/urandom",
     "/dev/tty",
 )
+
+# Below ABI 3, Landlock cannot deny truncating a file outside the writable roots.
+MIN_LANDLOCK_ABI = 3
+COMMAND_ENV_VARIABLE = "OUROBOROS_SANDBOX_COMMAND_ENV"
 
 EXIT_SANDBOX_FAILED = 125
 EXIT_NOT_EXECUTABLE = 126
@@ -157,8 +170,11 @@ def _add_rule(syscall: Callable[..., Any], ruleset: int, path: str, access: int)
 def restrict_writes(writable: list[str]) -> int:
     """Allow writes only beneath ``writable`` for this process; return the ABI."""
     abi = landlock_abi()
-    if abi < 1:
-        raise SandboxError("Landlock is not supported or not enabled by this kernel")
+    if abi < MIN_LANDLOCK_ABI:
+        raise SandboxError(
+            f"Landlock ABI {abi} is below {MIN_LANDLOCK_ABI} (unsupported, disabled, "
+            "or unable to deny truncation)"
+        )
     syscall = _syscall()
     handled = handled_write_access(abi)
     attr = _RulesetAttr(handled_access_fs=handled)
@@ -199,35 +215,55 @@ def restrict_writes(writable: list[str]) -> int:
     return abi
 
 
-def _parse(arguments: list[str]) -> tuple[list[str], list[str]]:
+def _parse(arguments: list[str]) -> tuple[bool, list[str], list[str]]:
+    landlock = bool(arguments) and arguments[0] == "--landlock"
+    index = 1 if landlock else 0
     writable: list[str] = []
-    index = 0
     while index < len(arguments) and arguments[index] == "--write":
         if index + 1 >= len(arguments):
             raise SandboxError("--write needs a directory")
         writable.append(arguments[index + 1])
         index += 2
     if index >= len(arguments) or arguments[index] != "--" or index + 1 >= len(arguments):
-        raise SandboxError("usage: --write DIR [--write DIR ...] -- ARGV...")
-    return writable, arguments[index + 1 :]
+        raise SandboxError("usage: [--landlock --write DIR ...] -- ARGV...")
+    if writable and not landlock:
+        raise SandboxError("--write needs --landlock")
+    return landlock, writable, arguments[index + 1 :]
+
+
+def _command_environment() -> dict[str, str]:
+    raw = os.environ.get(COMMAND_ENV_VARIABLE)
+    if raw is None:
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not set")
+    try:
+        env = json.loads(raw)
+    except ValueError as exc:
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not JSON: {exc}") from None
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+    ):
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not a string mapping")
+    return env
 
 
 def main(arguments: list[str]) -> int:
     try:
-        writable, command = _parse(arguments)
-        restrict_writes(writable)
+        landlock, writable, command = _parse(arguments)
+        env = _command_environment()
+        if landlock:
+            restrict_writes(writable)
     except (SandboxError, OSError) as exc:
         sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
         return EXIT_SANDBOX_FAILED
     try:
-        os.execvp(command[0], command)
+        os.execvpe(command[0], command, env)
     except FileNotFoundError as exc:
         sys.stderr.write(f"ouroboros exec sandbox: {command[0]}: {exc.strerror}\n")
         return EXIT_NOT_FOUND
     except OSError as exc:
         sys.stderr.write(f"ouroboros exec sandbox: {command[0]}: {exc.strerror}\n")
         return EXIT_NOT_EXECUTABLE
-    return EXIT_NOT_EXECUTABLE  # pragma: no cover - execvp does not return
+    return EXIT_NOT_EXECUTABLE  # pragma: no cover - execvpe does not return
 
 
 if __name__ == "__main__":

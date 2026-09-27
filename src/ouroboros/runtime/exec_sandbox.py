@@ -39,7 +39,12 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   locale, ``TZ`` and Python I/O settings) are copied from the source
   environment; ``TMPDIR``, ``TMP`` and ``TEMP`` point to the temp directory,
   and so does ``HOME`` unless the caller passes it through; ``env_set``
-  values are applied last.
+  values are applied last. That environment (``ConfinedCommand.command_env``)
+  takes effect only when the command itself is exec'd, inside the sandbox:
+  every launcher (``sandbox-exec``, ``unshare``, the helper) starts with a
+  fixed bootstrap environment (``ConfinedCommand.env``), so a loader control
+  the command names (``LD_PRELOAD``, ``DYLD_INSERT_LIBRARIES``) cannot run
+  code before confinement.
 
 Backends:
 
@@ -47,8 +52,10 @@ Backends:
   then ``file-write*`` denied except beneath the writable roots (passed as
   profile parameters, so no path is ever spliced into the profile text) and
   the devices; network denial allows only loopback IP.
-- **Linux**: Landlock, applied by ``_landlock_exec.py`` in the child before it
-  execs the command. It is unprivileged and needs no mount or user
+- **Linux**: Landlock (ABI 3, Linux 6.2, or newer: below it truncation
+  cannot be denied), applied by the helper ``_confine_exec.py`` before it
+  execs the command. On macOS the same helper runs inside ``sandbox-exec``
+  and only applies the command's environment. It is unprivileged and needs no mount or user
   namespace, so it works in containers. Network denial uses an unprivileged
   network namespace (``unshare --user --map-root-user --net``), or nothing
   extra when this process's network namespace already has only loopback (a
@@ -59,14 +66,17 @@ Backends:
 
 Each backend is probed once per process by running a small Python program
 under it that must be able to write inside a writable root and must fail to
-write next to it.
+create, write or truncate anything next to it.
 
 Unsafe off switch: ``OUROBOROS_EXEC_SANDBOX=off`` in the environment, or
 ``execution.exec_sandbox: false`` in ``~/.ouroboros/config.yaml``, makes
 ``confine`` return the argv unchanged with ``backend=DISABLED`` and
 ``network_denied=False`` (the environment is still built the same way). The
 sandbox is on by default, and a project ``.env`` cannot turn it off
-(``config/untrusted_env.py``).
+(``config/untrusted_env.py``). A caller with a durable policy passes it as
+``enabled`` (the orchestrator seals it in the execution-semantics contract,
+so a resumed run cannot silently change it); ``enabled=None`` reads the
+live switch.
 
 Outside this boundary: effects the confined process asks another, unconfined
 process to perform over IPC (a user service manager, a desktop automation
@@ -79,6 +89,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 import functools
+import json
 import os
 from pathlib import Path
 import shutil
@@ -114,7 +125,9 @@ DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
 TEMP_DIRECTORY_VARIABLES: tuple[str, ...] = ("TMPDIR", "TMP", "TEMP")
 
 _PROBE_TIMEOUT_SECONDS = 10.0
-_LANDLOCK_HELPER = Path(__file__).with_name("_landlock_exec.py")
+_CONFINE_HELPER = Path(__file__).with_name("_confine_exec.py")
+# Must match ``_confine_exec.COMMAND_ENV_VARIABLE`` (the helper is not imported).
+_COMMAND_ENV_VARIABLE = "OUROBOROS_SANDBOX_COMMAND_ENV"
 
 # macOS: profile parameters ``W0``..``Wn`` carry the writable roots.
 _DARWIN_DEVICE_RULES = (
@@ -164,16 +177,27 @@ class SandboxUnavailable:
 
 @dataclass(frozen=True, slots=True)
 class ConfinedCommand:
-    """What to spawn: ``argv`` in ``cwd`` with exactly ``env``."""
+    """What to spawn: ``argv`` in ``cwd`` with exactly ``env``.
+
+    ``env`` is the launchers' fixed bootstrap environment, which carries
+    ``command_env``; the command itself runs with exactly ``command_env``.
+    With the sandbox switched off the two are the same.
+    """
 
     argv: tuple[str, ...]
     env: Mapping[str, str]
+    command_env: Mapping[str, str]
     cwd: str
     backend: SandboxBackend
     writable_roots: tuple[str, ...]
     network_denied: bool
     isolates_process_environments: bool
     """Whether the command cannot read other processes' environments (Landlock only)."""
+
+
+def sandbox_enabled() -> bool:
+    """The live sandbox policy: False only when the unsafe off switch is set."""
+    return not sandbox_disabled()
 
 
 def sandbox_disabled() -> bool:
@@ -214,29 +238,47 @@ def _backend_argv(
     roots: Sequence[str],
     network_prefix: tuple[str, ...] | None,
 ) -> tuple[str, ...]:
-    """The argv running ``argv`` under ``backend``; ``network_prefix`` None allows network."""
+    """The argv running ``argv`` under ``backend``; ``network_prefix`` None allows network.
+
+    Every backend ends in ``_confine_exec.py``, which applies the command's
+    environment only when it execs the command, inside the sandbox.
+    """
+    helper = (sys.executable, "-I", "-S", "-B", str(_CONFINE_HELPER))
     if backend is SandboxBackend.SANDBOX_EXEC:
         executable = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
         profile = _darwin_profile(len(roots), deny_network=network_prefix is not None)
         params = [part for index, root in enumerate(roots) for part in ("-D", f"W{index}={root}")]
-        return (executable, "-p", profile, *params, "--", *argv)
-    if backend is SandboxBackend.LANDLOCK:
-        writes = [part for root in roots for part in ("--write", root)]
-        helper = (sys.executable, "-I", "-S", "-B", str(_LANDLOCK_HELPER), *writes, "--")
-        return (*(network_prefix or ()), *helper, *argv)
-    return tuple(argv)
+        return (executable, "-p", profile, *params, "--", *helper, "--", *argv)
+    writes = [part for root in roots for part in ("--write", root)]
+    return (*(network_prefix or ()), *helper, "--landlock", *writes, "--", *argv)
 
 
+def _bootstrap_environment(command_env: Mapping[str, str]) -> dict[str, str]:
+    """The fixed environment the launchers start with; the command's rides along.
+
+    Nothing in ``command_env`` is in effect until ``_confine_exec.py`` execs
+    the command, so a loader or interpreter control it names (``LD_PRELOAD``,
+    ``DYLD_INSERT_LIBRARIES``) cannot run before confinement.
+    """
+    return {"PATH": os.defpath, _COMMAND_ENV_VARIABLE: json.dumps(dict(command_env))}
+
+
+# The probe must write inside its root and fail to create, write or truncate
+# anything beside it.
 _PROBE_PROGRAM = (
     "import os, sys\n"
     "inside, outside = sys.argv[1], sys.argv[2]\n"
     "with open(os.path.join(inside, 'probe'), 'w') as handle:\n"
     "    handle.write('ok')\n"
-    "try:\n"
-    "    open(os.path.join(outside, 'probe'), 'w').close()\n"
-    "except OSError:\n"
-    "    sys.exit(0)\n"
-    "sys.exit(3)\n"
+    "for attempt in (\n"
+    "    lambda: open(os.path.join(outside, 'probe'), 'w').close(),\n"
+    "    lambda: os.truncate(os.path.join(outside, 'existing'), 0),\n"
+    "):\n"
+    "    try:\n"
+    "        attempt()\n"
+    "    except OSError:\n"
+    "        continue\n"
+    "    sys.exit(3)\n"
 )
 
 
@@ -255,6 +297,7 @@ def filesystem_backend() -> SandboxBackend | None:
         outside = probe_root / "outside"
         inside.mkdir()
         outside.mkdir()
+        (outside / "existing").write_text("keep", encoding="utf-8")
         argv = _backend_argv(
             candidate,
             (sys.executable, "-I", "-S", "-c", _PROBE_PROGRAM, str(inside), str(outside)),
@@ -263,7 +306,11 @@ def filesystem_backend() -> SandboxBackend | None:
         )
         try:
             result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                argv, capture_output=True, timeout=_PROBE_TIMEOUT_SECONDS, check=False
+                argv,
+                env=_bootstrap_environment({"PATH": os.defpath}),
+                capture_output=True,
+                timeout=_PROBE_TIMEOUT_SECONDS,
+                check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -271,6 +318,7 @@ def filesystem_backend() -> SandboxBackend | None:
             result.returncode == 0
             and (inside / "probe").is_file()
             and not (outside / "probe").exists()
+            and (outside / "existing").read_text(encoding="utf-8") == "keep"
         )
         if not confined:
             log.info(
@@ -324,12 +372,15 @@ def network_denial_prefix() -> tuple[str, ...] | None:
     return prefix if result.returncode == 0 else None
 
 
-def sandbox_unavailable_reason(*, deny_network: bool = True) -> SandboxUnavailableReason | None:
+def sandbox_unavailable_reason(
+    *, deny_network: bool = True, enabled: bool | None = None
+) -> SandboxUnavailableReason | None:
     """Why ``confine`` would refuse on this host, or None when it would confine.
 
-    None as well when the unsafe off switch is set.
+    None as well when the sandbox is switched off (``enabled``, or the live
+    switch when ``enabled`` is None).
     """
-    if sandbox_disabled():
+    if not (sandbox_enabled() if enabled is None else enabled):
         return None
     if filesystem_backend() is None:
         return SandboxUnavailableReason.SANDBOX_UNAVAILABLE
@@ -365,12 +416,15 @@ def confine(
     env_source: Mapping[str, str] | None = None,
     env_passthrough: Sequence[str] = DEFAULT_ENV_PASSTHROUGH,
     env_set: Mapping[str, str] | None = None,
+    enabled: bool | None = None,
 ) -> ConfinedCommand | SandboxUnavailable:
     """Return how to run ``argv`` confined, or why it cannot be.
 
     ``writable_roots`` and ``temp_dir`` must be existing directories; the
     caller creates them and removes them afterwards. ``temp_dir`` is writable
-    too. ``argv`` is run directly, never through a shell.
+    too. ``argv`` is run directly, never through a shell. ``enabled`` is the
+    caller's sealed sandbox policy (a resumed run keeps the one it started
+    with); None reads the live switch (``sandbox_enabled``).
     """
     real_temp = os.path.realpath(temp_dir)
     roots: list[str] = []
@@ -383,18 +437,19 @@ def confine(
     env = build_environment(
         real_temp, source=env_source, passthrough=env_passthrough, overrides=env_set
     )
-    if sandbox_disabled():
+    if not (sandbox_enabled() if enabled is None else enabled):
         _warn_disabled()
         return ConfinedCommand(
             argv=tuple(argv),
             env=env,
+            command_env=env,
             cwd=cwd,
             backend=SandboxBackend.DISABLED,
             writable_roots=tuple(roots),
             network_denied=False,
             isolates_process_environments=False,
         )
-    reason = sandbox_unavailable_reason(deny_network=deny_network)
+    reason = sandbox_unavailable_reason(deny_network=deny_network, enabled=True)
     if reason is not None:
         return SandboxUnavailable(reason)
     backend = filesystem_backend()
@@ -402,7 +457,8 @@ def confine(
     network_prefix = network_denial_prefix() if deny_network else None
     return ConfinedCommand(
         argv=_backend_argv(backend, argv, roots, network_prefix),
-        env=env,
+        env=_bootstrap_environment(env),
+        command_env=env,
         cwd=cwd,
         backend=backend,
         writable_roots=tuple(roots),
@@ -435,5 +491,6 @@ __all__ = [
     "filesystem_backend",
     "network_denial_prefix",
     "sandbox_disabled",
+    "sandbox_enabled",
     "sandbox_unavailable_reason",
 ]

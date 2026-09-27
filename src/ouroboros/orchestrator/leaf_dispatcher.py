@@ -962,7 +962,8 @@ class LeafDispatcher:
         )
         if not candidates:
             return observation
-        skipped = await asyncio.to_thread(replay_unavailable_reason)
+        sandbox_enabled = getattr(executor, "_exec_sandbox_enabled", None)
+        skipped = await asyncio.to_thread(replay_unavailable_reason, sandbox_enabled)
         if skipped is not None:
             # No execution sandbox: nothing is replayed, and the claims keep
             # the transcript-only rules.
@@ -973,6 +974,7 @@ class LeafDispatcher:
             workspace=task_cwd,
             env=sanitized_verify_environment(),
             timeout_seconds=float(timeout_seconds),
+            sandbox_enabled=sandbox_enabled,
         )
         if not runs:
             return observation

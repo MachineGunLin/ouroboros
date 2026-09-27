@@ -17,7 +17,7 @@ import sys
 import pytest
 
 from ouroboros.config.untrusted_env import UNTRUSTED_ENV_DENYLIST
-from ouroboros.runtime import _landlock_exec, exec_sandbox
+from ouroboros.runtime import _confine_exec, exec_sandbox
 from ouroboros.runtime.exec_sandbox import (
     DEFAULT_ENV_PASSTHROUGH,
     EXEC_SANDBOX_ENV_VAR,
@@ -277,8 +277,10 @@ def test_linux_ci_runner_has_landlock() -> None:
     """On GitHub Actions the Linux backend must exist, so its tests really run there."""
     if os.environ.get("GITHUB_ACTIONS") != "true":
         pytest.skip("only asserted on the GitHub Actions runner")
-    abi = _landlock_exec.landlock_abi()
-    assert abi >= 1, f"Landlock unavailable on this runner (kernel {os.uname().release})"
+    abi = _confine_exec.landlock_abi()
+    assert abi >= _confine_exec.MIN_LANDLOCK_ABI, (
+        f"Landlock ABI {abi} unusable on this runner (kernel {os.uname().release})"
+    )
     assert exec_sandbox.filesystem_backend() is SandboxBackend.LANDLOCK
 
 
@@ -423,19 +425,79 @@ class TestEnvironment:
         assert env["HOME"] == "/home/u"
 
 
+class TestNothingRunsBeforeConfinement:
+    """The command's environment takes effect only when the command is exec'd."""
+
+    def test_launchers_start_with_the_bootstrap_environment(
+        self, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(exec_sandbox, "filesystem_backend", lambda: SandboxBackend.LANDLOCK)
+        monkeypatch.setattr(exec_sandbox, "network_denial_prefix", lambda: ("unshare", "--"))
+        loader = {"LD_PRELOAD": "./evil.so", "DYLD_INSERT_LIBRARIES": "./evil.dylib"}
+
+        command = confine(
+            ("./run_tests.sh",),
+            cwd=str(layout["copy"]),
+            writable_roots=(str(layout["copy"]),),
+            temp_dir=str(layout["temp"]),
+            env_set=loader,
+        )
+
+        assert isinstance(command, ConfinedCommand)
+        assert set(command.env) == {"PATH", _confine_exec.COMMAND_ENV_VARIABLE}
+        assert command.env["PATH"] == os.defpath
+        carried = json.loads(command.env[_confine_exec.COMMAND_ENV_VARIABLE])
+        assert carried == dict(command.command_env)
+        assert carried["LD_PRELOAD"] == "./evil.so"
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="glibc LD_PRELOAD")
+    def test_a_preload_the_command_names_reaches_only_the_command(
+        self, layout: dict[str, Path]
+    ) -> None:
+        _require_backend()
+        missing = "/nonexistent/ouroboros-sandbox-preload.so"
+        command = confine(
+            _python("pass"),
+            cwd=str(layout["copy"]),
+            writable_roots=(str(layout["copy"]),),
+            temp_dir=str(layout["temp"]),
+            deny_network=False,
+            env_set={"LD_PRELOAD": missing},
+        )
+        assert isinstance(command, ConfinedCommand)
+
+        result = _run(command)
+
+        # The dynamic loader reports the missing preload once per process that
+        # starts with it: the command, and none of the launchers before it.
+        assert result.returncode == 0, result.stderr
+        assert result.stderr.count(missing) == 1, result.stderr
+
+
 class TestLandlockAccessMask:
     def test_rights_follow_the_abi(self) -> None:
         refer, truncate = 1 << 13, 1 << 14
 
-        assert _landlock_exec.handled_write_access(0) == 0
-        abi1 = _landlock_exec.handled_write_access(1)
+        assert _confine_exec.handled_write_access(0) == 0
+        abi1 = _confine_exec.handled_write_access(1)
         assert abi1 and not abi1 & (refer | truncate)
-        assert _landlock_exec.handled_write_access(2) == abi1 | refer
-        assert _landlock_exec.handled_write_access(3) == abi1 | refer | truncate
-        assert _landlock_exec.handled_write_access(8) == abi1 | refer | truncate
+        assert _confine_exec.handled_write_access(2) == abi1 | refer
+        assert _confine_exec.handled_write_access(3) == abi1 | refer | truncate
+        assert _confine_exec.handled_write_access(8) == abi1 | refer | truncate
         # Reading and executing are never handled.
         read_rights = (1 << 0) | (1 << 2) | (1 << 3)
-        assert not _landlock_exec.handled_write_access(8) & read_rights
+        assert not _confine_exec.handled_write_access(8) & read_rights
+
+    def test_helper_refuses_an_abi_that_cannot_deny_truncation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(_confine_exec, "landlock_abi", lambda: 2)
+        monkeypatch.setenv(_confine_exec.COMMAND_ENV_VARIABLE, "{}")
+
+        status = _confine_exec.main(["--landlock", "--write", str(tmp_path), "--", "true"])
+
+        assert status == _confine_exec.EXIT_SANDBOX_FAILED
+        assert _confine_exec.MIN_LANDLOCK_ABI == 3
 
     def test_helper_refuses_without_a_command(self) -> None:
-        assert _landlock_exec.main(["--write", "/tmp"]) == _landlock_exec.EXIT_SANDBOX_FAILED
+        assert _confine_exec.main(["--write", "/tmp"]) == _confine_exec.EXIT_SANDBOX_FAILED
