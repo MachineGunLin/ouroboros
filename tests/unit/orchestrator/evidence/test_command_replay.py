@@ -1251,3 +1251,78 @@ class TestLinkedLiveTrees:
         # Writes inside the copy are not blocked, and the denied writes left
         # nothing changed, so the run itself succeeds.
         assert run.succeeded, run.output_tail
+
+
+def _transcript_only_verdict(
+    workspace: Path, transcript: tuple[AgentMessage, ...], evidence: dict[str, object]
+) -> VerifierVerdict:
+    """The transcript verifier alone: a harness observation with no replayed runs."""
+    final = _final(evidence)
+    messages = [*_edit(workspace / "calc.py", "edit"), *transcript, final]
+    insert_observation_message(messages, WorkspaceObservation(changed_paths=frozenset({"calc.py"})))
+    return _verify_atomic_evidence_against_runtime_messages(
+        messages=tuple(messages),
+        typed_evidence=EvidenceRecord(data=evidence),
+        ac_content=AC,
+        execution_profile=load_profile("code"),
+        task_cwd=str(workspace),
+        adapter_working_directory=str(workspace),
+        verify_gate_active=True,
+    )
+
+
+class TestTranscriptOnlyHoles:
+    """False accepts that predate replay, closed on the transcript-only path."""
+
+    def _pytest_run(self, command: str) -> tuple[AgentMessage, ...]:
+        return _ran(command, "c1", exit_code=0)[:1] + (
+            _bash_result("c1", exit_code=0, output="1 passed in 0.01s"),
+        )
+
+    def test_excluding_run_does_not_back_the_excluded_file(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        (workspace / "tests" / "test_bad.py").write_text("def test_bad():\n    assert False\n")
+        command = "python -m pytest -q --ignore tests/test_bad.py"
+        transcript = (*_edit(workspace / "tests" / "test_bad.py", "e2"), *self._pytest_run(command))
+
+        verdict = _transcript_only_verdict(
+            workspace, transcript, _evidence(command, ["tests/test_bad.py"])
+        )
+
+        assert verdict.passed is False
+
+    def test_executing_run_still_backs_its_file(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        (workspace / "tests" / "test_good.py").write_text("def test_good():\n    assert True\n")
+        command = "python -m pytest -q tests/test_good.py"
+        transcript = (
+            *_edit(workspace / "tests" / "test_good.py", "e2"),
+            *self._pytest_run(command),
+        )
+
+        verdict = _transcript_only_verdict(
+            workspace, transcript, _evidence(command, ["tests/test_good.py"])
+        )
+
+        assert verdict.passed is True, verdict.reasons
+
+    def test_pipeline_exit_does_not_back_its_core_script(self, tmp_path: Path) -> None:
+        # The script fails; the pipeline's recorded exit is tail's.
+        workspace = _workspace(tmp_path / "ws", correct=False)
+
+        verdict = _transcript_only_verdict(
+            workspace,
+            _ran("./run_tests.sh | tail -5", "c1", exit_code=0),
+            _evidence("./run_tests.sh"),
+        )
+
+        assert verdict.passed is False
+
+    def test_direct_script_run_still_backs_its_claim(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+
+        verdict = _transcript_only_verdict(
+            workspace, _ran("./run_tests.sh", "c1", exit_code=0), _evidence("./run_tests.sh")
+        )
+
+        assert verdict.passed is True, verdict.reasons

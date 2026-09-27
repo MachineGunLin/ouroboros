@@ -24,7 +24,11 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     CommandObservation,
     observation_from_message,
 )
-from ouroboros.orchestrator.evidence.replay_policy import run_may_back_test_claim
+from ouroboros.orchestrator.evidence.replay_policy import (
+    claim_target_operands,
+    excludes_tests,
+    run_may_back_test_claim,
+)
 from ouroboros.orchestrator.evidence.shell_parsing import (
     _has_trailing_output_filter_pipeline,
     _is_django_test_subcommand,
@@ -32,12 +36,15 @@ from ouroboros.orchestrator.evidence.shell_parsing import (
     _looks_like_test_command,
     _looks_like_unittest_command,
     _normalized_command_claim_aliases,
+    _output_filter_pipeline_is_pipefail_protected,
     _project_test_runner_script,
     _runtime_command_evidence_aliases,
+    _shell_command_body,
     _split_leading_cd,
     _strip_env_prefix,
     _test_command_invocation,
     _test_command_invocation_allowing_output_plumbing,
+    _top_level_shell_character_positions,
 )
 
 
@@ -407,8 +414,29 @@ def _test_command_targets_claim(
         return False
     normalized_file = file_part.lower()
     normalized_command = command.lower()
-    if normalized_file in normalized_proof_text or normalized_file in normalized_command:
+    argv = _command_invocation_argv(command)
+    if excludes_tests(argv):
+        # ``pytest --ignore tests/x.py`` or ``pytest -k "not x"``: the named
+        # test file may not have run, whatever the output says.
+        return False
+    if normalized_file in normalized_proof_text:
         return True
+    if normalized_file in normalized_command:
+        if (
+            any(character.isspace() for character in normalized_file)
+            or not any(marker in normalized_file for marker in ("/", ".", "::"))
+            or (argv and normalized_file == argv[0].lower())
+        ):
+            # The claim is command text or a bare word (``pytest``) contained
+            # in the recorded command, not a test file or node id.
+            return True
+        # A test file or node id named in the command links only as a
+        # positional operand the runner executes (not ``--rootdir
+        # tests/x.py``, not ``cat tests/x.py``).
+        return any(
+            operand.split("::", 1)[0].lower() == normalized_file
+            for operand in claim_target_operands(argv)
+        )
     if _claim_summary_matches_runtime_chunk(
         command=command,
         claim=claim,
@@ -649,9 +677,33 @@ def _functional_command_supports_test_claim(
             continue
         if not _runtime_message_supports_command_claim(value, message):
             continue
+        if _recorded_status_belongs_to_a_pipeline(message):
+            # ``./run_tests.sh | tail -5``: the recorded exit is the last
+            # filter's, not the script's. Only replay can corroborate it.
+            continue
         if _runtime_message_has_success_evidence(
             message, messages=messages, index=index
         ) and _functional_command_has_authoritative_zero_exit(messages, index=index):
+            return True
+    return False
+
+
+def _recorded_status_belongs_to_a_pipeline(message: AgentMessage) -> bool:
+    """Return True when a recorded command's exit is a pipeline's, not its core's.
+
+    A top-level ``|`` without ``pipefail`` enabled before it means the
+    recorded status is the last pipeline stage's.
+    """
+    for recorded in _runtime_message_command_values(message):
+        body = recorded
+        for _ in range(4):
+            inner = _shell_command_body(body)
+            if inner is None or inner.strip() == body.strip():
+                break
+            body = inner
+        if not _top_level_shell_character_positions(body, "|"):
+            continue
+        if not _output_filter_pipeline_is_pipefail_protected(body):
             return True
     return False
 
@@ -713,6 +765,20 @@ def _functional_command_has_authoritative_zero_exit(
         if _runtime_message_is_tool_completion(candidate):
             return _message_carries_zero_exit(candidate)
     return False
+
+
+def _command_invocation_argv(command: str) -> tuple[str, ...]:
+    """Return the argv of the test invocation in ``command``, or ``()``.
+
+    Shell wrappers, a leading ``cd`` and output plumbing are peeled the way
+    the recognizer peels them; environment assignments are dropped.
+    """
+    invocation = _test_command_invocation(command) or command
+    try:
+        parts = shlex.split(invocation)
+    except ValueError:
+        return ()
+    return tuple(_strip_env_prefix(parts))
 
 
 def _replayed_argv(run: CommandObservation) -> tuple[str, ...]:

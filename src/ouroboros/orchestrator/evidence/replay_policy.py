@@ -872,6 +872,15 @@ def _excluding_option(token: str, kind: str) -> bool:
     )
 
 
+def excludes_tests(argv: Sequence[str]) -> bool:
+    """Return True when ``argv`` resolves to a runner with an option that
+    excludes or narrows the tests it runs (``--ignore``, ``-k``, ...)."""
+    runner = resolve_replay_program(argv, workspace=None)
+    return runner is not None and any(
+        _excluding_option(token, runner.kind) for token in runner.arguments
+    )
+
+
 def run_may_back_test_claim(argv: Sequence[str], claim_file: str | None) -> bool:
     """Gate the runner-output rules for a replayed test run.
 
@@ -942,6 +951,7 @@ __all__ = [
     "ResolvedRunner",
     "claim_target_operands",
     "environment_roots",
+    "excludes_tests",
     "outside_known_roots",
     "peel_wrappers",
     "replay_allowed",
