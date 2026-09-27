@@ -437,9 +437,11 @@ an admitted check covers it (for a bug-fix criterion, an admitted reproduction
 check). For the criteria left without an admitted check, one more constructor
 call, before the worker starts, asks for replacement checks and says why the
 earlier ones were excluded; the replacements go through the same admission.
-A criterion that names no observable behavior (no code span, call, path, error
-name, or verb such as return, raise, write or print) gets no check; it is
-reported as `non_behavioral`.
+In the same reply the constructor labels each criterion `behavior`,
+`implementation_preference` or `context`, quoting the Seed text it relied on
+(the quote must appear verbatim in the Seed; no extra model call). A criterion
+labeled other than `behavior` gets no check and is reported as
+`non_behavioral`; a missing or invalid label counts as `behavior`.
 
 Every criterion the package cannot verify (no admitted check, no binding, or
 non-behavioral) is decided by the existing verifier: its rejection fails the
