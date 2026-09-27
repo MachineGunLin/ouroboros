@@ -314,3 +314,30 @@ async def test_a_committed_boundary_refuses_an_uncommitted_receipt(
     await ledger.record_package_frozen("b1", committed, seed=seed)
     with pytest.raises(BoundaryOrderError):
         await ledger.record_bindings("b1", package_sha256=package.sha256, payload={})
+
+
+def test_a_committed_boundary_flags_an_unkeyed_successor_digest(repo: Path) -> None:
+    """R4-S5: any ``*package_sha256`` on a committed boundary, not only the top level."""
+    from ouroboros.boundary.events import superseded_event
+
+    package = _Constructor(_seed(), repo).outcome.package
+    assert package is not None
+    committed = commit_package(package, new_commitment_salt())
+    frozen = package_frozen_event("b1", committed)
+
+    def superseded(successor: str | None, successor_committed: bool) -> Any:
+        return superseded_event(
+            "b1",
+            superseded_by="b2",
+            package_sha256=committed.reference,
+            successor_package_sha256=successor,
+            reason="package_rejected",
+            committed=True,
+            successor_committed=successor_committed,
+        )
+
+    flag = "a committed boundary records an unkeyed package digest"
+    assert flag in verify_boundary_order([frozen, superseded(package.sha256, False)])
+    # A successor that holds no package cites none; a committed one cites its commitment.
+    assert flag not in verify_boundary_order([frozen, superseded(None, False)])
+    assert flag not in verify_boundary_order([frozen, superseded("c" * 64, True)])

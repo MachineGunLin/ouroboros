@@ -548,7 +548,13 @@ def verify_boundary_order(events: Sequence[BaseEvent]) -> tuple[str, ...]:
             started = [e for e in events if e.type == ACTOR_STARTED]
             if not started or position[id(started[0])] > position[id(event)]:
                 violations.append("bindings recorded before the worker started")
-    if _committed(seal) and any("package_sha256" in event.data for event in events):
+    if _committed(seal) and any(
+        key.endswith("package_sha256") and value is not None
+        for event in events
+        for key, value in event.data.items()
+    ):
+        # Any unkeyed digest, including a successor's (R4-S5). A successor
+        # with no package cites none (``successor_package_sha256: null``).
         violations.append("a committed boundary records an unkeyed package digest")
     finals = [e for e in events if e.type == BINDING_RECORDED and e.data.get("phase") == "final"]
     verified = [e for e in events if e.type == CANDIDATE_VERIFIED]
