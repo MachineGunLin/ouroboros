@@ -311,3 +311,80 @@ async def test_a_run_never_bound_to_a_package_resumes_as_the_legacy_run(
         resume=True,
     )
     assert lines == [] and runner.acceptance_authority is None and run.resumed is None
+
+
+# R4-A1: a resumed run counts attempts exactly as the live arm-on run does.
+
+
+def _failed(index: int, error: str, **fields: Any) -> ACExecutionResult:
+    return ACExecutionResult(
+        ac_index=index,
+        ac_content=f"criterion {index}",
+        success=False,
+        outcome=ACExecutionOutcome.FAILED,
+        error=error,
+        **fields,
+    )
+
+
+async def test_after_a_crash_a_root_that_already_failed_is_never_accepted(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's probe: a failed session and a failed verify command stay failed.
+
+    Criterion 2 passes its visible cases and criterion 3 is uncovered, so the
+    package alone would accept both. The live arm-on run does not count
+    either as an attempt, and neither does the resumed run.
+    """
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    (repo / "mathutils.py").write_text(CLAMP_FIXED + DOUBLE)
+    forget_live_state(state)
+    _run, authority = await _resume(store, seed, repo)
+    restored = ParallelExecutionResult(
+        results=(
+            _restored().results[0],
+            _failed(1, "Implementation session failed"),
+            _failed(2, "Verify gate failed: exit 1"),
+        ),
+        success_count=1,
+        failure_count=2,
+    )
+    decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=restored)
+    assert [result.outcome for result in decided.results] == [ACExecutionOutcome.FAILED] * 3
+    assert decided.results[1].error == "Implementation session failed"
+    assert decided.results[2].error == "Verify gate failed: exit 1"
+    assert not decided.all_succeeded
+    decisions = authority.outcome.reconciliation.decisions
+    assert [decision.accepted for decision in decisions] == [False, False, False]
+    assert not authority.outcome.legacy_run_accepted
+
+
+async def test_after_a_crash_a_root_only_the_gate_failed_is_decided_by_the_package(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As in the live run, a root the package gate failed is an attempt the package decides."""
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    (repo / "mathutils.py").write_text(CLAMP_FIXED + DOUBLE)
+    forget_live_state(state)
+    _run, authority = await _resume(store, seed, repo)
+    base = _restored().results
+    restored = ParallelExecutionResult(
+        results=(
+            base[0],
+            _failed(
+                1,
+                "check_package: the finished workspace fails the frozen check package",
+                check_package_repair="counterexample",
+                check_package_failure_class="CHECK_PACKAGE_FAIL:abc",
+            ),
+            base[2],
+        ),
+        success_count=2,
+        failure_count=1,
+    )
+    decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=restored)
+    assert [result.outcome for result in decided.results] == [
+        ACExecutionOutcome.FAILED,  # held-out cases unavailable
+        ACExecutionOutcome.SUCCEEDED,  # the finished workspace passes criterion 2
+        ACExecutionOutcome.SUCCEEDED,
+    ]

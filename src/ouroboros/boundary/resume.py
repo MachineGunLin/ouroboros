@@ -22,7 +22,11 @@ current workspace, with no model call:
 A covered criterion without a package decision (the record or the journal is
 unreadable) is indeterminate: not accepted, a non-zero exit, never a legacy
 decision. Uncovered criteria keep the rule of the live run (unverified,
-accepted when attempted). The recomputed decision is recorded as
+accepted when attempted). What counts as an attempt is the live arm-on rule
+(``existing_outcomes_from_results(..., gated=True)``): a root that failed for
+any reason other than the package gate (a failed session, a failed verify
+command, or a legacy rejection of a resumed attempt, which runs without the
+gate) is not accepted, whatever the package says. The recomputed decision is recorded as
 ``boundary.acceptance.resumed``; the frozen boundary's single-shot records
 (final bindings, candidate verification) are not written again.
 """
@@ -336,7 +340,11 @@ class ResumedCheckPackageAuthority:
     async def __call__(self, *, seed: Seed, execution_id: str, parallel_result: Any) -> Any:
         if self.outcome is not None:
             return parallel_result
-        legacy = existing_outcomes_from_results(parallel_result)
+        # The live arm-on rule (R4-A1): only a root that succeeded, or that
+        # only the package gate failed, is an attempt the package may accept.
+        # A runtime failure, a failed verify command, or a resumed attempt the
+        # (ungated) legacy verifier rejected is never accepted here.
+        legacy = existing_outcomes_from_results(parallel_result, gated=True)
         legacy_accepted = bool(legacy) and all(item.passed for item in legacy.values())
         try:
             keys = seed_criterion_keys(seed)
