@@ -1030,6 +1030,19 @@ class TestAllowlist:
     def test_refused(self, command: str) -> None:
         assert not self._allowed(command), command
 
+    def test_denylist_refuses_what_the_allowlist_admits(self) -> None:
+        # A workspace script is admitted by the allowlist (rule b); the
+        # denylist, a second layer, still refuses a pip install through it.
+        (self.workspace / ".venv" / "bin").mkdir(parents=True)
+        _executable(self.workspace / ".venv" / "bin" / "pip", "#!/bin/sh\n")
+        argv = (".venv/bin/pip", "install", "x")
+        candidate = replay_candidate(" ".join(argv), str(self.workspace))
+        assert candidate is not None
+
+        assert replay_allowed(argv, workspace=str(self.workspace))
+        assert replay_denied(argv)
+        assert not command_replay.replay_admissible(candidate, str(self.workspace))
+
     def test_absolute_workspace_program_is_admitted(self) -> None:
         script = self.workspace.resolve() / "run_tests.sh"
         assert replay_allowed((str(script),), workspace=str(self.workspace))
@@ -1159,3 +1172,6 @@ class TestLinkedLiveTrees:
         assert not (venv / "new_from_replay").exists()
         assert live_calc.read_bytes() == original
         assert run.network_isolated
+        # Writes inside the copy are not blocked, and the denied writes left
+        # nothing changed, so the run itself succeeds.
+        assert run.succeeded, run.output_tail
