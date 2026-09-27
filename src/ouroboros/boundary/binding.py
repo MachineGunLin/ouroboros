@@ -62,6 +62,10 @@ _SOURCE_ROOTS = (".", "src")
 _SKIPPED_DIRS = frozenset({".git", "__pycache__", ".venv", "venv", "node_modules", CHECK_DIR})
 
 
+# Modules a target process never imports from the workspace under that name.
+_INTERPRETER_MODULES = frozenset({"__main__", "sitecustomize", "usercustomize"})
+
+
 class CallKind(StrEnum):
     """How the oracle harness invokes the bound target."""
 
@@ -462,12 +466,16 @@ def validate_declared_binding_static(
     if call_kind is CallKind.CLI and _is_under(binding.symbol, check_dir):
         return invalid("binding_in_check_dir", binding=binding)
     module = binding.symbol[3:] if binding.symbol.startswith("-m ") else binding.symbol
-    if (call_kind is not CallKind.CLI or binding.symbol.startswith("-m ")) and (
-        module.split(".", 1)[0] in sys.stdlib_module_names
-    ):
+    top = module.split(".", 1)[0]
+    importable = call_kind is not CallKind.CLI or binding.symbol.startswith("-m ")
+    if importable and top in sys.stdlib_module_names:
         # A workspace file named like a standard-library module satisfies the
         # static lookup, but the harness has already imported the real one.
         return invalid("stdlib_symbol", binding=binding)
+    if importable and top in _INTERPRETER_MODULES:
+        # In the target process these names are the harness itself or the
+        # interpreter's startup hooks, never the workspace file.
+        return invalid("interpreter_module", binding=binding)
     location = locate_symbol(artifact, binding.symbol, binding.call_kind)
     if location is None:
         return invalid("symbol_not_found", binding=binding)

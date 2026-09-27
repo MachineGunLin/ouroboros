@@ -223,6 +223,22 @@ def test_declared_binding_to_a_standard_library_name_is_refused(tmp_path: Path) 
     assert not result.valid and result.reason == "binding_invalid:stdlib_symbol"
 
 
+@pytest.mark.parametrize("module", ["__main__", "sitecustomize", "usercustomize"])
+def test_declared_binding_to_an_interpreter_module_is_refused(tmp_path: Path, module: str) -> None:
+    # R2-S6: a workspace __main__.py satisfies the static lookup, but in the
+    # target process __main__ is the harness itself.
+    base = _repo(tmp_path / "base", {"mathutils.py": "def clamp(v, lo, hi):\n    return v\n"})
+    artifact = _repo(
+        tmp_path / "artifact",
+        {
+            "mathutils.py": "def clamp(v, lo, hi):\n    return v\n",
+            f"{module}.py": "def _short(v, lo, hi):\n    return v\n",
+        },
+    )
+    result = _validate({"symbol": f"{module}._short"}, artifact, base)
+    assert not result.valid and result.reason == "binding_invalid:interpreter_module"
+
+
 def test_declared_binding_under_the_check_dir_is_refused(pair: tuple[Path, Path]) -> None:
     base, artifact = pair
     result = _validate({"symbol": ".ouroboros_checks.fake.mix"}, artifact, base)
