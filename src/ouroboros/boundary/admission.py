@@ -48,16 +48,12 @@ from pydantic import BaseModel
 from ouroboros.boundary.admission_rules import UNSAFE_CHECK_REASON, unsafe_checks
 from ouroboros.boundary.binding import Binding, CheckTier
 from ouroboros.boundary.check_rules import PROSE_ONLY_CHECK_REASON, prose_only_checks
-from ouroboros.boundary.controller_dir import (
-    controller_mutations,
-    prepare_controller_dir,
-    remove_controller_dir,
-)
 from ouroboros.boundary.oracle import (
     is_oracle_file,
     journal_safe_oracle_result,
-    parse_oracle_result,
+    redact_held_out,
 )
+from ouroboros.boundary.oracle_run import run_oracle_check
 from ouroboros.boundary.package import (
     CheckPackage,
     CheckRole,
@@ -199,6 +195,9 @@ def _receipt_dump(receipt: BaseModel) -> dict[str, Any]:
         for key in _OPTIONAL_CHECK_KEYS:
             if check.get(key) is None:
                 check.pop(key, None)
+        if "oracle_result" in check:
+            # A held-out case keeps its id and pass/fail only, until revealed.
+            check["oracle_result"] = redact_held_out(check["oracle_result"])
     return data
 
 
@@ -343,7 +342,7 @@ def _package_preconditions(package: CheckPackage, manifest: Mapping[str, str]) -
 def _materialize(package: CheckPackage, root: Path) -> None:
     for item in package.files:
         if is_oracle_file(item.path):
-            continue  # oracle files run from the controller directory
+            continue  # oracle files are never materialized (boundary/oracle_run.py)
         target = root / item.path
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "xb") as handle:
@@ -361,6 +360,7 @@ def _classify(
     mutated: bool,
     signature_seen: bool,
     on_base: bool,
+    oracle_undecided: bool = False,
 ) -> tuple[CheckStatus, str]:
     if mutated:
         return CheckStatus.INDETERMINATE, "protected_bytes_mutated"
@@ -368,6 +368,10 @@ def _classify(
         return CheckStatus.INDETERMINATE, "launch_failed"
     if completed.timed_out:
         return CheckStatus.INDETERMINATE, "timeout"
+    if oracle_undecided:
+        # The oracle never observed the target (setup failure, malformed
+        # frame): no evidence either way, whatever the check's role.
+        return CheckStatus.INDETERMINATE, "failure_signature_absent"
     passed = completed.return_code == 0
     if not on_base:
         if passed:
@@ -412,23 +416,36 @@ async def _execute_check(
     )
     digest_before = manifest_digest(protected)
     oracle = package.oracle_for(check.check_id)
-    argv: tuple[str, ...] = check.argv
-    ctrl: Path | None = None
-    ctrl_manifest: dict[str, str] = {}
-    if oracle is not None:
-        argv, ctrl_manifest, ctrl = prepare_controller_dir(
-            package, check, copy_root, bindings=bindings
-        )
+    binding = (bindings or {}).get(check.check_id)
     cwd = copy_root / check.cwd
-    try:
-        if cwd.is_dir():
-            completed = await _run_argv(argv, cwd, timeout, env=env, interpreter=interpreter)
-        else:
-            completed = _Completed(None, b"", b"", False, f"cwd missing: {check.cwd}", 0.0)
-        ctrl_mutated = controller_mutations(ctrl, ctrl_manifest) if ctrl is not None else ()
-    finally:
-        if ctrl is not None:
-            remove_controller_dir(ctrl)
+    oracle_run = None
+    if not cwd.is_dir():
+        completed = _Completed(None, b"", b"", False, f"cwd missing: {check.cwd}", 0.0)
+    elif oracle is not None:
+        # Target processes in the project interpreter, then the comparator in
+        # the controller's own interpreter (boundary/oracle_run.py).
+        oracle_run = await run_oracle_check(
+            {item.path: item.content for item in package.files},
+            oracle,
+            cwd,
+            timeout_seconds=timeout,
+            on_base=on_base,
+            env=_command_env(env),
+            interpreter=interpreter,
+            binding=binding,
+            workspace_roots=(source.resolve(), copy_root.resolve()),
+        )
+        completed = _Completed(
+            oracle_run.return_code,
+            oracle_run.output.encode("utf-8"),
+            b"",
+            oracle_run.timed_out,
+            oracle_run.launch_error,
+            oracle_run.duration,
+        )
+    else:
+        completed = await _run_argv(check.argv, cwd, timeout, env=env, interpreter=interpreter)
+    ctrl_mutated = oracle_run.ctrl_mutations if oracle_run is not None else ()
     after = tree_manifest(copy_root, unprotected_names=unprotected)
     mutated_paths = (*changed_paths(protected, after), *ctrl_mutated)
     new_paths = added_paths(protected, after)
@@ -436,16 +453,22 @@ async def _execute_check(
     undeclared = tuple(p for p in new_paths if p not in scratch)
     combined = (completed.stdout + b"\n" + completed.stderr).decode("utf-8", errors="replace")
     signature = check.failure_signature
-    signature_seen = bool(signature) and signature in combined
+    if oracle_run is not None:
+        # Decided by the comparator's structured result, never by text the
+        # target could print.
+        combined = oracle_run.output
+        signature_seen = oracle_run.signature_seen
+    else:
+        signature_seen = bool(signature) and signature in combined
     status, reason = _classify(
         check,
         completed,
         mutated=bool(mutated_paths),
         signature_seen=signature_seen,
         on_base=on_base,
+        oracle_undecided=oracle_run is not None and oracle_run.return_code not in (0, 1),
     )
     tail = combined if completed.launch_error is None else completed.launch_error
-    binding = (bindings or {}).get(check.check_id)
     return CheckExecution(
         check_id=check.check_id,
         role=check.role,
@@ -471,11 +494,7 @@ async def _execute_check(
             if binding is not None
             else (oracle.default_binding.to_dict() if oracle is not None else None)
         ),
-        oracle_result=(
-            parse_oracle_result(completed.stdout.decode("utf-8", errors="replace"))
-            if oracle is not None
-            else None
-        ),
+        oracle_result=oracle_run.result if oracle_run is not None else None,
     )
 
 
@@ -685,9 +704,9 @@ async def verify_candidate(
 ) -> CandidateVerification:
     """Run the unchanged frozen package on a candidate checkout.
 
-    ``bindings`` (check id to late binding) are written next to the oracle
-    harness in each check's controller directory; an oracle check without one
-    runs through its frozen default binding. ``only_checks`` restricts the run
+    ``bindings`` (check id to late binding) are what each oracle check's
+    target process resolves and calls (``boundary/oracle_run.py``); an oracle
+    check without one runs through its frozen default binding. ``only_checks`` restricts the run
     to those check ids (checks of unverified criteria are not run).
     ``check_tiers`` is recorded on each check and in the receipt.
 

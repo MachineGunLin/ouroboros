@@ -10,19 +10,19 @@ outcome). The product turns that data into package files:
   product code.
 
 Both files are covered by the package hash, so the failure signature, the
-cases, and the grammar are frozen before any worker starts. The harness reads
-the cases and the binding (the default one, or a late binding written to
-``bindings.json`` next to it at verification time), calls the target through
-the binding, and compares what it observed with the frozen expectation. It
-never derives an expectation from the artifact.
+cases, and the grammar are frozen before any worker starts. Neither file is
+written anywhere while a check runs: the controller (``boundary/oracle_run.py``)
+passes their content to the harness processes over stdin or argv.
 
-Isolation (see ``boundary/admission.py``): the oracle files are materialized
-in a controller directory outside the checkout copy, made read-only, and
-digested before and after the run. The target is called in a child process
-that receives only the call inputs, never the expected values; the parent
-harness, which never imports workspace code, does the comparison. A workspace
-module that monkeypatches at import time therefore cannot reach the
-comparison, and an edit to the check files is a protected-byte mutation.
+Isolation: the harness has two roles, each in its own process. The target
+role runs in the project interpreter, one process per case, and receives the
+binding and one call's inputs, never an expected value; it returns what it
+observed as JSON framed by a per-process random nonce. The comparator role
+runs afterwards in the controller's own interpreter (``-I -S``, outside every
+checkout, no workspace import), holds the frozen expectations, and decides
+pass or fail. A workspace interpreter, ``sitecustomize``, or import-time
+monkeypatch can therefore change what the target returns, not the comparison.
+It never derives an expectation from the artifact.
 
 Held-out cases: a case whose scalar literals (arguments and expected value)
 do not all appear in the Seed text a worker sees (goal, constraints, criterion
@@ -288,7 +288,7 @@ def bindings_text(bindings: Mapping[str, Binding]) -> str:
 
 
 def is_oracle_file(path: str) -> bool:
-    """Oracle files live in the controller directory, never in the checkout copy."""
+    """Oracle files are never materialized in a checkout copy (or anywhere else)."""
     return path == ORACLE_DIR or path.startswith(ORACLE_DIR + "/")
 
 
@@ -325,6 +325,30 @@ def journal_safe_oracle_result(result: Mapping[str, Any] | None) -> dict[str, An
             for case in result.get("cases") or ()
         ],
     }
+
+
+def redact_held_out(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """``result`` with held-out cases reduced to case id, flags, and pass/fail.
+
+    Stored receipts and printed output use this form: a held-out case's input,
+    expected value, and observation stay in memory (for a reveal) until the
+    case is revealed, after which it is no longer held out.
+    """
+    if result is None:
+        return None
+    cases = [
+        (
+            {
+                "case_id": case.get("case_id"),
+                "held_out": True,
+                "passed": bool(case.get("passed")),
+            }
+            if case.get("held_out")
+            else dict(case)
+        )
+        for case in result.get("cases") or ()
+    ]
+    return {**result, "cases": cases}
 
 
 def failed_heldout_only(result: Mapping[str, Any] | None) -> bool:
@@ -397,30 +421,38 @@ def repair_lines(result: Mapping[str, Any] | None, *, limit: int = 5) -> list[st
 
 ORACLE_HARNESS_SOURCE = r'''"""Ouroboros oracle harness (product code; the constructor writes data only).
 
-Usage: python harness.py <check_id>   (cwd: the checkout under test)
+Two roles, each in its own process; the controller starts both and never
+runs them in the same process.
 
-Reads oracle.json (and bindings.json, when present) from this directory, calls
-the bound target in a child process that receives only the inputs, and
-compares each observation with the frozen expectation here, in a process that
-never imports workspace code.
+target <nonce> <call_kind> <symbol>
+    Runs in the project interpreter (-I -B) with the checkout copy under test
+    as cwd. It imports and resolves the symbol, then writes the frame
+    '<nonce> {"phase": "resolved", ...}'. Only after that frame does the
+    controller send ONE call on stdin: the inputs, never an expectation. The
+    observation is written as '<nonce> {"phase": "result", ...}'. Frames go to
+    the process's original stdout; everything the target code prints goes to
+    stderr, which the controller discards.
+
+compare
+    Runs in the controller's own interpreter (-I -S), outside every checkout,
+    and never imports workspace code. It reads the frozen oracle data, the
+    binding, and the observations from stdin, decides every case, and writes
+    '<nonce> <result JSON>'.
 """
 import json
 import math
 import os
-import secrets
-import subprocess
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-RESULT_PREFIX = "OUROBOROS_ORACLE_RESULT "
-CHILD_TIMEOUT = 100
 MAX_REPR = 300
 
-CHILD = r"""
-import importlib, json, os, sys
+
+# ---------------------------------------------------------------- target role
+
 
 class _Missing(Exception):
     pass
+
 
 def _plain(value, depth=0):
     if depth > 50:
@@ -441,7 +473,10 @@ def _plain(value, depth=0):
         return {key: _plain(item, depth + 1) for key, item in value.items()}
     raise TypeError(type(value).__name__)
 
+
 def _resolve(symbol, kind):
+    import importlib
+
     parts = symbol.split(".")
     for split in range(len(parts) - 1, 0, -1):
         module_name = ".".join(parts[:split])
@@ -469,6 +504,7 @@ def _resolve(symbol, kind):
         return target
     raise _Missing(symbol + ": module not found")
 
+
 def _run(target, kind, call):
     try:
         if kind == "method":
@@ -480,8 +516,8 @@ def _run(target, kind, call):
     except BaseException as exc:
         return {"case_id": call["case_id"], "outcome": "raised",
                 "exception": [klass.__name__ for klass in type(exc).__mro__],
-                "repr": (type(exc).__name__ + ": " + str(exc))[:300]}
-    entry = {"case_id": call["case_id"], "outcome": "returned", "repr": repr(value)[:300]}
+                "repr": (type(exc).__name__ + ": " + str(exc))[:MAX_REPR]}
+    entry = {"case_id": call["case_id"], "outcome": "returned", "repr": repr(value)[:MAX_REPR]}
     try:
         entry["value"] = _plain(value)
         entry["encodable"] = True
@@ -489,45 +525,48 @@ def _run(target, kind, call):
         entry["encodable"] = False
     return entry
 
-def main():
-    request = json.loads(sys.stdin.read())
+
+def _read_all(fd):
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8")
+
+
+def _target(nonce, kind, symbol):
+    # Frames use a private copy of the original stdout; fd 1 now points to
+    # stderr, so nothing the target code prints can look like a frame.
+    frames = os.dup(1)
+    os.dup2(2, 1)
+
+    def frame(payload):
+        data = ("\n" + nonce + " " + json.dumps(payload) + "\n").encode("utf-8")
+        while data:
+            data = data[os.write(frames, data):]
+
     cwd = os.getcwd()
     for path in (os.path.join(cwd, "src"), cwd):
         if path not in sys.path:
             sys.path.insert(0, path)
-    out = {"resolve": "ok", "detail": "", "results": []}
-    target = None
     try:
-        target = _resolve(request["symbol"], request["call_kind"])
+        target = _resolve(symbol, kind)
     except _Missing as exc:
-        out["resolve"] = "missing"
-        out["detail"] = str(exc)[:500]
+        frame({"phase": "resolved", "resolve": "missing", "detail": str(exc)[:500]})
+        os._exit(0)
     except BaseException as exc:
-        out["resolve"] = "import_error"
-        out["detail"] = (type(exc).__name__ + ": " + str(exc))[:500]
-    if target is not None:
-        for call in request["calls"]:
-            out["results"].append(_run(target, request["call_kind"], call))
-    sys.stdout.flush()
-    sys.stdout.write("\n" + request["nonce"] + " " + json.dumps(out) + "\n")
-    sys.stdout.flush()
+        frame({"phase": "resolved", "resolve": "import_error",
+               "detail": (type(exc).__name__ + ": " + str(exc))[:500]})
+        os._exit(0)
+    frame({"phase": "resolved", "resolve": "ok", "detail": ""})
+    call = json.loads(_read_all(0))
+    frame({"phase": "result", "entry": _run(target, kind, call)})
     os._exit(0)
 
-main()
-"""
 
-
-def _load(name):
-    path = os.path.join(HERE, name)
-    if not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _short(value):
-    text = repr(value)
-    return text if len(text) <= MAX_REPR else text[:MAX_REPR] + "..."
+# ---------------------------------------------------------- shared call shape
 
 
 def _split_args(params, arg_map, args):
@@ -544,13 +583,13 @@ def _split_args(params, arg_map, args):
     return [positional[index] for index in sorted(positional)], keywords
 
 
-def _cli_argv(symbol, params, arg_map, args):
+def _cli_argv(interpreter, cwd, symbol, params, arg_map, args):
     if symbol.startswith("-m "):
-        prefix = [sys.executable, "-m", symbol[3:]]
+        prefix = [interpreter, "-B", "-m", symbol[3:]]
     elif symbol.endswith(".py"):
-        prefix = [sys.executable, symbol]
+        prefix = [interpreter, "-B", symbol]
     else:
-        prefix = [os.path.join(os.getcwd(), symbol)]
+        prefix = [os.path.join(cwd, symbol)]
 
     def text(value):
         return value if isinstance(value, str) else json.dumps(value)
@@ -566,6 +605,14 @@ def _cli_argv(symbol, params, arg_map, args):
     return prefix + [positional[index] for index in sorted(positional)] + flags
 
 
+# --------------------------------------------------------------- compare role
+
+
+def _short(value):
+    text = repr(value)
+    return text if len(text) <= MAX_REPR else text[:MAX_REPR] + "..."
+
+
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -573,19 +620,25 @@ def _number(value):
 def _equal(expected, observed, approx):
     if approx is not None and _number(expected):
         return _number(observed) and abs(float(observed) - float(expected)) <= approx
-    if _number(expected) and _number(observed) and (
-            isinstance(expected, float) or isinstance(observed, float)):
-        # Float arithmetic: 2 + 6 * 0.1 is 2.6000000000000005. A tolerance of
-        # a few ulps keeps an exact decimal expectation meaningful.
-        return math.isclose(float(observed), float(expected), rel_tol=1e-9, abs_tol=1e-12)
+    if isinstance(expected, bool) or isinstance(observed, bool):
+        return type(expected) is type(observed) and expected == observed
+    if isinstance(expected, int) and _number(observed):
+        # An integer expectation is exact.
+        return observed == expected
+    if _number(expected) and _number(observed):
+        # Float arithmetic: 0 + 3 * 0.1 is 0.30000000000000004. A bound of a
+        # few units in the last place keeps an exact decimal expectation
+        # meaningful; anything wider needs the case's own "approx".
+        e, o = float(expected), float(observed)
+        if not (math.isfinite(e) and math.isfinite(o)):
+            return e == o
+        return abs(o - e) <= 16 * math.ulp(max(abs(e), abs(o)))
     if isinstance(expected, list) and isinstance(observed, list):
         return len(expected) == len(observed) and all(
             _equal(e, o, approx) for e, o in zip(expected, observed))
     if isinstance(expected, dict) and isinstance(observed, dict):
         return set(expected) == set(observed) and all(
             _equal(expected[k], observed[k], approx) for k in expected)
-    if isinstance(expected, bool) or isinstance(observed, bool):
-        return type(expected) is type(observed) and expected == observed
     return expected == observed
 
 
@@ -594,130 +647,100 @@ def _render_call(symbol, args, kwargs):
     return symbol.rsplit(".", 1)[-1] + "(" + ", ".join(parts) + ")"
 
 
-def _python_cases(spec, binding):
-    calls = []
-    rendered = {}
-    for case in spec["cases"]:
-        args, kwargs = _split_args(spec["params"], binding.get("arg_map") or {}, case["args"])
-        calls.append({"case_id": case["case_id"], "args": args, "kwargs": kwargs,
-                      "init": case.get("init")})
-        rendered[case["case_id"]] = _render_call(binding["symbol"], args, kwargs)
-    nonce = secrets.token_hex(16)
-    request = {"nonce": nonce, "symbol": binding["symbol"], "call_kind": spec["call_kind"],
-               "calls": calls}
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", CHILD], input=json.dumps(request), capture_output=True,
-            text=True, timeout=CHILD_TIMEOUT, cwd=os.getcwd())
-    except subprocess.TimeoutExpired:
-        return "child_timeout", "the target did not return in time", {}, rendered
-    report = None
-    for line in reversed(completed.stdout.splitlines()):
-        if line.startswith(nonce + " "):
-            report = json.loads(line[len(nonce) + 1:])
-            break
-    if report is None:
-        tail = (completed.stdout + completed.stderr)[-500:]
-        return "child_crashed", "the call process exited without a report: " + tail, {}, rendered
-    observed = {entry["case_id"]: entry for entry in report["results"]}
-    return report["resolve"], report["detail"], observed, rendered
+def _abnormal(entry, call_text, expected_text):
+    if entry["outcome"] == "timeout":
+        return call_text + ": expected " + expected_text + ", observed timeout"
+    return (call_text + ": expected " + expected_text + ", observed crash (exit "
+            + str(entry.get("exit")) + ")")
 
 
 def _judge_python(case, entry, call_text):
     expect = case["expect"]
+    if expect["kind"] == "raises":
+        expected_text = "to raise " + expect["exception"]
+    else:
+        expected_text = _short(expect["value"])
     if entry is None:
         return False, call_text + ": no observation"
+    if entry["outcome"] in ("crashed", "timeout"):
+        return False, _abnormal(entry, call_text, expected_text)
     if expect["kind"] == "raises":
         if entry["outcome"] == "raised" and expect["exception"] in entry["exception"]:
             return True, ""
         seen = entry["repr"] if entry["outcome"] == "raised" else "returned " + entry["repr"]
         return False, call_text + ": expected to raise " + expect["exception"] + ", observed " + seen
     if entry["outcome"] != "returned":
-        return False, call_text + ": expected " + _short(expect["value"]) + ", raised " + entry["repr"]
+        return False, call_text + ": expected " + expected_text + ", raised " + entry["repr"]
     if not entry.get("encodable"):
-        return False, (call_text + ": expected " + _short(expect["value"]) + ", observed "
+        return False, (call_text + ": expected " + expected_text + ", observed "
                        + entry["repr"] + " (not a plain value)")
     if _equal(expect["value"], entry["value"], expect.get("approx")):
         return True, ""
-    return False, call_text + ": expected " + _short(expect["value"]) + ", observed " + _short(entry["value"])
+    return False, call_text + ": expected " + expected_text + ", observed " + _short(entry["value"])
 
 
-def _cli_case(spec, binding, case):
-    argv = _cli_argv(binding["symbol"], spec["params"], binding.get("arg_map") or {}, case["args"])
-    call_text = " ".join(argv[1:] if argv[0] == sys.executable else argv)
-    script = binding["symbol"]
-    if not script.startswith("-m ") and not os.path.isfile(os.path.join(os.getcwd(), script)):
-        return "missing", False, call_text + ": " + script + " not found"
-    try:
-        completed = subprocess.run(argv, input=case.get("stdin") or "", capture_output=True,
-                                   text=True, timeout=CHILD_TIMEOUT, cwd=os.getcwd())
-    except subprocess.TimeoutExpired:
-        return "child_timeout", False, call_text + ": timed out"
-    except OSError as exc:
-        return "missing", False, call_text + ": " + str(exc)
+def _judge_cli(case, entry):
+    call_text = entry.get("call") or case["case_id"]
     expect = case["expect"]
+    if entry["outcome"] in ("crashed", "timeout"):
+        return False, _abnormal(entry, call_text, "a completed command")
     problems = []
-    if expect.get("exit_code") is not None and completed.returncode != expect["exit_code"]:
-        problems.append("exit " + str(completed.returncode) + " (expected " + str(expect["exit_code"]) + ")")
-    out = completed.stdout
+    code = entry.get("exit_code")
+    if expect.get("exit_code") is not None and code != expect["exit_code"]:
+        problems.append("exit " + str(code) + " (expected " + str(expect["exit_code"]) + ")")
+    out = entry.get("stdout") or ""
     if expect.get("stdout") is not None and out.rstrip("\n") != expect["stdout"].rstrip("\n"):
         problems.append("stdout " + _short(out) + " (expected " + _short(expect["stdout"]) + ")")
     if expect.get("stdout_contains") is not None and expect["stdout_contains"] not in out:
         problems.append("stdout " + _short(out) + " lacks " + _short(expect["stdout_contains"]))
-    return "ok", not problems, (call_text + ": " + "; ".join(problems)) if problems else ""
+    return not problems, (call_text + ": " + "; ".join(problems)) if problems else ""
+
+
+def _compare(request):
+    check_id = request["check_id"]
+    spec = next(item for item in request["oracle"]["oracles"] if item["check_id"] == check_id)
+    binding = request.get("binding")
+    source = "declared" if binding is not None else "default"
+    binding = binding or spec["default_binding"]
+    resolve = request["resolve"]
+    detail = request.get("detail") or ""
+    observed = request.get("observations") or {}
+    cases = []
+    for case in spec["cases"]:
+        entry = observed.get(case["case_id"])
+        if spec["call_kind"] == "cli":
+            call_text = (entry or {}).get("call") or case["case_id"]
+        else:
+            args, kwargs = _split_args(spec["params"], binding.get("arg_map") or {}, case["args"])
+            call_text = _render_call(binding["symbol"], args, kwargs)
+        if resolve == "missing":
+            passed, text = False, call_text + ": " + detail
+        elif resolve != "ok":
+            passed, text = False, ""
+        elif spec["call_kind"] == "cli":
+            passed, text = (False, call_text + ": no observation") if entry is None else _judge_cli(
+                case, entry)
+        else:
+            passed, text = _judge_python(case, entry, call_text)
+        cases.append({"case_id": case["case_id"], "held_out": bool(case.get("held_out")),
+                      "passed": passed, "detail": text})
+    return {"check_id": check_id, "criterion_key": spec["criterion_key"],
+            "binding_source": source, "symbol": binding["symbol"],
+            "call_kind": spec["call_kind"], "resolve": resolve, "cases": cases}
 
 
 def main():
-    check_id = sys.argv[1]
-    data = _load("oracle.json")
-    spec = next(item for item in data["oracles"] if item["check_id"] == check_id)
-    bindings = _load("bindings.json") or {}
-    binding = bindings.get(check_id)
-    source = "declared" if binding is not None else "default"
-    binding = binding or spec["default_binding"]
-    cases = []
-    resolve = "ok"
-    detail = ""
-    if spec["call_kind"] == "cli":
-        for case in spec["cases"]:
-            status, passed, text = _cli_case(spec, binding, case)
-            if status == "child_timeout":
-                resolve = status
-            elif status == "missing" and resolve == "ok":
-                resolve = "missing"
-            cases.append({"case_id": case["case_id"], "held_out": bool(case.get("held_out")),
-                          "passed": passed, "detail": text})
+    role = sys.argv[1] if len(sys.argv) > 1 else ""
+    if role == "target":
+        _target(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif role == "compare":
+        request = json.loads(sys.stdin.read())
+        result = _compare(request)
+        sys.stdout.write(request["nonce"] + " " + json.dumps(result, sort_keys=True) + "\n")
+        sys.stdout.flush()
     else:
-        resolve, detail, observed, rendered = _python_cases(spec, binding)
-        for case in spec["cases"]:
-            if resolve == "missing":
-                passed, text = False, rendered[case["case_id"]] + ": " + detail
-            elif resolve != "ok":
-                passed, text = False, ""
-            else:
-                passed, text = _judge_python(case, observed.get(case["case_id"]),
-                                             rendered[case["case_id"]])
-            cases.append({"case_id": case["case_id"], "held_out": bool(case.get("held_out")),
-                          "passed": passed, "detail": text})
-    result = {"check_id": check_id, "criterion_key": spec["criterion_key"],
-              "binding_source": source, "symbol": binding["symbol"],
-              "call_kind": spec["call_kind"], "resolve": resolve, "cases": cases}
-    if resolve not in ("ok", "missing"):
-        # Setup failure (import error, crash, timeout): no failure signature,
-        # so it is never counted as a detected failure.
-        print("oracle could not run the target: " + resolve + " " + detail)
-        print(RESULT_PREFIX + json.dumps(result, sort_keys=True))
-        sys.exit(3)
-    failed = [case for case in cases if not case["passed"]]
-    if failed:
-        print(spec["failure_signature"])
-        for case in failed:
-            marker = " (held-out)" if case["held_out"] else ""
-            print("counterexample" + marker + ": " + case["detail"])
-        print(RESULT_PREFIX + json.dumps(result, sort_keys=True))
-        sys.exit(1)
-    print(RESULT_PREFIX + json.dumps(result, sort_keys=True))
-    sys.exit(0)
+        sys.stderr.write("usage: harness target <nonce> <kind> <symbol> | harness compare\n")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
@@ -748,6 +771,7 @@ __all__ = [
     "oracle_data",
     "oracle_data_text",
     "parse_oracle_result",
+    "redact_held_out",
     "repair_lines",
     "worker_visible_seed_text",
 ]

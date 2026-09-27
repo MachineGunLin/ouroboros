@@ -94,5 +94,12 @@ def added_paths(before: Mapping[str, str], after: Mapping[str, str]) -> tuple[st
 
 
 def copy_checkout(source: Path, destination: Path) -> None:
-    """Copy a checkout, preserving symlinks, into a new ``destination``."""
-    shutil.copytree(source, destination, symlinks=True)
+    """Copy a checkout, preserving symlinks, into a new ``destination``.
+
+    ``__pycache__`` is not copied: it is outside the protected digest, so a
+    planted ``.pyc`` matching a source file's mtime and size could otherwise
+    run in place of the reviewed source.
+    """
+    shutil.copytree(
+        source, destination, symlinks=True, ignore=shutil.ignore_patterns("__pycache__")
+    )

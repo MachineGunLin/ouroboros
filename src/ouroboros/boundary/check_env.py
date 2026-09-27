@@ -8,7 +8,8 @@ product-path rules:
 - **Scrubbed environment.** Only an allowlist of variables needed to run
   Python and the project's tooling reaches the script (``PATH``, ``HOME``,
   locale, temp directories, virtualenv markers, and the Windows system
-  variables). Everything else, including every credential-like variable
+  variables). ``PYTHONPATH`` is dropped: a relative entry would resolve
+  inside the checkout copy ahead of the standard library. Everything else, including every credential-like variable
   (``*_API_KEY``, ``*_TOKEN``, ``AWS_*``, ``GH_*``, ``OPENAI_*``, ...), is
   dropped.
 - **Project interpreter.** A check's ``python3``/``python`` runs with the
@@ -48,7 +49,6 @@ ALLOWED_CHECK_ENV = frozenset(
         "VIRTUAL_ENV",
         "CONDA_PREFIX",
         "CONDA_DEFAULT_ENV",
-        "PYTHONPATH",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
         "PYTHONDONTWRITEBYTECODE",

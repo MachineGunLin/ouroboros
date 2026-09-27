@@ -21,7 +21,7 @@ A literal ``importlib.import_module("pkg.mod")`` or ``find_spec("pkg")`` is an
 ordinary import and is allowed; a guarded ``hasattr`` or ``find_spec`` lookup
 of a new symbol is the prescribed feature-check pattern. The product oracle
 harness (``boundary/oracle.py``) is not subject to these rules: it is product
-code and runs from the controller directory.
+code, run by the controller (``boundary/oracle_run.py``).
 
 A script that does not parse is left to admission, which runs it.
 """

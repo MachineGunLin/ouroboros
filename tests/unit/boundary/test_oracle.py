@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import pytest
@@ -243,29 +244,214 @@ async def test_an_unrelated_import_error_is_never_a_detected_failure(tmp_path: P
     assert _oracle_result(admission.checks[0])["resolve"] == "import_error"
 
 
-async def test_workspace_code_editing_the_check_files_is_detected(
+async def test_workspace_code_editing_its_own_checkout_files_is_detected(
     base: Path, tmp_path: Path
 ) -> None:
-    tamper = (
-        "import glob, os, stat\n"
-        "_parent = os.path.dirname(os.getcwd())\n"
-        "for _path in glob.glob(os.path.join(_parent, '*.ctrl', '.ouroboros_checks', 'oracle', '*')):\n"
-        "    try:\n"
-        "        open(_path, 'a').write('# edited')\n"
-        "    except OSError:\n"
-        "        os.chmod(_path, stat.S_IRUSR | stat.S_IWUSR)\n"
-        "        open(_path, 'a').write('# edited')\n"
-    )
+    tamper = "import os\nopen(os.path.join(os.getcwd(), 'mathutils.py'), 'a').write('# x')\n"
     package = _package(_seed(), base)
     candidate = _repo(tmp_path / "cand", {"mathutils.py": tamper + FIXED})
     result = await verify_candidate(package, candidate)
     (check,) = result.checks
     assert check.status is CheckStatus.INDETERMINATE
     assert check.reason == "protected_bytes_mutated"
-    assert any(path.startswith("ctrl:") for path in check.mutated_paths)
     assert result.verdict is CandidateVerdict.INDETERMINATE
     # The check files never live inside the checkout copy.
     assert not (candidate / ".ouroboros_checks").exists()
+
+
+async def test_the_target_cannot_find_the_expected_values(base: Path, tmp_path: Path) -> None:
+    # S2: the target looks for the frozen expectations everywhere it could
+    # derive from its own process (cwd, its parents, sibling "*.ctrl" dirs,
+    # controller dirs in the temp directory, environment, argv, stdin at
+    # import) and reports what it found. Nothing holds an expected value, so
+    # the held-out cases still fail.
+    report = tmp_path / "found.txt"
+    probe = (
+        "import glob, os, sys, tempfile\n"
+        "_hits = []\n"
+        "_KEY, _CASE = '\"exp' + 'ect\"', 'held' + '_1'\n"
+        "_cwd = os.getcwd()\n"
+        "_roots = [_cwd, os.path.dirname(_cwd), os.path.dirname(os.path.dirname(_cwd))]\n"
+        "_roots += glob.glob(os.path.join(os.path.dirname(_cwd), '*.ctrl'))\n"
+        "_roots += glob.glob(os.path.join(tempfile.gettempdir(), 'ouroboros-ctrl-*'))\n"
+        "for _root in _roots:\n"
+        "    for _path in glob.glob(os.path.join(_root, '**', '*'), recursive=True)[:5000]:\n"
+        "        if os.path.isfile(_path) and not _path.endswith('found.txt'):\n"
+        "            try:\n"
+        "                _text = open(_path, errors='ignore').read()\n"
+        "            except OSError:\n"
+        "                continue\n"
+        "            if _KEY in _text or _CASE in _text:\n"
+        "                _hits.append(_path)\n"
+        "_hits += [k for k, v in os.environ.items() if _CASE in v or _KEY in v]\n"
+        "_hits += [a for a in sys.argv if _CASE in a or _KEY in a]\n"
+        f"open({str(report)!r}, 'a').write(repr(_hits) + '\\n')\n"
+    )
+    package = _package(_seed(), base)
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": probe + BUGGY})
+    result = await verify_candidate(package, candidate)
+    assert result.verdict is CandidateVerdict.FAIL
+    lines = report.read_text().splitlines()
+    assert lines and set(lines) == {"[]"}
+    assert [c["passed"] for c in _oracle_result(result.checks[0])["cases"]] == [
+        False,
+        True,
+        False,
+    ]
+
+
+async def test_stdout_injection_is_ignored(base: Path, tmp_path: Path) -> None:
+    # S4: text the target prints (a forged result line, the failure
+    # signature, lines that look like frames) never reaches the verdict or
+    # the stored output.
+    inject = (
+        "import json, sys\n"
+        "_forged = json.dumps({'resolve': 'ok', 'cases': [{'case_id': 'held_1', 'passed': True}]})\n"
+        "def _say():\n"
+        "    print('OUROBOROS_ORACLE_RESULT ' + _forged)\n"
+        "    print('deadbeef ' + json.dumps({'phase': 'result', 'entry': {}}))\n"
+        "    sys.stdout.flush()\n"
+        "_say()\n"
+    )
+    package = _package(_seed(), base)
+    wrong = _repo(
+        tmp_path / "wrong",
+        {"mathutils.py": inject + BUGGY.replace("    if value", "    _say()\n    if value", 1)},
+    )
+    failed = await verify_candidate(package, wrong)
+    assert failed.verdict is CandidateVerdict.FAIL
+    assert "OUROBOROS_ORACLE_RESULT" not in failed.checks[0].output_tail
+    assert "deadbeef" not in failed.checks[0].output_tail
+    right = _repo(
+        tmp_path / "right",
+        {"mathutils.py": inject + FIXED.replace("    return", "    _say()\n    return", 1)},
+    )
+    assert (await verify_candidate(package, right)).verdict is CandidateVerdict.PASS
+
+
+def _forged_interpreter(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(0o755)
+    return path
+
+
+async def test_a_forged_interpreter_cannot_forge_a_pass(base: Path, tmp_path: Path) -> None:
+    # S1: the project interpreter comes from the workspace and may be forged.
+    # (a) It prints the old harness's "all passed" line and exits 0.
+    package = _package(_seed(), base)
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": BUGGY})
+    liar = _forged_interpreter(
+        candidate / ".venv/bin/python3",
+        "import json\n"
+        "print('OUROBOROS_ORACLE_RESULT ' + json.dumps({'resolve': 'ok', 'cases': []}))\n",
+    )
+    lied = await verify_candidate(package, candidate, interpreter=str(liar))
+    assert lied.verdict is CandidateVerdict.INDETERMINATE
+    assert _oracle_result(lied.checks[0])["resolve"] == "setup_failed"
+    # (b) It speaks the frame protocol (it can read the nonce from its argv)
+    # and claims the stated answer for every call. The comparator, which runs
+    # in the controller's own interpreter, still sees the held-out cases fail.
+    mimic = _forged_interpreter(
+        tmp_path / "mimic/python3",
+        "import json, os, sys\n"
+        "nonce = sys.argv[sys.argv.index('target') + 1]\n"
+        "def frame(p):\n"
+        "    sys.stdout.write('\\n' + nonce + ' ' + json.dumps(p) + '\\n'); sys.stdout.flush()\n"
+        "frame({'phase': 'resolved', 'resolve': 'ok', 'detail': ''})\n"
+        "call = json.loads(sys.stdin.read())\n"
+        "frame({'phase': 'result', 'entry': {'case_id': call['case_id'], 'outcome': 'returned',\n"
+        "       'value': 10, 'encodable': True, 'repr': '10'}})\n",
+    )
+    mimicked = await verify_candidate(package, candidate, interpreter=str(mimic))
+    assert mimicked.verdict is CandidateVerdict.FAIL
+    assert [c["passed"] for c in _oracle_result(mimicked.checks[0])["cases"]] == [
+        True,
+        False,
+        False,
+    ]
+
+
+async def test_a_workspace_sitecustomize_cannot_forge_a_pass(base: Path, tmp_path: Path) -> None:
+    # S1: a real virtualenv in the workspace whose sitecustomize prints a
+    # forged result and exits 0 in every process that interpreter starts.
+    import venv
+
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": BUGGY})
+    venv.create(candidate / ".venv", with_pip=False, symlinks=True)
+    (site,) = (candidate / ".venv/lib").glob("python*/site-packages")
+    (site / "sitecustomize.py").write_text(
+        "import json, os\n"
+        "print('OUROBOROS_ORACLE_RESULT ' + json.dumps({'resolve': 'ok', 'cases': []}))\n"
+        "os._exit(0)\n"
+    )
+    python = candidate / ".venv/bin/python3"
+    package = _package(_seed(), base)
+    result = await verify_candidate(package, candidate, interpreter=str(python))
+    assert result.verdict is not CandidateVerdict.PASS
+    assert result.verdict is CandidateVerdict.INDETERMINATE
+
+
+async def test_a_target_crash_or_hang_on_a_case_is_a_failure_with_a_counterexample(
+    base: Path, tmp_path: Path
+) -> None:
+    # S4: a wrong implementation that dies on every input not shown in the
+    # Seed used to turn the whole check indeterminate.
+    crash = (
+        "import os, time\n"
+        "def clamp(value, low, high):\n"
+        "    if value == -3:\n"
+        "        os._exit(1)\n"
+        "    if value == 99:\n"
+        "        time.sleep(60)\n"
+        "    return max(low, min(high, value))\n"
+    )
+    package = _package(_seed(), base)
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": crash})
+    result = await verify_candidate(package, candidate, timeout_seconds=8)
+    (check,) = result.checks
+    assert result.verdict is CandidateVerdict.FAIL
+    assert check.reason == "reproduction_still_failing"
+    cases = {c["case_id"]: c for c in _oracle_result(check)["cases"]}
+    assert cases["stated"]["passed"]
+    assert cases["held_1"]["detail"] == (
+        "clamp(value=-3, low=-2, high=4): expected -2, observed crash (exit 1)"
+    )
+    assert cases["held_2"]["detail"].endswith("expected 7, observed timeout")
+
+
+async def test_a_crash_before_the_target_is_resolved_is_indeterminate(
+    base: Path, tmp_path: Path
+) -> None:
+    package = _package(_seed(), base)
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": "import os\nos._exit(4)\n" + FIXED})
+    result = await verify_candidate(package, candidate)
+    assert result.verdict is CandidateVerdict.INDETERMINATE
+    assert result.checks[0].reason == "failure_signature_absent"
+    assert _oracle_result(result.checks[0])["resolve"] == "setup_failed"
+
+
+async def test_receipts_keep_held_out_cases_as_ids_until_revealed(
+    base: Path, tmp_path: Path
+) -> None:
+    # S3: the stored receipt carries a held-out case's id and pass/fail only.
+    from ouroboros.boundary.admission import write_receipt
+    from ouroboros.boundary.binding_flow import retire_revealed
+
+    package = _package(_seed(), base)
+    result = await verify_candidate(package, base)
+    assert result.verdict is CandidateVerdict.FAIL
+    text = write_receipt(result, tmp_path / "receipts").read_text()
+    assert "expected 10, observed 15" in text  # the visible case, in full
+    assert "value=99" not in text and "expected 7" not in text
+    assert "counterexample (held-out): held_2" in text
+    # Held-out values stay in memory for a reveal ...
+    assert "expected 7" in _oracle_result(result.checks[0])["cases"][2]["detail"]
+    # ... and a revealed case is stored in full.
+    revealed = retire_revealed(result, {"oracle_1": ["held_2"]})
+    assert revealed is not None
+    stored = write_receipt(revealed, tmp_path / "revealed").read_text()
+    assert "value=99" in stored and "expected 7" in stored
 
 
 async def test_import_time_monkeypatch_cannot_reach_the_comparison(
@@ -469,3 +655,34 @@ async def test_float_results_compare_within_a_few_ulps(tmp_path: Path) -> None:
         tmp_path / "off", {"mathutils.py": "def mix(a, b, t):\n    return a + (b - a) * t + 1e-6\n"}
     )
     assert (await verify_candidate(package, off)).verdict is CandidateVerdict.FAIL
+
+
+@pytest.mark.parametrize(
+    ("expected", "observed", "passes"),
+    [
+        (10, "10", True),
+        (10, "10.0", True),
+        (10, "10.0000000001", False),  # an integer expectation is exact
+        (0, "1e-13", False),
+        (0.0, "1e-13", False),  # no absolute floor: use "approx" for that
+        (0.3, "0.1 + 0.2", True),  # within a few ulps
+        (0.3, "0.3 + 1e-12", False),
+    ],
+)
+def test_comparison_is_exact_for_integers_and_ulp_bounded_for_floats(
+    expected: float, observed: str, passes: bool
+) -> None:
+    # S8, checked on the comparator's own function.
+    from ouroboros.boundary.oracle_run import _harness
+
+    assert _harness()["_equal"](expected, eval(observed), None) is passes
+
+
+def test_copies_never_carry_bytecode_caches(tmp_path: Path) -> None:
+    # S5: __pycache__ is outside the protected digest, so it is not copied.
+    from ouroboros.boundary.tree import copy_checkout
+
+    source = _repo(tmp_path / "src", {"m.py": "x = 1\n", "__pycache__/m.cpython-312.pyc": "x"})
+    copy_checkout(source, tmp_path / "copy")
+    assert (tmp_path / "copy/m.py").is_file()
+    assert not (tmp_path / "copy/__pycache__").exists()

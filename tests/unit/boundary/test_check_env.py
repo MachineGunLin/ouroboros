@@ -43,6 +43,11 @@ def test_scrub_keeps_the_allowlist_and_drops_credentials() -> None:
     assert env == {"PATH": "/bin", "HOME": "/h", "LC_ALL": "C", "VIRTUAL_ENV": "/v"}
 
 
+def test_scrub_drops_pythonpath() -> None:
+    # S9: a relative PYTHONPATH entry would resolve inside the checkout copy.
+    assert "PYTHONPATH" not in scrubbed_check_environment({"PATH": "/bin", "PYTHONPATH": "."})
+
+
 def _preservation_package(seed):
     package = _package(seed, "keep_env", NO_SECRET_SCRIPT)
     check = package.checks[0]
