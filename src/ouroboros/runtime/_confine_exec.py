@@ -2,7 +2,7 @@
 
 Run as a standalone script, never imported into the controller:
 
-    python -I -S -B _confine_exec.py [--loopback-up] [--landlock --write DIR ...] -- ARGV...
+    python -I -S -B _confine_exec.py [--loopback-up] [--landlock] --root DIR DEV INO ... -- ARGV...
 
 It is the last step of every ``ouroboros.runtime.exec_sandbox`` backend. It is
 started with a fixed bootstrap environment, so nothing the command's own
@@ -11,14 +11,18 @@ before confinement. The command's environment arrives as JSON in
 ``OUROBOROS_SANDBOX_COMMAND_ENV`` and is applied only by the final
 ``execvpe``, after:
 
+- on every platform, each writable root (``--root DIR DEV INO``) is opened
+  without following a symlink and must still be the directory ``confine``
+  validated (same device and inode), or nothing runs;
 - on Linux (``--landlock``), a Landlock ruleset that handles every filesystem
   right that creates, changes, truncates or removes something and grants them
-  only beneath each ``--write`` directory (plus writing to ``/dev/null`` and a
+  only beneath those verified root descriptors (plus writing to ``/dev/null`` and a
   few other character devices). Reading and executing are not handled. Landlock
   ABI 3 (Linux 6.2) is the minimum: below it, truncation cannot be denied.
   The restriction is inherited by everything the command execs or forks, and
   Landlock also denies ptrace-mode access (``/proc/<pid>/environ``, ``mem``,
-  ``maps``) to processes outside the domain;
+  ``maps``) to processes outside the domain; then the metadata seccomp
+  filter below;
 - on macOS, nothing more: ``sandbox-exec`` already confined this process.
 
 It depends on nothing but the standard library, so it starts with ``-S`` (no
@@ -148,27 +152,63 @@ def landlock_abi() -> int:
     return max(int(result), 0)
 
 
+def _add_rule_fd(
+    syscall: Callable[..., Any], ruleset: int, fd: int, access: int, what: str
+) -> None:
+    # struct landlock_path_beneath_attr is packed: u64 allowed_access, s32 parent_fd.
+    attr = ctypes.create_string_buffer(struct.pack("=Qi", access, fd), 12)
+    _check(
+        syscall(
+            _SYS_LANDLOCK_ADD_RULE,
+            ctypes.c_int(ruleset),
+            ctypes.c_int(_LANDLOCK_RULE_PATH_BENEATH),
+            ctypes.byref(attr),
+            ctypes.c_uint32(0),
+        ),
+        f"landlock_add_rule({what})",
+    )
+
+
 def _add_rule(syscall: Callable[..., Any], ruleset: int, path: str, access: int) -> None:
     fd = os.open(path, _O_PATH | os.O_CLOEXEC)
     try:
-        # struct landlock_path_beneath_attr is packed: u64 allowed_access, s32 parent_fd.
-        attr = ctypes.create_string_buffer(struct.pack("=Qi", access, fd), 12)
-        _check(
-            syscall(
-                _SYS_LANDLOCK_ADD_RULE,
-                ctypes.c_int(ruleset),
-                ctypes.c_int(_LANDLOCK_RULE_PATH_BENEATH),
-                ctypes.byref(attr),
-                ctypes.c_uint32(0),
-            ),
-            f"landlock_add_rule({path})",
-        )
+        _add_rule_fd(syscall, ruleset, fd, access, path)
     finally:
         os.close(fd)
 
 
-def restrict_writes(writable: list[str]) -> int:
-    """Allow writes only beneath ``writable`` for this process; return the ABI."""
+def open_verified_roots(roots: list[tuple[str, int, int]]) -> list[int]:
+    """Open each writable root without following a symlink and check its identity.
+
+    ``roots`` are ``(path, st_dev, st_ino)`` as ``exec_sandbox.confine``
+    validated them. A root that was renamed, replaced or swapped for a symlink
+    since then fails here and the command never runs. On Linux the returned
+    descriptors are the very objects the Landlock rules are bound to.
+    """
+    flags = os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+    flags |= _O_PATH if sys.platform.startswith("linux") else os.O_RDONLY
+    opened: list[int] = []
+    try:
+        for path, device, inode in roots:
+            try:
+                fd = os.open(path, flags)
+            except OSError as exc:
+                raise SandboxError(
+                    f"writable root {path} cannot be opened: {exc.strerror}"
+                ) from None
+            opened.append(fd)
+            status = os.fstat(fd)
+            if (status.st_dev, status.st_ino) != (device, inode):
+                raise SandboxError(f"writable root {path} is not the directory that was confined")
+    except BaseException:
+        for fd in opened:
+            os.close(fd)
+        raise
+    return opened
+
+
+def restrict_writes(root_fds: list[int]) -> int:
+    """Allow writes only beneath the verified root descriptors; return the ABI."""
     abi = landlock_abi()
     if abi < MIN_LANDLOCK_ABI:
         raise SandboxError(
@@ -188,10 +228,8 @@ def restrict_writes(writable: list[str]) -> int:
         "landlock_create_ruleset",
     )
     try:
-        for path in writable:
-            if not os.path.isdir(path):
-                raise SandboxError(f"writable root is not a directory: {path}")
-            _add_rule(syscall, ruleset, path, handled)
+        for fd in root_fds:
+            _add_rule_fd(syscall, ruleset, fd, handled, f"root fd {fd}")
         for device in WRITABLE_DEVICES:
             if os.path.exists(device):
                 _add_rule(syscall, ruleset, device, device_write_access(abi))
@@ -374,23 +412,29 @@ def bring_loopback_up() -> None:
         fcntl.ioctl(sock, _SIOCSIFFLAGS, struct.pack("16sH14s", b"lo", current | _IFF_UP, b""))
 
 
-def _parse(arguments: list[str]) -> tuple[bool, bool, list[str], list[str]]:
+def _parse(
+    arguments: list[str],
+) -> tuple[bool, bool, list[tuple[str, int, int]], list[str]]:
     loopback = bool(arguments) and arguments[0] == "--loopback-up"
     if loopback:
         arguments = arguments[1:]
     landlock = bool(arguments) and arguments[0] == "--landlock"
     index = 1 if landlock else 0
-    writable: list[str] = []
-    while index < len(arguments) and arguments[index] == "--write":
-        if index + 1 >= len(arguments):
-            raise SandboxError("--write needs a directory")
-        writable.append(arguments[index + 1])
-        index += 2
+    roots: list[tuple[str, int, int]] = []
+    while index < len(arguments) and arguments[index] == "--root":
+        if index + 3 >= len(arguments):
+            raise SandboxError("--root needs DIR DEV INO")
+        try:
+            device, inode = int(arguments[index + 2]), int(arguments[index + 3])
+        except ValueError:
+            raise SandboxError("--root DEV and INO must be integers") from None
+        roots.append((arguments[index + 1], device, inode))
+        index += 4
     if index >= len(arguments) or arguments[index] != "--" or index + 1 >= len(arguments):
-        raise SandboxError("usage: [--landlock --write DIR ...] -- ARGV...")
-    if writable and not landlock:
-        raise SandboxError("--write needs --landlock")
-    return loopback, landlock, writable, arguments[index + 1 :]
+        raise SandboxError("usage: [--loopback-up] [--landlock] --root DIR DEV INO ... -- ARGV...")
+    if not roots:
+        raise SandboxError("at least one --root is required")
+    return loopback, landlock, roots, arguments[index + 1 :]
 
 
 def _command_environment() -> dict[str, str]:
@@ -410,13 +454,18 @@ def _command_environment() -> dict[str, str]:
 
 def main(arguments: list[str]) -> int:
     try:
-        loopback, landlock, writable, command = _parse(arguments)
+        loopback, landlock, roots, command = _parse(arguments)
         env = _command_environment()
-        if loopback:
-            bring_loopback_up()
-        if landlock:
-            restrict_writes(writable)
-            deny_metadata_changes()
+        root_fds = open_verified_roots(roots)
+        try:
+            if loopback:
+                bring_loopback_up()
+            if landlock:
+                restrict_writes(root_fds)
+                deny_metadata_changes()
+        finally:
+            for fd in root_fds:
+                os.close(fd)
     except (SandboxError, OSError) as exc:
         sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
         return EXIT_SANDBOX_FAILED

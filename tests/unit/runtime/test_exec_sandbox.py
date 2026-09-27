@@ -152,6 +152,47 @@ class TestRealBackend:
         assert result.returncode == 0, result.stderr
         assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
 
+    def test_a_root_swapped_for_a_symlink_after_confine_runs_nothing(
+        self, layout: dict[str, Path]
+    ) -> None:
+        _require_backend()
+        copy, outside = layout["copy"].resolve(), layout["outside"].resolve()
+        command = confine(
+            _python("open('escaped.txt', 'w').write('x')"),
+            cwd=str(copy),
+            writable_roots=(str(copy),),
+            temp_dir=str(layout["temp"]),
+            deny_network=False,
+        )
+        assert isinstance(command, ConfinedCommand)
+        copy.rename(copy.with_name("copy-moved"))
+        copy.symlink_to(outside, target_is_directory=True)
+
+        result = _run(command)
+
+        assert result.returncode == _confine_exec.EXIT_SANDBOX_FAILED, result.stderr
+        assert not (outside / "escaped.txt").exists()
+
+    def test_a_root_holding_a_hard_link_is_refused(
+        self, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(exec_sandbox, "filesystem_backend", lambda: SandboxBackend.LANDLOCK)
+        outside_file = layout["outside"] / "shared.txt"
+        outside_file.write_text("keep", encoding="utf-8")
+        os.link(outside_file, layout["copy"] / "alias.txt")
+
+        result = confine(
+            ("true",),
+            cwd=str(layout["copy"]),
+            writable_roots=(str(layout["copy"]),),
+            temp_dir=str(layout["temp"]),
+            deny_network=False,
+        )
+
+        assert isinstance(result, SandboxUnavailable)
+        assert result.reason is SandboxUnavailableReason.ALIASED_WRITABLE_ROOT
+        assert result.detail.endswith("alias.txt")
+
     def test_writable_root_with_quote_and_backslash_in_its_name(self, tmp_path: Path) -> None:
         _require_backend()
         root = tmp_path / 'we"ird\\dir'
@@ -584,10 +625,21 @@ class TestLandlockAccessMask:
         monkeypatch.setattr(_confine_exec, "landlock_abi", lambda: 2)
         monkeypatch.setenv(_confine_exec.COMMAND_ENV_VARIABLE, "{}")
 
-        status = _confine_exec.main(["--landlock", "--write", str(tmp_path), "--", "true"])
+        status = os.stat(tmp_path)
+        root = ["--root", str(tmp_path), str(status.st_dev), str(status.st_ino)]
+        status = _confine_exec.main(["--landlock", *root, "--", "true"])
 
         assert status == _confine_exec.EXIT_SANDBOX_FAILED
         assert _confine_exec.MIN_LANDLOCK_ABI == 3
 
     def test_helper_refuses_without_a_command(self) -> None:
-        assert _confine_exec.main(["--write", "/tmp"]) == _confine_exec.EXIT_SANDBOX_FAILED
+        assert _confine_exec.main(["--root", "/tmp", "1", "2"]) == _confine_exec.EXIT_SANDBOX_FAILED
+
+    def test_helper_refuses_a_root_that_is_not_the_confined_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv(_confine_exec.COMMAND_ENV_VARIABLE, "{}")
+        status = os.stat(tmp_path)
+        wrong_inode = ["--root", str(tmp_path), str(status.st_dev), str(status.st_ino + 1)]
+
+        assert _confine_exec.main([*wrong_inode, "--", "true"]) == _confine_exec.EXIT_SANDBOX_FAILED

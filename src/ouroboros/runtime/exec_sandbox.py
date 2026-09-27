@@ -20,6 +20,12 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   (``/dev/null`` and friends). Everything else, including the live
   workspace, the user's home directory and the system temp directory, is
   read-only. Reading and executing are not restricted.
+  Each root is claimed by identity: ``confine`` records its real path,
+  device and inode, and the helper opens it without following a symlink and
+  refuses to run the command unless it is still that directory (on Linux the
+  Landlock rule is bound to that very descriptor). A root holding a regular
+  file with another hard link is refused (``aliased_writable_root``): the
+  other link may be outside, and writing through the root would change it.
   "Read-only" covers content, names (create, remove, rename, link) and
   metadata the process sets (mode, ownership, timestamps, extended
   attributes, inode flags). The access time the kernel records when a
@@ -106,6 +112,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -175,6 +182,9 @@ class SandboxUnavailableReason(StrEnum):
     """Network denial was requested and no mechanism for it works here."""
     INVALID_WRITABLE_ROOT = "invalid_writable_root"
     """A writable root or the temp directory is not an existing directory."""
+    ALIASED_WRITABLE_ROOT = "aliased_writable_root"
+    """A regular file under a writable root has another hard link, which may be
+    outside the roots: writing it through the root would change that file too."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,10 +232,38 @@ def _darwin_profile(root_count: int, *, deny_network: bool) -> str:
     return profile + (_DARWIN_NETWORK_RULES if deny_network else "")
 
 
+# A writable root as ``confine`` validated it: real path, device, inode. The
+# helper refuses to run the command unless the path still opens (without
+# following a symlink) to that same directory.
+_RootClaim = tuple[str, int, int]
+
+
+def _claim_root(path: str) -> _RootClaim:
+    status = os.stat(path)
+    return (path, status.st_dev, status.st_ino)
+
+
+def _hard_linked_file(root: str) -> str | None:
+    """A regular file beneath ``root`` with more than one link, or None.
+
+    Symlinks and linked directories are not followed.
+    """
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                status = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
+                return path
+    return None
+
+
 def _backend_argv(
     backend: SandboxBackend,
     argv: Sequence[str],
-    roots: Sequence[str],
+    roots: Sequence[_RootClaim],
     network_prefix: tuple[str, ...] | None,
 ) -> tuple[str, ...]:
     """The argv running ``argv`` under ``backend``; ``network_prefix`` None allows network.
@@ -234,16 +272,18 @@ def _backend_argv(
     environment only when it execs the command, inside the sandbox.
     """
     helper = (sys.executable, "-I", "-S", "-B", str(_CONFINE_HELPER))
+    claims = [part for path, dev, ino in roots for part in ("--root", path, str(dev), str(ino))]
     if backend is SandboxBackend.SANDBOX_EXEC:
         executable = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
         profile = _darwin_profile(len(roots), deny_network=network_prefix is not None)
-        params = [part for index, root in enumerate(roots) for part in ("-D", f"W{index}={root}")]
-        return (executable, "-p", profile, *params, "--", *helper, "--", *argv)
-    writes = [part for root in roots for part in ("--write", root)]
+        params = [
+            part for index, (path, _, _) in enumerate(roots) for part in ("-D", f"W{index}={path}")
+        ]
+        return (executable, "-p", profile, *params, "--", *helper, *claims, "--", *argv)
     # A fresh network namespace starts with ``lo`` down; bring it up so only
     # non-loopback traffic is denied.
     loopback = ("--loopback-up",) if network_prefix else ()
-    return (*(network_prefix or ()), *helper, *loopback, "--landlock", *writes, "--", *argv)
+    return (*(network_prefix or ()), *helper, *loopback, "--landlock", *claims, "--", *argv)
 
 
 def _bootstrap_environment(command_env: Mapping[str, str]) -> dict[str, str]:
@@ -266,7 +306,7 @@ def _probe_matrix(argv_prefix: Sequence[str] | None, root: Path) -> dict[str, An
     builder's output for the probe command.
     """
     inside, outside = root / "inside", root / "outside"
-    inside.mkdir()
+    inside.mkdir(exist_ok=True)
     outside.mkdir()
     probe_module.prepare(str(outside))
     before = probe_module.snapshot(str(outside))
@@ -327,7 +367,9 @@ def filesystem_backend() -> SandboxBackend | None:
         (probe_root / "baseline").mkdir()
         (probe_root / "confined").mkdir()
         baseline = _probe_matrix(None, probe_root / "baseline")
-        prefix = _backend_argv(candidate, (), (str(probe_root / "confined" / "inside"),), None)
+        (probe_root / "confined" / "inside").mkdir()
+        inside = _claim_root(str(probe_root / "confined" / "inside"))
+        prefix = _backend_argv(candidate, (), (inside,), None)
         confined = _probe_matrix(prefix, probe_root / "confined")
         if not _matrix_confines(baseline, confined):
             log.info(
@@ -444,6 +486,7 @@ def confine(
             return SandboxUnavailable(SandboxUnavailableReason.INVALID_WRITABLE_ROOT, root)
         if real not in roots:
             roots.append(real)
+    claims = [_claim_root(root) for root in roots]
     env = build_environment(
         real_temp, source=env_source, passthrough=env_passthrough, overrides=env_set
     )
@@ -462,11 +505,15 @@ def confine(
     reason = sandbox_unavailable_reason(deny_network=deny_network, enabled=True)
     if reason is not None:
         return SandboxUnavailable(reason)
+    for root in roots:
+        aliased = _hard_linked_file(root)
+        if aliased is not None:
+            return SandboxUnavailable(SandboxUnavailableReason.ALIASED_WRITABLE_ROOT, aliased)
     backend = filesystem_backend()
     assert backend is not None  # checked by sandbox_unavailable_reason
     network_prefix = network_denial_prefix() if deny_network else None
     return ConfinedCommand(
-        argv=_backend_argv(backend, argv, roots, network_prefix),
+        argv=_backend_argv(backend, argv, claims, network_prefix),
         env=_bootstrap_environment(env),
         command_env=env,
         cwd=cwd,
