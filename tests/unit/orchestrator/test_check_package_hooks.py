@@ -254,17 +254,32 @@ async def test_resume_never_restores_legacy_rejected_work_as_succeeded(tmp_path:
     # package decides after the worker stops. A resumed process has no
     # package, so the checkpoint records that work as failed and the resumed
     # run restores it as failed (the legacy verdict decides).
+    from ouroboros.core.seed import OntologySchema, Seed, SeedMetadata
     from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
     from ouroboros.orchestrator.parallel_executor_models import (
         ACExecutionOutcome,
         checkpoint_outcome,
     )
-    from tests.unit.orchestrator.test_parallel_executor_verify_by_default import (
-        _make_executor,
-        _seed_with_specs,
-    )
 
-    seed = _seed_with_specs("rejected root", "rejected sub-AC", "clean")
+    def _make_executor(*, working_directory: str, run_verify_commands: bool) -> Any:
+        adapter = MagicMock()
+        adapter.working_directory = working_directory
+        adapter.runtime_backend = "claude"
+        return ParallelACExecutor(
+            adapter=adapter,
+            event_store=AsyncMock(),
+            console=MagicMock(),
+            enable_decomposition=False,
+            run_verify_commands=run_verify_commands,
+            ac_retry_attempts=0,
+        )
+
+    seed = Seed(
+        goal="resume",
+        acceptance_criteria=("rejected root", "rejected sub-AC", "clean"),
+        ontology_schema=OntologySchema(name="n", description="d"),
+        metadata=SeedMetadata(ambiguity_score=0.05),
+    )
     plan = DependencyGraph(
         nodes=tuple(ACNode(index=i, content=f"ac {i}", depends_on=()) for i in range(3)),
         execution_levels=((0, 1, 2),),

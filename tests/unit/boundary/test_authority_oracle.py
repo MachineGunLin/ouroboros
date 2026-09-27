@@ -903,7 +903,7 @@ async def test_held_out_values_never_reach_the_boundary_store(
 
     from ouroboros.boundary.events import BOUNDARY_AGGREGATE_TYPE
 
-    reply = copy.deepcopy(REPLY)
+    reply: dict[str, Any] = copy.deepcopy(REPLY)
     reply["oracles"][0]["cases"][1] = {
         "case_id": "held",
         "args": {"value": 6173, "low": 1, "high": 4409},
