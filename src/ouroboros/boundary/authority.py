@@ -145,13 +145,24 @@ def legacy_verdict_in_tree(result: Any) -> tuple[bool, str | None, str | None]:
     sub-result, not on the root. The legacy verdict of the root is therefore
     the whole tree's: rejected when the legacy verifier rejected the root or
     any sub-AC.
+
+    Only the rejection the executor made (``legacy_rejection``) is a legacy
+    rejection. A verifier verdict that did not pass without one is not: the
+    executor keeps such a result successful when the transcript was
+    unavailable (``TRANSCRIPT_MISSING_INFRASTRUCTURE``), when the environment
+    was unverifiable, or when a passing ``verify_command`` replaced the
+    evidence, and arm ``off`` accepts it. That verdict carries no rejection
+    (R3-A2); it only supplies the failure class of a real rejection.
     """
-    verdict = getattr(result, "atomic_verifier_verdict", None)
     text = getattr(result, "legacy_rejection", None) or None
-    if verdict is not None and not bool(getattr(verdict, "passed", True)):
-        return True, getattr(verdict, "failure_class", None), text
     if text:
-        return True, None, text
+        verdict = getattr(result, "atomic_verifier_verdict", None)
+        failure_class = (
+            getattr(verdict, "failure_class", None)
+            if verdict is not None and not bool(getattr(verdict, "passed", True))
+            else None
+        )
+        return True, failure_class, text
     for sub in getattr(result, "sub_results", ()) or ():
         rejected, failure_class, sub_text = legacy_verdict_in_tree(sub)
         if rejected:

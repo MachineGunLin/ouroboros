@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ouroboros.boundary.acceptance import PackageCriterionStatus
-from ouroboros.boundary.authority import CheckPackageAuthority, existing_outcomes_from_results
+from ouroboros.boundary.authority import (
+    CheckPackageAuthority,
+    apply_legacy_fallback,
+    existing_outcomes_from_results,
+    legacy_verdict_in_tree,
+)
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import ConstructionOutcome, package_from_reply
 from ouroboros.boundary.package import seed_criterion_keys, verify_commitment
@@ -158,7 +163,24 @@ def _legacy_rejected(index: int, *, entry: dict | None = None) -> ACExecutionRes
         atomic_verifier_verdict=VerifierVerdict(
             passed=False, reasons=("form",), failure_class="EVIDENCE_FORM_MISMATCH"
         ),
+        # The executor keeps the rejection it made advisory (gate installed).
+        legacy_rejection="legacy verifier: evidence form mismatch",
         typed_evidence=EvidenceRecord(data={"entry_points": [entry]} if entry else {}),
+    )
+
+
+def _transcript_unavailable(index: int) -> ACExecutionResult:
+    """What the leaf returns when the transcript could not be collected: no rejection."""
+    return ACExecutionResult(
+        ac_index=index,
+        ac_content=f"criterion {index}",
+        success=True,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        atomic_verifier_verdict=VerifierVerdict(
+            passed=False,
+            reasons=("transcript_missing_infrastructure: runtime support messages were empty",),
+            failure_class="TRANSCRIPT_MISSING_INFRASTRUCTURE",
+        ),
     )
 
 
@@ -365,6 +387,33 @@ def test_existing_outcomes_with_the_gate_treat_runtime_failures_as_unattempted()
     gated = existing_outcomes_from_results(parallel, gated=True)
     assert [gated[i].attempted for i in range(3)] == [True, False, True]
     assert gated[0].failure_class == "EVIDENCE_FORM_MISMATCH" and not gated[0].passed
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_an_unavailable_transcript_is_no_legacy_rejection(gated: bool) -> None:
+    # R3-A2: the executor keeps such a result successful and sets no
+    # rejection (arm off accepts it); a failing verdict alone is no
+    # information, on the root and on a sub-AC.
+    decomposed = ACExecutionResult(
+        ac_index=1,
+        ac_content="c1",
+        success=True,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        is_decomposed=True,
+        sub_results=(replace(_transcript_unavailable(1), ac_content="sub"),),
+    )
+    parallel = ParallelExecutionResult(
+        results=(_transcript_unavailable(0), decomposed), success_count=2, failure_count=0
+    )
+    assert legacy_verdict_in_tree(parallel.results[0]) == (False, None, None)
+    assert legacy_verdict_in_tree(decomposed) == (False, None, None)
+    outcomes = existing_outcomes_from_results(parallel, gated=gated)
+    assert [outcomes[i].passed for i in range(2)] == [True, True]
+    kept = apply_legacy_fallback(parallel, outcomes)
+    assert (
+        kept.all_succeeded
+        and [r.outcome for r in kept.results] == [ACExecutionOutcome.SUCCEEDED] * 2
+    )
 
 
 def test_tier_summary_value_is_a_closed_bucketed_enum() -> None:
@@ -1012,3 +1061,32 @@ async def test_held_out_values_never_reach_the_boundary_store(
     (salt_path,) = controller_private_dir(tmp_path / "store").iterdir()
     salt = bytes.fromhex(json.loads(salt_path.read_text())["salt"])
     assert verify_commitment(state.package, salt, record["package_commitment"])
+
+
+async def test_telemetry_never_reads_an_unavailable_transcript_as_a_rejection(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # R3-A2: the package passes and the legacy verifier had no transcript:
+    # that is agreement with what arm off decides (accept), never
+    # package_accepted_over_legacy_reject.
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
+    authority.install(_executor(repo))
+    results = (
+        _transcript_unavailable(0),
+        replace(
+            _transcript_unavailable(1),
+            typed_evidence=EvidenceRecord(data={"entry_points": [MIX_ENTRY]}),
+        ),
+        _transcript_unavailable(2),
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert decided.all_succeeded and authority.outcome.legacy_run_accepted is True
+    meta = await _run_for(authority).outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="completed"
+    )  # type: ignore[arg-type]
+    assert meta["package_verdict"] == "pass"
+    assert meta["legacy_verdict"] == "accept"
+    assert meta["reconciliation"] == "agree"
+    assert meta["legacy_failure_class"] == "accepted"
