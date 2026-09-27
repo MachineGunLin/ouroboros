@@ -41,7 +41,9 @@ Replay runs `<test command>` alone and judges its own exit status, so the
 filter cannot mask a failure. A `set -o pipefail && ...` preamble is not
 replayable (`set` is a shell builtin), so claims resting on it keep the
 transcript-only rules. Those rules recognize `set -o pipefail` alone or with
-`-e`/`-u` beside it (`set -euo pipefail; ...`, `set -e -o pipefail && ...`).
+`-e`/`-u` beside it (`set -euo pipefail; ...`, `set -e -o pipefail && ...`);
+a later `set` that names `pipefail` without enabling it (`set +o pipefail`)
+removes the protection again.
 
 For richer result formats, prefer one of these approaches:
 
@@ -117,9 +119,13 @@ the default) and the leaf held Bash authority. The rules:
 - **Isolation.** Each command runs as a direct argv (no shell) in a fresh copy
   of the workspace, with the verify gate's scrubbed environment plus
   `PYTHONDONTWRITEBYTECODE=1`, and `execution.verify_command_timeout_seconds`.
-  `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` and `PYTEST_DISABLE_PLUGIN_AUTOLOAD` are
-  removed from the inherited environment, and each replayed run records them
-  in `scrubbed_environment`. Assignments the command itself makes are kept
+  The narrowing variables (`NARROWING_ENVIRONMENT` and the `JEST_*` and
+  `VITEST_*` families; see "Narrowing" below) are removed from the inherited
+  environment, and each replayed run records the names it removed in
+  `scrubbed_environment`. A replay that needed one of them from the inherited
+  environment (a `manage.py test` relying on `DJANGO_SETTINGS_MODULE`, a Go
+  build relying on `GOFLAGS=-mod=vendor`) can fail; that fails closed.
+  Assignments the command itself makes are kept
   (recorded in `env_delta`); they disable target linkage instead (below).
   `.git` and caches are not copied; `.venv`, `venv`, `node_modules`, `.tox`
   and `.nox` are linked, not copied. A workspace over 50,000 files or 1 GiB is
@@ -161,7 +167,8 @@ the default) and the leaf held Bash authority. The rules:
   same conditions: nothing narrows it, and a claimed file named in the
   command must be one of its executed operands.
 - **Narrowing.** Any of these in a command disables the target rule and the
-  runner-output rules for it, on replay and on the transcript-only path:
+  runner-output rules for it, on replay and on the transcript-only path.
+  Where a runner's semantics are unclear, the option is treated as narrowing.
   - an option that excludes or selects tests, in any spelling (`--opt value`,
     `--opt=value`, `-kvalue`): pytest `--deselect`, `--ignore`,
     `--ignore-glob`, `-k`, `-m`; unittest `-k`; Django and project runner
@@ -178,13 +185,58 @@ the default) and the leaf held Bash authority. The rules:
   - pytest `-p` loading or disabling a plugin, except the no-op
     `no:cacheprovider`; `-p`/`--pattern` for unittest, Django and project
     runner scripts (a discovery pattern);
-  - an assignment of `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` or
-    `PYTEST_DISABLE_PLUGIN_AUTOLOAD` on the command line: a leading
-    assignment, one consumed by an `env` wrapper, or, on the transcript-only
-    path, anywhere in the command text (`export PYTEST_ADDOPTS=... && ...`).
+  - an assignment on the command line of a variable that changes what a
+    runner collects or loads or where the code under test is imported from:
+    `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`,
+    `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONSAFEPATH`,
+    `DJANGO_SETTINGS_MODULE`, `NODE_OPTIONS`, `NODE_PATH`, `RUBYOPT`,
+    `RUBYLIB`, `BUNDLE_GEMFILE`, `GOFLAGS`, `CGO_ENABLED`, and any `JEST_*` or
+    `VITEST_*` variable. A leading assignment, one consumed by an `env`
+    wrapper, and one anywhere in the transcript command's text
+    (`export PYTHONPATH=stubs && ...`) all count; on the transcript-only
+    path, so does an export of one in an earlier Bash call of the same leaf
+    (a runtime's shell may keep it);
+  - the Python interpreter flags `-P` and `-I` (they change `sys.path`);
+  - a runner's configuration, module-resolution or selection options:
+    Django `runtests.py`, `manage.py test` and `django-admin test`
+    `--settings`, `--pythonpath`, `--testrunner` and `--parallel` (the
+    SWE-bench form `--settings=test_sqlite --parallel 1` included); jest and
+    vitest `-c`/`--config`, `-t`/`--testNamePattern`,
+    `--testPathIgnorePatterns`, `--testPathPattern`, `--selectProjects`,
+    `--shard`, `-o`/`--onlyChanged`, `--changedSince`, `--passWithNoTests`,
+    `--root`/`--rootDir`, module-mapping and setup-file options (camelCase and
+    kebab-case alike); mocha `--config`, `--grep`/`-g`, `--fgrep`,
+    `--invert`, `--ignore`/`--exclude`, `--file`, `-r`/`--require`; phpunit
+    `-c`/`--configuration`, `--filter`, `--group`, `--exclude-group`,
+    `--testsuite`, `--bootstrap`; rspec `-O`/`--options`, `-e`/`--example`,
+    `-t`/`--tag`, `--pattern`, `--exclude-pattern`, `-I`, `-r`/`--require`;
+    `go test` `-run`, `-skip`, `-tags`, `-short`, `-list`, `-exec`, `-mod`,
+    `-modfile`, `-overlay`; `cargo test` and `cargo nextest` with a
+    positional filter (before or after `--`), `--skip`, `--exact`,
+    `--features`, `--no-default-features`, `--lib`, `--bins`, `--tests`,
+    `--test`, `-p`/`--package`, or any option outside a short list of
+    harmless ones (`--release`, `-j`, `--workspace`, `--nocapture`, ...);
+    Maven `-Dtest=` (and `-Dit.test`, `-Dgroups`, `surefire.*`,
+    `failsafe.*`), `-P`, `-pl`, `-s`, `-f`; Gradle `--tests`, `-P`, `-x`,
+    `-b`, `-c`, `-I`, `-p`.
+
+  Two classes are told apart. Selection options (`-k`, `--tests`, `-Dtest=`,
+  `-run`, `-t`, `--filter`, ...) choose which tests run; on the
+  transcript-only path, output that names the whole claim still backs it
+  (`gradle test --tests Foo` with `Foo > t PASSED`). Configuration (the
+  variables above, `-P`/`-I`, config files, settings, module resolution,
+  plugin loading, `go test -list`) can make a named test pass against other
+  code, so no output backs a claim on such a run.
 
   An option the tables do not know never takes an option-like token as its
   value, so `pytest --x --ignore tests/t.py tests/t.py` is still narrowed.
+
+  Scope: configuration the workspace itself carries (a `pytest.ini` with
+  `addopts = --deselect ...`, a `conftest.py` that deselects or skips, a
+  `jest.config.js`, Django's default settings module) is part of the work
+  under review, not of the command, so it does not disable linkage. Detecting
+  it would need the runner's own report of deselected or skipped tests; the
+  legacy verifier does not detect such test tampering either.
 - **Output filters.** `CMD | tail ...`, `CMD 2>&1 | grep ...` and chains of
   output filters (`tail`, `head`, `grep`, `egrep`, `fgrep`, `sed`, `cat`,
   `cut`, `sort`, `uniq`, `wc`, `tr`) replay `CMD` alone and use `CMD`'s own
