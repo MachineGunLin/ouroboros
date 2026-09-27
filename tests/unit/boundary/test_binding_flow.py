@@ -601,3 +601,57 @@ async def test_all_unverified_criteria_give_the_all_unverified_reason(
     )
     assert verdict.artifact_verdict is ArtifactVerdict.UNVERIFIED
     assert verdict.reasons == ("all_unverified",)
+
+
+async def test_no_held_out_value_reaches_the_store(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # S3: after preparation and a failing verification, no file in the store
+    # (package record, receipts, base snapshot) holds a held-out input or
+    # expected value; the record keeps the held-out case as an id.
+    import json
+
+    reply = _reply()
+    reply["oracles"][0]["cases"][1] = {
+        "case_id": "held",
+        "args": {"value": 6173, "low": 1, "high": 4409},
+        "expect": {"kind": "returns", "value": 4409},
+    }
+    seed = _seed()
+    constructor = _Constructor(seed, repo)
+    constructor.outcome = ConstructionOutcome(
+        package_from_reply(
+            reply, seed, input_digest="1" * 64, generator="fake", base_checkout=repo
+        ),
+        None,
+        "1" * 64,
+        "fake",
+    )
+    state = await prepare_check_package(
+        seed,
+        event_store=store,
+        constructor=constructor,
+        execution_id="exec_flow",
+        base_checkout=repo,
+        worker_workspace=repo,
+        runtime_label="test",
+        settings=CheckPackageSettings(True, policy=RegenerationPolicy.STUDY),
+        store_dir=tmp_path / "store",
+    )
+    assert state.package is not None and state.package.oracles[0].cases[1].held_out
+    verdict = await verify_check_package(
+        state, event_store=store, candidate_checkout=repo, settings=CheckPackageSettings(True)
+    )
+    assert verdict.verdict == "fail"
+    stored = [path for path in (tmp_path / "store").rglob("*") if path.is_file()]
+    assert {path.parent.name for path in stored} >= {"packages", "receipts"}
+    hits = [
+        (str(path), token)
+        for path in stored
+        for token in (b"6173", b"4409")
+        if token in path.read_bytes()
+    ]
+    assert hits == []
+    (record,) = (tmp_path / "store" / "packages").iterdir()
+    held = json.loads(record.read_text())["held_out"]
+    assert ("oracle_1", "held") in [(item["check_id"], item["case_id"]) for item in held]
