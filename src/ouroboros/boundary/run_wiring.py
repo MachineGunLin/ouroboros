@@ -102,6 +102,7 @@ from ouroboros.boundary.package import (
     write_package_record,
 )
 from ouroboros.boundary.rollout import (
+    AssignmentSource,
     CheckPackageAssignment,
     resolve_check_package_assignment,
 )
@@ -428,8 +429,19 @@ async def prepare_check_package(
         versions.append(final_id)
         bound = final_id
 
+    # The arm's source goes into the journal: a resumed run (another
+    # process) reports the original assignment from it (R4-A2).
+    source = (
+        settings.assignment.source
+        if settings.assignment is not None
+        else AssignmentSource.USER_FORCED_ON
+    )
     await ledger.record_actor_started(
-        execution_id, [bound], workspace=worker_workspace, runtime=runtime_label
+        execution_id,
+        [bound],
+        workspace=worker_workspace,
+        runtime=runtime_label,
+        assignment=source.value,
     )
     admitted = admission is not None and admission.verdict is PackageVerdict.ADMITTED
     snapshot: tuple[Path, Path] | None = None

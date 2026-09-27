@@ -26,6 +26,7 @@ from ouroboros.boundary.resume import (
     PACKAGE_UNAVAILABLE,
     ResumedCheckPackageAuthority,
 )
+from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
 from ouroboros.boundary.run_control import CheckPackageRun
 from ouroboros.boundary.run_wiring import (
     BoundaryRunState,
@@ -144,7 +145,12 @@ def repo(tmp_path: Path) -> Path:
 
 
 async def _run_until_the_worker_stops(
-    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: EventStore,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    assignment: CheckPackageAssignment | None = None,
 ) -> tuple[Seed, BoundaryRunState]:
     """Prepare (arm on), dispatch the worker, and let it stop; the package never decides."""
     monkeypatch.setattr(
@@ -159,7 +165,7 @@ async def _run_until_the_worker_stops(
         base_checkout=repo,
         worker_workspace=repo,
         runtime_label="codex",
-        settings=CheckPackageSettings(True, policy=RegenerationPolicy.STUDY),
+        settings=CheckPackageSettings(True, policy=RegenerationPolicy.STUDY, assignment=assignment),
         store_dir=tmp_path / "store",
     )
     assert state.admitted and state.package is not None
@@ -481,3 +487,69 @@ async def test_an_untouched_store_agrees_with_the_journal(
     _run, authority = await _resume(store, seed, repo)
     assert authority.boundary.package is not None
     assert authority.boundary.held_out_checks == frozenset({"oracle_clamp"})
+
+
+# R4-A2: telemetry of a resumed run is the original run's, from the journal.
+
+
+async def test_resumed_telemetry_reports_the_original_arm_and_the_package_decision(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's probe: arm on (randomized), the resumed package fails the run.
+
+    Before the fix the row read arm ``off``, ``not_run``, ``package_verdict=none``,
+    ``reconciliation=none`` and ``legacy_verdict=reject``.
+    """
+    randomized = CheckPackageAssignment(Arm.ON, AssignmentSource.RANDOMIZED)
+    seed, state = await _run_until_the_worker_stops(
+        store, repo, tmp_path, monkeypatch, assignment=randomized
+    )
+    started = [
+        event
+        for event in await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
+        if event.type == "boundary.actor.started"
+    ]
+    assert [event.data["check_package_assignment"] for event in started] == ["randomized"]
+    forget_live_state(state)  # clamp still broken: package FAIL; legacy accepted all
+    run, authority = await _resume(store, seed, repo)  # the arm resolves off now
+    decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=_restored())
+    assert not decided.all_succeeded and authority.outcome.legacy_run_accepted
+    meta = await run.outcome_meta(
+        store, execution_id=EXECUTION, session_id="s", terminal_status="failed"
+    )
+    assert {key: meta[key] for key in list(meta)[:6]} == {
+        "check_package_arm": "on",
+        "check_package_assignment": "randomized",
+        "check_package_status": "admitted",
+        "package_verdict": "fail",
+        "legacy_verdict": "accept",
+        "reconciliation": "package_rejected_over_legacy_accept",
+    }
+    assert meta["legacy_failure_class"] == "accepted"
+    assert meta["unverified_count"] == "1"
+
+
+async def test_resumed_telemetry_of_an_undecided_run_is_indeterminate(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    (repo / "mathutils.py").write_text(CLAMP_FIXED + DOUBLE)
+    forget_live_state(state)
+    run, authority = await _resume(store, seed, repo)
+    await authority(seed=seed, execution_id=EXECUTION, parallel_result=_restored())
+    meta = await run.outcome_meta(
+        store, execution_id=EXECUTION, session_id="s", terminal_status="failed"
+    )
+    assert (
+        meta["check_package_arm"],
+        meta["check_package_assignment"],
+        meta["check_package_status"],
+        meta["package_verdict"],
+        meta["reconciliation"],
+    ) == (
+        "on",
+        "user_forced_on",
+        "admitted",
+        "indeterminate",
+        "package_rejected_over_legacy_accept",
+    )

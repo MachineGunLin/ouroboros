@@ -25,7 +25,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ouroboros.boundary.authority import CheckPackageAuthority, reveal_commitment_salts
+from ouroboros.boundary.authority import (
+    AuthorityOutcome,
+    CheckPackageAuthority,
+    reveal_commitment_salts,
+)
 from ouroboros.boundary.ledger import BoundaryOrderError
 from ouroboros.boundary.resume import ResumedCheckPackageAuthority, load_resumed_boundary
 from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
@@ -171,6 +175,15 @@ class CheckPackageRun:
 
     @property
     def assignment(self) -> CheckPackageAssignment:
+        if self.resumed is not None:
+            # The original run's arm, from the journal (R4-A2): a bound
+            # package means arm on. Journals written before the source was
+            # recorded report ``user_forced_on``.
+            try:
+                source = AssignmentSource(self.resumed.boundary.assignment or "")
+            except ValueError:
+                source = AssignmentSource.USER_FORCED_ON
+            return CheckPackageAssignment(Arm.ON, source)
         return self.settings.assignment or (
             CheckPackageAssignment(Arm.ON, AssignmentSource.USER_FORCED_ON)
             if self.settings.enabled
@@ -348,6 +361,10 @@ class CheckPackageRun:
     @property
     def status(self) -> str:
         """``check_package_status`` (TELEMETRY.md)."""
+        if self.resumed is not None:
+            # Only a run whose worker was bound to an admitted package resumes
+            # with a package decision.
+            return "admitted"
         if not self.enabled or not self.attempted:
             return "not_run"
         if self.preparation_error is not None or self.state is None:
@@ -402,8 +419,14 @@ class CheckPackageRun:
                 lines.append("The finished workspace fails the frozen check package.")
         return lines
 
+    def _outcome(self) -> AuthorityOutcome | None:
+        """The decision of this run's authority, live or resumed."""
+        if self.resumed is not None:
+            return self.resumed.outcome
+        return self.authority.outcome if self.authority is not None else None
+
     def _legacy_verdict(self, terminal_status: str | None, *, verdict_available: bool) -> str:
-        outcome = self.authority.outcome if self.authority is not None else None
+        outcome = self._outcome()
         if outcome is not None:
             return "accept" if outcome.legacy_run_accepted else "reject"
         if not verdict_available:
@@ -411,7 +434,7 @@ class CheckPackageRun:
         return {"completed": "accept", "failed": "reject"}.get(terminal_status or "", "none")
 
     def _package_verdict(self) -> str:
-        outcome = self.authority.outcome if self.authority is not None else None
+        outcome = self._outcome()
         if outcome is None:
             return "none"
         if outcome.error is not None:
@@ -423,7 +446,7 @@ class CheckPackageRun:
     def _reconciliation(self, legacy_verdict: str) -> str:
         if self.status == "not_run":
             return "none"
-        outcome = self.authority.outcome if self.authority is not None else None
+        outcome = self._outcome()
         if outcome is None or outcome.reconciliation is None or not outcome.package_decided:
             return "fallback_to_legacy"
         accepted = outcome.reconciliation.run_accepted
@@ -459,7 +482,7 @@ class CheckPackageRun:
             "legacy_verdict": legacy_verdict,
             "reconciliation": self._reconciliation(legacy_verdict),
         }
-        outcome = self.authority.outcome if self.authority is not None else None
+        outcome = self._outcome()
         if outcome is not None and outcome.legacy and legacy_verdict == "reject":
             failure_class, count = legacy_failure_class_from_annotations(outcome.legacy)
             meta.update(

@@ -104,8 +104,14 @@ def actor_started_event(
     package_sha256: str | None,
     runtime: str | None,
     committed: bool = False,
+    assignment: str | None = None,
 ) -> BaseEvent:
-    """A worker bound to this boundary started after the boundary was sealed."""
+    """A worker bound to this boundary started after the boundary was sealed.
+
+    ``assignment`` is the product arm's source (``rollout.AssignmentSource``),
+    recorded so that a resumed run reports the original assignment; omitted
+    when not given, so other callers keep their earlier bytes.
+    """
     return _event(
         boundary_id,
         ACTOR_STARTED,
@@ -113,6 +119,7 @@ def actor_started_event(
             "actor_id": actor_id,
             **cite(package_sha256, committed=committed),
             "runtime": runtime,
+            **({"check_package_assignment": assignment} if assignment is not None else {}),
         },
     )
 

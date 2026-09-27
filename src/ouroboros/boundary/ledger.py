@@ -187,6 +187,7 @@ class BoundaryLedger:
         *,
         workspace: Path | None = None,
         runtime: str | None = None,
+        assignment: str | None = None,
     ) -> list[BaseEvent]:
         """Record a worker start on every boundary it is bound to.
 
@@ -237,6 +238,7 @@ class BoundaryLedger:
                 package_sha256=package_by_boundary[boundary_id],
                 runtime=runtime,
                 committed=committed.get(boundary_id, False),
+                assignment=assignment,
             )
             for boundary_id in boundary_ids
         ]

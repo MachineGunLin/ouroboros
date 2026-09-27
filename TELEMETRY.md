@@ -122,7 +122,12 @@ the finished workspace).
   `admitted` (a package passed admission on the starting tree, possibly after
   a regenerated version replaced a rejected one), `rejected` (the last package
   built was not admitted), `construction_failed` (the last attempt built no
-  package, or preparation failed), `not_run` (arm `off` or a resumed session).
+  package, or preparation failed), `not_run` (arm `off`, or a resumed session
+  whose worker was not bound to an admitted package). A resumed session whose
+  worker was bound to an admitted package reports the original run's arm and
+  assignment (recorded in the local journal when the worker started),
+  `admitted`, and the package decision recomputed on resume; a later
+  `--no-check-package` does not change that.
 - `package_verdict` is the package's verdict on the finished workspace, by
   precedence: `fail` if a verified criterion failed, else `indeterminate` if a
   criterion could not be decided, else `pass` if at least one criterion

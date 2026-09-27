@@ -130,6 +130,8 @@ class ResumedBoundary:
     revealed: dict[str, set[str]] | None = None
     source: str = "record"
     reason: str | None = None
+    assignment: str | None = None
+    """The arm's source recorded at the worker start (``rollout.AssignmentSource``)."""
 
 
 def visible_package(record: dict[str, Any]) -> tuple[CheckPackage, frozenset[str]]:
@@ -220,6 +222,8 @@ async def load_resumed_boundary(
             revealed.setdefault(str(event.data.get("check_id")), set()).add(
                 str(event.data.get("case_id"))
             )
+    started = next(event for event in bound if event.type == ACTOR_STARTED)
+    assignment = started.data.get("check_package_assignment")
     store = store_dir or default_store_dir(execution_id)
     base = {
         "execution_id": execution_id,
@@ -230,6 +234,7 @@ async def load_resumed_boundary(
         "base_tree_digest": admission.data.get("base_tree_digest"),
         "check_tiers": admission.data.get("check_tiers"),
         "revealed": revealed,
+        "assignment": assignment if isinstance(assignment, str) else None,
     }
     live = live_state(execution_id)
     if live is not None and live.package is not None and live.package.reference == reference:
