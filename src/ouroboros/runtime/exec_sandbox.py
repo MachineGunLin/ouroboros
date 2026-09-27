@@ -302,9 +302,12 @@ def _backend_argv(
         ]
         return (executable, "-p", profile, *params, "--", *helper, *claims, "--", *argv)
     # A fresh network namespace starts with ``lo`` down; bring it up so only
-    # non-loopback traffic is denied.
-    loopback = ("--loopback-up",) if network_prefix else ()
-    return (*(network_prefix or ()), *helper, *loopback, "--landlock", *claims, "--", *argv)
+    # non-loopback traffic is denied. Whenever the network is to be denied,
+    # the helper verifies at activation that its namespace has only loopback.
+    network: tuple[str, ...] = ()
+    if network_prefix is not None:
+        network = (*(("--loopback-up",) if network_prefix else ()), "--require-loopback-only")
+    return (*(network_prefix or ()), *helper, *network, "--landlock", *claims, "--", *argv)
 
 
 def _bootstrap_environment(command_env: Mapping[str, str]) -> dict[str, str]:
@@ -418,12 +421,15 @@ def _process_has_only_loopback() -> bool:
     return bool(names) and all(name == "lo" for name in names)
 
 
-@functools.cache
 def network_denial_prefix() -> tuple[str, ...] | None:
-    """The argv prefix that denies network access, or None; probed once.
+    """The argv prefix that denies network access now, or None.
 
     ``()`` when the denial needs no prefix: on macOS it is part of the
-    profile, and a Linux process with only loopback is already offline.
+    profile, and a Linux process with only loopback is already offline. The
+    namespace state is read on every call, never cached (interfaces can
+    appear, and namespaces can differ by thread); on Linux the helper also
+    checks its own namespace at activation (``--require-loopback-only``).
+    Only the static ``unshare`` capability is probed once.
     """
     if sys.platform == "darwin":
         return ()
@@ -431,6 +437,12 @@ def network_denial_prefix() -> tuple[str, ...] | None:
         return None
     if _process_has_only_loopback():
         return ()
+    return _unshare_prefix()
+
+
+@functools.cache
+def _unshare_prefix() -> tuple[str, ...] | None:
+    """``unshare --user --map-root-user --net`` if it works here; probed once."""
     executable = shutil.which("unshare") or ""
     if not executable:
         return None

@@ -480,7 +480,7 @@ class TestUnavailable:
         monkeypatch.setattr(exec_sandbox.sys, "platform", "win32")
 
         assert exec_sandbox.filesystem_backend.__wrapped__() is None  # type: ignore[attr-defined]
-        assert exec_sandbox.network_denial_prefix.__wrapped__() is None  # type: ignore[attr-defined]
+        assert exec_sandbox.network_denial_prefix() is None
 
     @pytest.mark.parametrize("root", ["relative/dir", "/nonexistent/ouroboros-sandbox-root"])
     def test_invalid_writable_root(self, tmp_path: Path, root: str) -> None:
@@ -505,10 +505,53 @@ class TestUnavailable:
         monkeypatch.setattr(exec_sandbox.sys, "platform", "linux")
         monkeypatch.setattr(exec_sandbox.shutil, "which", lambda _name: None)
 
-        probe = exec_sandbox.network_denial_prefix.__wrapped__  # type: ignore[attr-defined]
+        monkeypatch.setattr(exec_sandbox, "_unshare_prefix", lambda: None)
+        probe = exec_sandbox.network_denial_prefix
 
         assert exec_sandbox._process_has_only_loopback() is offline
         assert probe() == (() if offline else None)
+
+
+class TestNetworkStateIsNotCached:
+    def test_the_loopback_only_decision_follows_the_current_namespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(exec_sandbox.sys, "platform", "linux")
+        monkeypatch.setattr(exec_sandbox, "_unshare_prefix", lambda: None)
+        interfaces = [[(1, "lo")]]
+        monkeypatch.setattr(exec_sandbox.socket, "if_nameindex", lambda: interfaces[0])
+
+        offline = exec_sandbox.network_denial_prefix()
+        interfaces[0] = [(1, "lo"), (2, "eth0")]
+        online = exec_sandbox.network_denial_prefix()
+
+        assert offline == () and online is None
+
+    def test_linux_launch_verifies_the_namespace_at_activation(self) -> None:
+        claim = [("/root", 1, 2)]
+        offline = exec_sandbox._backend_argv(SandboxBackend.LANDLOCK, ("true",), claim, ())
+        namespaced = exec_sandbox._backend_argv(
+            SandboxBackend.LANDLOCK, ("true",), claim, ("unshare", "--")
+        )
+        allowed = exec_sandbox._backend_argv(SandboxBackend.LANDLOCK, ("true",), claim, None)
+
+        assert "--require-loopback-only" in offline and "--loopback-up" not in offline
+        assert "--require-loopback-only" in namespaced and "--loopback-up" in namespaced
+        assert "--require-loopback-only" not in allowed
+
+    def test_helper_refuses_a_namespace_with_other_interfaces(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import socket as socket_module
+
+        monkeypatch.setenv(_confine_exec.COMMAND_ENV_VARIABLE, "{}")
+        monkeypatch.setattr(socket_module, "if_nameindex", lambda: [(1, "lo"), (2, "eth0")])
+        status = os.stat(tmp_path)
+        root = ["--root", str(tmp_path), str(status.st_dev), str(status.st_ino)]
+
+        result = _confine_exec.main(["--require-loopback-only", *root, "--", "true"])
+
+        assert result == _confine_exec.EXIT_SANDBOX_FAILED
 
 
 class TestOffSwitch:

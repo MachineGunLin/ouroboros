@@ -2,7 +2,8 @@
 
 Run as a standalone script, never imported into the controller:
 
-    python -I -S -B _confine_exec.py [--loopback-up] [--landlock] --root DIR DEV INO ... -- ARGV...
+    python -I -S -B _confine_exec.py [--loopback-up] [--require-loopback-only] [--landlock]
+        --root DIR DEV INO ... -- ARGV...
 
 It is the last step of every ``ouroboros.runtime.exec_sandbox`` backend. It is
 started with a fixed bootstrap environment, so nothing the command's own
@@ -448,11 +449,30 @@ def bring_loopback_up() -> None:
         fcntl.ioctl(sock, _SIOCSIFFLAGS, struct.pack("16sH14s", b"lo", current | _IFF_UP, b""))
 
 
+def require_loopback_only() -> None:
+    """Refuse unless this process's network namespace has only ``lo``.
+
+    Checked at activation, in the process that execs the command, so a
+    decision made earlier in the controller cannot go stale.
+    """
+    import socket
+
+    try:
+        names = [name for _index, name in socket.if_nameindex()]
+    except OSError as exc:
+        raise SandboxError(f"network interfaces cannot be listed: {exc}") from None
+    if not names or any(name != "lo" for name in names):
+        raise SandboxError(f"network is not isolated: interfaces {sorted(names)}")
+
+
 def _parse(
     arguments: list[str],
-) -> tuple[bool, bool, list[tuple[str, int, int]], list[str]]:
+) -> tuple[bool, bool, bool, list[tuple[str, int, int]], list[str]]:
     loopback = bool(arguments) and arguments[0] == "--loopback-up"
     if loopback:
+        arguments = arguments[1:]
+    offline = bool(arguments) and arguments[0] == "--require-loopback-only"
+    if offline:
         arguments = arguments[1:]
     landlock = bool(arguments) and arguments[0] == "--landlock"
     index = 1 if landlock else 0
@@ -467,10 +487,13 @@ def _parse(
         roots.append((arguments[index + 1], device, inode))
         index += 4
     if index >= len(arguments) or arguments[index] != "--" or index + 1 >= len(arguments):
-        raise SandboxError("usage: [--loopback-up] [--landlock] --root DIR DEV INO ... -- ARGV...")
+        raise SandboxError(
+            "usage: [--loopback-up] [--require-loopback-only] [--landlock] "
+            "--root DIR DEV INO ... -- ARGV..."
+        )
     if not roots:
         raise SandboxError("at least one --root is required")
-    return loopback, landlock, roots, arguments[index + 1 :]
+    return loopback, offline, landlock, roots, arguments[index + 1 :]
 
 
 def _command_environment() -> dict[str, str]:
@@ -490,12 +513,14 @@ def _command_environment() -> dict[str, str]:
 
 def main(arguments: list[str]) -> int:
     try:
-        loopback, landlock, roots, command = _parse(arguments)
+        loopback, offline, landlock, roots, command = _parse(arguments)
         env = _command_environment()
         root_fds = open_verified_roots(roots)
         try:
             if loopback:
                 bring_loopback_up()
+            if offline:
+                require_loopback_only()
             if landlock:
                 restrict_writes(root_fds)
                 deny_metadata_changes()
