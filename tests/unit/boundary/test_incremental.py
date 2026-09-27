@@ -112,6 +112,9 @@ async def test_one_call_per_criterion_each_persisted_as_produced(tmp_path: Path)
     ]
     stored = json.loads((partial / "criterion-001.json").read_text())
     assert stored["status"] == "ok" and stored["reply"]["oracles"][0]["check_id"] == "c1_oracle"
+    # S3: cases are stored as ids only (held-out values never reach disk).
+    assert stored["reply"]["oracles"][0]["cases"]
+    assert all(set(case) == {"case_id"} for case in stored["reply"]["oracles"][0]["cases"])
     assert [spec.check_id for spec in outcome.package.oracles] == ["c1_oracle", "c2_oracle"]
     keys = seed_criterion_keys(_seed())
     assert {item.criterion_key: item.reason for item in outcome.package.uncovered} == {

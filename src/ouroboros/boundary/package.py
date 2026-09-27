@@ -25,6 +25,7 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -44,6 +45,7 @@ from ouroboros.boundary.oracle import (
 from ouroboros.core.seed import AcceptanceCriterionSpec, Seed, derive_semantic_ac_key
 
 CHECK_PACKAGE_SCHEMA = "ouroboros.check_package.v1"
+PACKAGE_RECORD_SCHEMA = "ouroboros.check_package_record.v1"
 ORACLE_PACKAGE_SCHEMA = "ouroboros.check_package.v2"
 # Fields added with the oracle split. They are left out of the canonical
 # bytes while empty, so a package without oracles keeps its v1 bytes and
@@ -489,6 +491,78 @@ def write_check_package(package: CheckPackage, directory: Path) -> Path:
         return target
     with open(target, "xb") as handle:
         handle.write(data)
+    return target
+
+
+def _held_out_digest(key: bytes, check_id: str, case: dict[str, Any]) -> str:
+    message = canonical_json_bytes({"check_id": check_id, "case": case})
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def package_record(package: CheckPackage, key: bytes) -> dict[str, Any]:
+    """The package as the product stores it: no held-out input or expected value.
+
+    Held-out cases are reduced to their case id and an HMAC-SHA256 of the
+    case under ``key``, a per-run secret kept in memory only (a plain hash of
+    a small expected value could be reversed by enumeration). The oracle data
+    file is stored in the same reduced form, without its full-content digest.
+    Everything else is the canonical package. ``package_sha256`` names the
+    full package (as recorded in the journal); the record itself cannot be
+    loaded back as a package.
+    """
+    data = package.canonical_dict()
+    held_out: list[dict[str, str]] = []
+    oracles = []
+    for spec in data.get("oracles") or ():
+        cases = []
+        for case in spec["cases"]:
+            if case.get("held_out"):
+                digest = _held_out_digest(key, spec["check_id"], case)
+                held_out.append(
+                    {
+                        "check_id": spec["check_id"],
+                        "case_id": case["case_id"],
+                        "hmac_sha256": digest,
+                    }
+                )
+                cases.append({"case_id": case["case_id"], "held_out": True, "hmac_sha256": digest})
+            else:
+                cases.append(case)
+        oracles.append({**spec, "cases": cases})
+    if oracles:
+        data["oracles"] = oracles
+        reduced = json.dumps(
+            {**json.loads(oracle_data_text(package.oracles)), "oracles": oracles},
+            sort_keys=True,
+            indent=1,
+            ensure_ascii=False,
+        )
+        data["files"] = [
+            {"path": item["path"], "content": reduced, "held_out_redacted": True}
+            if item["path"] == ORACLE_DATA_PATH
+            else item
+            for item in data["files"]
+        ]
+    return {
+        "schema_version": PACKAGE_RECORD_SCHEMA,
+        "package_sha256": package.sha256,
+        "held_out": held_out,
+        "package": data,
+    }
+
+
+def write_package_record(package: CheckPackage, directory: Path, key: bytes) -> Path:
+    """Write ``package_record`` to ``<directory>/<package sha256>.json`` (create-only).
+
+    The product's store uses this instead of ``write_check_package`` so that
+    held-out expected values never reach the disk. An existing record is kept.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{package.sha256}.json"
+    if target.exists():
+        return target
+    with open(target, "xb") as handle:
+        handle.write(canonical_json_bytes(package_record(package, key)))
     return target
 
 

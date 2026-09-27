@@ -25,10 +25,16 @@ verdict is indeterminate. The study policy allows exactly one attempt.
 
 The worker never receives the package: it runs from the unchanged Seed, whose
 worker prompt already omits ``verify_command`` and ``output_assertion``.
-Packages and full receipts are stored under ``<store_dir>/packages`` and
-``<store_dir>/receipts``, outside every checkout. The store directory is
-owner-only (0700), and a stored receipt keeps a held-out case's id and
-pass/fail only until the case is revealed (``oracle.redact_held_out``).
+Package records and receipts are stored under ``<store_dir>/packages`` and
+``<store_dir>/receipts``, outside every checkout. Held-out inputs and
+expected values are never written to disk: they stay in this process's
+memory for the run. The package record keeps a held-out case's id and a
+keyed hash only (``package.package_record``; the key is per run and in
+memory), constructor partial replies keep case ids only, and a stored
+receipt keeps a held-out case's id and pass/fail only until the case is
+revealed (``oracle.redact_held_out``). The store directory is owner-only
+(0700). A run that resumes in another process cannot recover the held-out
+cases, so the package is not applied on resume.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from enum import StrEnum
 import json
 import os
 from pathlib import Path
+import secrets
 from typing import TYPE_CHECKING, Any
 
 from ouroboros.boundary.acceptance import (
@@ -80,7 +87,7 @@ from ouroboros.boundary.package import (
     CheckPackage,
     seed_criterion_keys,
     seed_digest,
-    write_check_package,
+    write_package_record,
 )
 from ouroboros.boundary.rollout import (
     CheckPackageAssignment,
@@ -171,10 +178,11 @@ def default_store_dir(execution_id: str) -> Path:
 def private_store_dir(store: Path) -> Path:
     """Create ``store`` owner-only (0700); the ``boundary`` parent too when it is one.
 
-    The store holds the package (every held-out case with its expected value),
-    the constructor's partial replies, and the base snapshot. The mode keeps
-    other users out; code running as the same user can still read it (there is
-    no OS sandbox), which is why receipts never carry held-out values.
+    The store holds the package record, the constructor's partial replies,
+    receipts, and the base snapshot, none of which carries a held-out input or
+    expected value. The mode keeps other users out; code running as the same
+    user can still read it (there is no OS sandbox), which is why nothing in
+    it may carry held-out values.
     """
     store.mkdir(parents=True, exist_ok=True)
     targets = [store]
@@ -310,6 +318,8 @@ async def prepare_check_package(
     # Model-written checks run with a scrubbed environment and the project's
     # interpreter when one exists (boundary/check_env.py).
     interpreter = resolve_check_interpreter(base)
+    # Keys the held-out case hashes of the stored package record; never stored.
+    record_key = secrets.token_bytes(32)
 
     for attempt in range(1, settings.attempts + 1):
         boundary_id = f"{execution_id}/check_package/v{attempt}"
@@ -329,7 +339,7 @@ async def prepare_check_package(
             )
             feedback = [failure_reason]
         else:
-            package_path = write_check_package(package, store / "packages")
+            package_path = write_package_record(package, store / "packages", record_key)
             await ledger.record_package_frozen(boundary_id, package, seed=seed)
             admission = await admit_check_package(
                 package,

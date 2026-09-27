@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -890,3 +891,102 @@ async def test_a_hostile_frame_is_a_package_fail_not_a_legacy_fallback(
     assert authority.outcome.verdict is not None
     assert authority.outcome.verdict.verdict == "fail"
     assert not decided.all_succeeded
+
+
+async def test_held_out_values_never_reach_the_boundary_store(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # S3: after a run (admission, a gate repair, the final verification), no
+    # file under the boundary store and no boundary event holds a held-out
+    # input or expected value. The values are distinctive so a hit is real.
+    import copy
+
+    from ouroboros.boundary.events import BOUNDARY_AGGREGATE_TYPE
+
+    reply = copy.deepcopy(REPLY)
+    reply["oracles"][0]["cases"][1] = {
+        "case_id": "held",
+        "args": {"value": 6173, "low": 1, "high": 4409},
+        "expect": {"kind": "returns", "value": 4409},
+    }
+    reply["oracles"][1]["cases"][1] = {
+        "case_id": "held",
+        "args": {"a": 3079, "b": 3083, "t": 0.5},
+        "expect": {"kind": "returns", "value": 3081, "approx": 1e-9},
+    }
+    secrets = (b"6173", b"4409", b"3079", b"3083", b"3081")
+    seed = _seed()
+    constructor = _Constructor(seed, repo)
+    constructor.outcome = ConstructionOutcome(
+        package_from_reply(
+            reply, seed, input_digest="1" * 64, generator="fake", base_checkout=repo
+        ),
+        None,
+        "1" * 64,
+        "fake",
+    )
+    settings = CheckPackageSettings(enabled=True)
+    state = await prepare_check_package(
+        seed,
+        event_store=store,
+        constructor=constructor,
+        execution_id="exec_oracle",
+        base_checkout=repo,
+        worker_workspace=repo,
+        runtime_label="codex",
+        settings=settings,
+        store_dir=tmp_path / "store",
+    )
+    assert state.package is not None
+    assert [case.held_out for spec in state.package.oracles for case in spec.cases] == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    authority = CheckPackageAuthority(state, settings, event_store=store, candidate_checkout=repo)
+    authority.install(_executor(repo))
+    (repo / "mathutils.py").write_text(BUGGY + BAD_MIX)
+    ok = ACExecutionResult(
+        ac_index=0, ac_content="c0", success=True, outcome=ACExecutionOutcome.SUCCEEDED
+    )
+    gated = await authority.gate(seed=seed, ac_index=0, result=ok)
+    assert gated.check_package_repair
+    parallel = ParallelExecutionResult(
+        results=(
+            ok,
+            ACExecutionResult(
+                ac_index=1,
+                ac_content="c1",
+                success=True,
+                typed_evidence=EvidenceRecord(data={"entry_points": [MIX_ENTRY]}),
+            ),
+            ACExecutionResult(ac_index=2, ac_content="c2", success=True),
+        ),
+        success_count=3,
+        failure_count=0,
+    )
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert not decided.all_succeeded
+
+    stored = [path for path in (tmp_path / "store").rglob("*") if path.is_file()]
+    assert any(path.parent.name == "packages" for path in stored)
+    assert any(path.parent.name == "receipts" for path in stored)
+    hits = [
+        (str(path), token.decode())
+        for path in stored
+        for token in secrets
+        if token in path.read_bytes()
+    ]
+    assert hits == []
+    events = await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
+    journal = json.dumps([event.data for event in events]).encode()
+    assert [token for token in secrets if token in journal] == []
+    # The record names the full package and keeps held-out cases as ids.
+    (record_path,) = (tmp_path / "store" / "packages").iterdir()
+    record = json.loads(record_path.read_text())
+    assert record["package_sha256"] == state.package.sha256
+    assert [(item["check_id"], item["case_id"]) for item in record["held_out"]] == [
+        ("oracle_1", "held"),
+        ("oracle_2", "held"),
+    ]

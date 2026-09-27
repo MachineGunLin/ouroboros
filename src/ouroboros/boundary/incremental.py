@@ -105,8 +105,32 @@ def merge_pieces(pieces: Sequence[CriterionPiece]) -> tuple[dict[str, Any], dict
     return merged, missing
 
 
+def _without_case_values(reply: Mapping[str, Any] | None) -> Any:
+    """``reply`` with every oracle case reduced to its id (held-out values never reach disk)."""
+    if not isinstance(reply, Mapping) or not isinstance(reply.get("oracles"), list):
+        return reply
+    oracles = [
+        {
+            **item,
+            "cases": [
+                {"case_id": case.get("case_id") if isinstance(case, Mapping) else None}
+                for case in item.get("cases") or ()
+            ],
+        }
+        if isinstance(item, Mapping)
+        else item
+        for item in reply["oracles"]
+    ]
+    return {**reply, "oracles": oracles}
+
+
 def persist_piece(partial_dir: Path | None, piece: CriterionPiece) -> None:
-    """Write one criterion's parsed reply as soon as it exists."""
+    """Write one criterion's parsed reply, without case values, as soon as it exists.
+
+    Which cases are held out is decided later against the Seed text, so every
+    oracle case is stored as its id only; the package record keeps the
+    visible cases in full.
+    """
     if partial_dir is None:
         return
     partial_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +141,7 @@ def persist_piece(partial_dir: Path | None, piece: CriterionPiece) -> None:
         "reply_sha256": piece.reply_sha256,
         "input_digest": piece.input_digest,
         "generator": piece.generator,
-        "reply": piece.reply,
+        "reply": _without_case_values(piece.reply),
     }
     target = partial_dir / f"criterion-{piece.criterion:03d}.json"
     target.write_text(json.dumps(body, sort_keys=True, indent=1), encoding="utf-8")
