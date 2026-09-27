@@ -413,7 +413,12 @@ the acceptance criteria; the package is admitted only if every check behaves
 as declared on the current tree. After the worker stops, the package decides
 the criteria it covers, before the session's terminal status is recorded; the
 existing verifier's verdict is kept as advisory for those criteria and decides
-the others.
+the others. Edits the worker makes to test configuration inside the workspace
+(for example `pytest.ini`, `conftest.py`, or Django's `tests/test_sqlite.py`)
+can make the existing verifier accept; the check package's oracle checks are
+unaffected, because they call the implementation through the product harness
+and do not read workspace test configuration (a model-written script check
+that runs the project's test runner would read it).
 
 ```yaml
 boundary:
