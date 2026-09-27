@@ -553,3 +553,31 @@ async def test_resumed_telemetry_of_an_undecided_run_is_indeterminate(
         "indeterminate",
         "package_rejected_over_legacy_accept",
     )
+
+
+# R4-A3: an unreadable journal refuses the resume instead of handing it to legacy.
+
+
+class _UnreadableJournal:
+    async def replay(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("database is locked")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_an_unreadable_journal_refuses_the_resume(repo: Path, enabled: bool) -> None:
+    from ouroboros.boundary.ledger import BoundaryOrderError
+
+    run = CheckPackageRun(CheckPackageSettings(enabled=enabled))
+    runner = SimpleNamespace(acceptance_authority=None)
+    with pytest.raises(BoundaryOrderError, match="could not be read on resume"):
+        await run.prepare(
+            runner,
+            _seed(),
+            event_store=_UnreadableJournal(),
+            execution_id="exec_x",
+            worker_dir=repo,
+            runtime_backend="codex",
+            model=None,
+            resume=True,
+        )
+    assert runner.acceptance_authority is None and run.resumed is None

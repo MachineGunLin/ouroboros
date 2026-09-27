@@ -277,13 +277,23 @@ class CheckPackageRun:
     async def _prepare_resume(
         self, runner: Any, event_store: EventStore, execution_id: str, worker_dir: Path
     ) -> list[str]:
-        """Install the resumed authority when the original run was bound to a package."""
+        """Install the resumed authority when the original run was bound to a package.
+
+        Raises ``BoundaryOrderError`` when the journal cannot be read: whether
+        the package decides the covered criteria is then unknown, and letting
+        the legacy verifier decide them could skip the package (R4-A3). The
+        caller must not resume then.
+        """
         self.skipped_reason = "resume"
         try:
             boundary = await load_resumed_boundary(event_store, execution_id)
-        except Exception as exc:  # noqa: BLE001 - reading the journal must not fail the run
+        except Exception as exc:  # noqa: BLE001 - any read failure refuses the resume
             log.warning("boundary.run_control.resume_unreadable", error_type=type(exc).__name__)
-            return [f"Check package state could not be read on resume ({type(exc).__name__})."]
+            raise BoundaryOrderError(
+                "check package state could not be read on resume "
+                f"({type(exc).__name__}); retry the resume",
+                details={"execution_id": execution_id},
+            ) from exc
         if boundary is None:
             if not self.enabled:
                 return []
@@ -332,7 +342,10 @@ class CheckPackageRun:
             log.info("boundary.run_control.prepared", execution_id=execution_id, line=line)
 
     async def prepare_resumed(self, execution_id: str) -> None:
-        """``prepare`` for a resumed run with the bound context; lines go to the log."""
+        """``prepare`` for a resumed run with the bound context; lines go to the log.
+
+        Raises ``BoundaryOrderError`` when the journal cannot be read.
+        """
         binding = self._binding
         lines = await self._prepare_resume(
             binding["runner"], binding["event_store"], execution_id, binding["worker_dir"]
