@@ -213,6 +213,49 @@ class TestRealBackend:
         assert result.returncode == _confine_exec.EXIT_SANDBOX_FAILED, result.stderr
         assert victim.read_text(encoding="utf-8") == "KEEP"
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_hard_link_in_an_unreadable_subtree_runs_nothing(
+        self, layout: dict[str, Path]
+    ) -> None:
+        _require_backend()
+        copy = layout["copy"].resolve()
+        victim = layout["outside"].resolve() / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        hidden = copy / "hidden"
+        hidden.mkdir()
+        os.link(victim, hidden / "alias.txt")
+        hidden.chmod(0o300)
+        try:
+            refused = confine(
+                ("true",),
+                cwd=str(copy),
+                writable_roots=(str(copy),),
+                temp_dir=str(layout["temp"]),
+                deny_network=False,
+            )
+            hidden.chmod(0o700)
+            (hidden / "alias.txt").unlink()
+            command = confine(
+                _python("open('hidden/alias.txt', 'w').write('ESCAPED')"),
+                cwd=str(copy),
+                writable_roots=(str(copy),),
+                temp_dir=str(layout["temp"]),
+                deny_network=False,
+            )
+            assert isinstance(command, ConfinedCommand)
+            # The link and the unreadable directory appear after confine().
+            os.link(victim, hidden / "alias.txt")
+            hidden.chmod(0o300)
+
+            result = _run(command)
+        finally:
+            hidden.chmod(0o700)
+
+        assert isinstance(refused, SandboxUnavailable)
+        assert refused.reason is SandboxUnavailableReason.ALIASED_WRITABLE_ROOT
+        assert result.returncode == _confine_exec.EXIT_SANDBOX_FAILED, result.stderr
+        assert victim.read_text(encoding="utf-8") == "KEEP"
+
     def test_writable_root_with_quote_and_backslash_in_its_name(self, tmp_path: Path) -> None:
         _require_backend()
         root = tmp_path / 'we"ird\\dir'

@@ -213,19 +213,29 @@ def open_verified_roots(roots: list[tuple[str, int, int]]) -> list[int]:
 def refuse_hard_linked_files(root_fds: list[int]) -> None:
     """Refuse to run when any regular file beneath a verified root has another link.
 
+    The walk must be complete: a directory that cannot be listed or an entry
+    that cannot be examined refuses too, since it may hold such a link.
+
     The other link may be outside the roots, and writing through the root
     would change that file. Walked from the verified descriptors, without
     following symlinks, after the restriction is in place and immediately
     before exec, so a link added after ``confine`` is seen; the confined
     command itself cannot add one (linking an outside file in is denied).
     """
+
+    def unreadable(error: OSError) -> None:
+        raise SandboxError(
+            f"a writable root cannot be fully inspected for hard links: {error}"
+        ) from None
+
     for fd in root_fds:
-        for dirpath, _dirnames, filenames, dirfd in os.fwalk(".", dir_fd=fd, follow_symlinks=False):
+        walk = os.fwalk(".", dir_fd=fd, follow_symlinks=False, onerror=unreadable)
+        for dirpath, _dirnames, filenames, dirfd in walk:
             for name in filenames:
                 try:
                     status = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-                except OSError:
-                    continue
+                except OSError as exc:
+                    unreadable(exc)
                 if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
                     raise SandboxError(
                         f"{os.path.join(dirpath, name)} in a writable root has "

@@ -187,7 +187,8 @@ class SandboxUnavailableReason(StrEnum):
     """A writable root or the temp directory is not an existing directory."""
     ALIASED_WRITABLE_ROOT = "aliased_writable_root"
     """A regular file under a writable root has another hard link, which may be
-    outside the roots: writing it through the root would change that file too."""
+    outside the roots (writing it through the root would change that file
+    too), or part of the root cannot be inspected to rule that out."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,18 +250,25 @@ def _claim_root(path: str) -> _RootClaim:
 def _hard_linked_file(root: str) -> str | None:
     """A regular file beneath ``root`` with more than one link, or None.
 
-    Symlinks and linked directories are not followed.
+    Symlinks and linked directories are not followed. A directory that cannot
+    be listed or an entry that cannot be examined is returned as well: it may
+    hold such a link, so the root cannot be shown to be free of aliases.
     """
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+    failures: list[str] = []
+
+    def unreadable(error: OSError) -> None:
+        failures.append(f"{error.filename}: {error.strerror}")
+
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False, onerror=unreadable):
         for name in filenames:
             path = os.path.join(dirpath, name)
             try:
                 status = os.lstat(path)
-            except OSError:
-                continue
+            except OSError as exc:
+                return f"{path}: {exc.strerror}"
             if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
                 return path
-    return None
+    return failures[0] if failures else None
 
 
 def _backend_argv(
