@@ -175,7 +175,12 @@ command text a second way. The rules:
   on a read-only descriptor, chown, utime, and where the host supports them
   xattrs, file flags and inode-flag ioctls): every class the probe can
   perform unconfined must be denied outside the root when confined, with the
-  outside left unchanged, or the backend is reported unavailable. Where no backend works
+  outside left unchanged, or the backend is reported unavailable. Reading
+  stays allowed, so the access time the kernel records for a permitted read
+  can change (under `sandbox-exec` too); only a `noatime` mount stops that.
+  The replayed command gets `/dev/null` as stdin, never the controller's
+  own (under an MCP host, its JSON-RPC stream); the process runner does
+  this for verify commands as well. Where no backend works
   (Windows, a kernel without Landlock ABI 3, an already-sandboxed macOS
   process),
   nothing is replayed, the claims keep the transcript-only rules, and the

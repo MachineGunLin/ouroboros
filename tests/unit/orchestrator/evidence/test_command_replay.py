@@ -933,6 +933,29 @@ class TestIsolationRecord:
         assert len(sealed_off) == 1 and not sealed_off[0].network_isolated
         assert not marker.exists()
 
+    async def test_replay_cannot_write_through_inherited_stdin(self, tmp_path: Path) -> None:
+        """The controller's fd 0 (an MCP host's JSON-RPC stream) never reaches a replay."""
+        workspace = _workspace(tmp_path / "ws")
+        outside = tmp_path / "controller_stdin.txt"
+        outside.write_text("keep", encoding="utf-8")
+        _executable(workspace / "run_tests.sh", "#!/bin/sh\necho escaped >&0\nexit 0\n")
+        candidate = replay_candidate("./run_tests.sh", str(workspace))
+        assert candidate is not None
+        saved = os.dup(0)
+        stdin = os.open(outside, os.O_RDWR)
+        try:
+            os.dup2(stdin, 0)
+            runs = await replay_commands(
+                (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
+            )
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            os.close(stdin)
+
+        assert len(runs) == 1
+        assert outside.read_text(encoding="utf-8") == "keep"
+
     async def test_skip_is_recorded_and_claims_keep_transcript_rules(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_replay_isolation: None
     ) -> None:

@@ -451,6 +451,15 @@ class TestEnvironment:
             "X": "1",
         }
 
+    def test_empty_passthrough_values_are_preserved(self) -> None:
+        source = {"PATH": "", "HOME": "", "LANG": ""}
+
+        env = build_environment(
+            "/scratch/tmp", source=source, passthrough=(*DEFAULT_ENV_PASSTHROUGH, "HOME")
+        )
+
+        assert env["PATH"] == "" and env["HOME"] == "" and env["LANG"] == ""
+
     def test_home_is_kept_only_when_passed_through(self) -> None:
         source = {"PATH": "/bin", "HOME": "/home/u"}
 

@@ -21,7 +21,11 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   workspace, the user's home directory and the system temp directory, is
   read-only. Reading and executing are not restricted.
   "Read-only" covers content, names (create, remove, rename, link) and
-  metadata (mode, ownership, timestamps, extended attributes, inode flags).
+  metadata the process sets (mode, ownership, timestamps, extended
+  attributes, inode flags). The access time the kernel records when a
+  permitted read happens is part of read access, not a write the process
+  performs: it changes under ``sandbox-exec`` with every write denied as
+  well, and only a mount option (``noatime``) can stop it.
 - **Network** (``deny_network=True``, reported as ``network_denied``):
   non-loopback IP traffic is denied. Loopback (``localhost``) and Unix-domain
   sockets stay available for local IPC.
@@ -193,6 +197,12 @@ class SandboxUnavailable:
 @dataclass(frozen=True, slots=True)
 class ConfinedCommand:
     """What to spawn: ``argv`` in ``cwd`` with exactly ``env``.
+
+    Spawn contract: the sandbox governs what the command opens, not what it
+    inherits. Spawn it with ``stdin`` set to ``DEVNULL`` or a pipe the caller
+    owns, ``stdout``/``stderr`` to pipes, and no other descriptors (the
+    default ``close_fds``); never hand it the controller's own stdin or a
+    descriptor for a file outside the writable roots.
 
     ``env`` is the launchers' fixed bootstrap environment, which carries
     ``command_env``; the command itself runs with exactly ``command_env``.
@@ -430,7 +440,7 @@ def build_environment(
 ) -> dict[str, str]:
     """The complete environment of a confined command (see the module docstring)."""
     values = os.environ if source is None else source
-    env = {name: values[name] for name in passthrough if values.get(name)}
+    env = {name: values[name] for name in passthrough if name in values}
     for name in TEMP_DIRECTORY_VARIABLES:
         env[name] = temp_dir
     env.setdefault("HOME", temp_dir)
