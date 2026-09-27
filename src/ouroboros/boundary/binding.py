@@ -42,6 +42,7 @@ from enum import StrEnum
 import hashlib
 from pathlib import Path, PurePosixPath
 import re
+import sys
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -369,23 +370,22 @@ def _locate_python(
     return None
 
 
-_WORD = re.compile(rf"{_IDENT}")
-
-
 def symbol_named_in_text(symbol: str, text: str) -> bool:
-    """Whether the symbol's final name appears as a whole word in ``text``."""
-    if symbol.startswith("-m "):
-        name = symbol[3:].rsplit(".", 1)[-1]
-    elif "/" in symbol or symbol.endswith(".py"):
-        name = PurePosixPath(symbol).name
-        return name in text
-    else:
-        name = symbol.rsplit(".", 1)[-1]
-    return name in set(_WORD.findall(text))
+    """Whether the full qualified symbol appears in ``text``.
+
+    A Python symbol must appear with its module (``mathutils.interpolate``),
+    a ``-m`` target with its full dotted module, and a script with its full
+    checkout-relative path. The bare final name does not count: a criterion
+    that says ``interpolate(a, b, t)`` does not name where it lives, so a
+    default binding guessed from that name is not pre-bound (tier A).
+    """
+    name = symbol[3:] if symbol.startswith("-m ") else symbol
+    pattern = rf"(?<![\w./-]){re.escape(name)}(?![\w/-]|\.\w)"
+    return re.search(pattern, text) is not None
 
 
 def default_binding_resolves(binding: Binding, base: Path, criterion_text: str) -> bool:
-    """Tier A rule: the default symbol exists at the base or the criterion names it."""
+    """Tier A rule: the default symbol exists at the base or the criterion names it in full."""
     return locate_symbol(base, binding.symbol, binding.call_kind) is not None or (
         symbol_named_in_text(binding.symbol, criterion_text)
     )
@@ -440,7 +440,8 @@ def validate_declared_binding_static(
 ) -> BindingValidation:
     """Grammar plus the static rules for a worker-declared binding.
 
-    Valid when: the grammar holds; the symbol exists in the artifact; its
+    Valid when: the grammar holds; the symbol's top-level module is not a
+    standard-library module; the symbol exists in the artifact; its
     defining file is not under ``check_dir``; and it exists at the base or the
     artifact introduced or changed it (new or changed defining file, or a
     changed definition). The base run through the binding is separate
@@ -460,6 +461,13 @@ def validate_declared_binding_static(
         return invalid(exc.reason)
     if call_kind is CallKind.CLI and _is_under(binding.symbol, check_dir):
         return invalid("binding_in_check_dir", binding=binding)
+    module = binding.symbol[3:] if binding.symbol.startswith("-m ") else binding.symbol
+    if (call_kind is not CallKind.CLI or binding.symbol.startswith("-m ")) and (
+        module.split(".", 1)[0] in sys.stdlib_module_names
+    ):
+        # A workspace file named like a standard-library module satisfies the
+        # static lookup, but the harness has already imported the real one.
+        return invalid("stdlib_symbol", binding=binding)
     location = locate_symbol(artifact, binding.symbol, binding.call_kind)
     if location is None:
         return invalid("symbol_not_found", binding=binding)
@@ -581,8 +589,6 @@ def script_check_tier(source: str, *, base: Path, criterion_text: str) -> tuple[
     (``no_binding``: the script names a target the criterion does not fix, so
     a correct artifact that chose another name would fail it).
     """
-    import sys
-
     try:
         tree = ast.parse(source)
     except SyntaxError:

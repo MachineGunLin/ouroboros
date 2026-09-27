@@ -126,9 +126,18 @@ def test_locate_symbol_statically(tmp_path: Path) -> None:
 
 
 def test_symbol_named_in_text() -> None:
-    assert symbol_named_in_text("mathutils.lerp", "add lerp(a, b, t) to mathutils")
+    # A2: the full qualified symbol, never the bare final name.
+    assert symbol_named_in_text("mathutils.lerp", "add mathutils.lerp(a, b, t)")
+    assert symbol_named_in_text("mathutils.lerp", "add `mathutils.lerp`.")
+    assert not symbol_named_in_text("mathutils.lerp", "add lerp(a, b, t) to mathutils")
+    assert not symbol_named_in_text("mathutils.lerp", "add pkg.mathutils.lerp")
+    assert not symbol_named_in_text("mathutils.lerp", "add mathutils.lerp_v2")
     assert not symbol_named_in_text("mathutils.lerp", "add linear interpolation")
     assert not symbol_named_in_text("m.clamp", "clamped values")
+    assert symbol_named_in_text("bin/pick.py", "run bin/pick.py 3 8")
+    assert not symbol_named_in_text("bin/pick.py", "run pick.py 3 8")
+    assert symbol_named_in_text("-m tools.pick", "python -m tools.pick 3 8")
+    assert not symbol_named_in_text("-m tools.pick", "python -m pick 3 8")
 
 
 def test_default_binding_resolves_at_base_or_by_name(tmp_path: Path) -> None:
@@ -137,7 +146,8 @@ def test_default_binding_resolves_at_base_or_by_name(tmp_path: Path) -> None:
     named = _parse({"symbol": "mathutils.lerp"})
     open_name = _parse({"symbol": "mathutils.interpolate"})
     assert default_binding_resolves(existing, base, "fix the bound")
-    assert default_binding_resolves(named, base, "add lerp(a, b, t)")
+    assert default_binding_resolves(named, base, "add mathutils.lerp(a, b, t)")
+    assert not default_binding_resolves(named, base, "add lerp(a, b, t)")
     assert not default_binding_resolves(open_name, base, "add linear interpolation")
 
 
@@ -196,6 +206,21 @@ def test_declared_binding_existing_at_base_is_statically_valid(pair: tuple[Path,
     # (admission.admit_binding) is what refuses it when it already passes.
     result = _validate({"symbol": "other.keep"}, artifact, base)
     assert result.valid and result.exists_at_base and not result.changed_by_artifact
+
+
+def test_declared_binding_to_a_standard_library_name_is_refused(tmp_path: Path) -> None:
+    # S6: a workspace json.py satisfies the static lookup, but the harness
+    # has already imported the real json module.
+    base = _repo(tmp_path / "base", {"mathutils.py": "def clamp(v, lo, hi):\n    return v\n"})
+    artifact = _repo(
+        tmp_path / "artifact",
+        {
+            "mathutils.py": "def clamp(v, lo, hi):\n    return v\n",
+            "json.py": "def loads(v, lo, hi):\n    return v\n",
+        },
+    )
+    result = _validate({"symbol": "json.loads"}, artifact, base)
+    assert not result.valid and result.reason == "binding_invalid:stdlib_symbol"
 
 
 def test_declared_binding_under_the_check_dir_is_refused(pair: tuple[Path, Path]) -> None:
@@ -302,7 +327,11 @@ def test_script_check_tier_follows_its_imports(tmp_path: Path) -> None:
     named = "from mathutils import lerp\n"
     unnamed = "from mathutils import interpolate\n"
     assert script_check_tier(existing, base=base, criterion_text="fix clamp")[0] is CheckTier.A
-    assert script_check_tier(named, base=base, criterion_text="add lerp(a, b, t)")[0] is CheckTier.A
+    assert (
+        script_check_tier(named, base=base, criterion_text="add mathutils.lerp(a, b, t)")[0]
+        is CheckTier.A
+    )
+    assert script_check_tier(named, base=base, criterion_text="add lerp(a, b, t)")[0] is CheckTier.U
     tier, reason = script_check_tier(unnamed, base=base, criterion_text="add linear interpolation")
     assert tier is CheckTier.U and reason == "no_binding:mathutils.interpolate"
 
