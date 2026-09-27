@@ -361,8 +361,12 @@ def _classify(
     signature_seen: bool,
     on_base: bool,
     oracle_undecided: bool = False,
+    oracle_failed: bool = False,
 ) -> tuple[CheckStatus, str]:
-    if mutated:
+    if mutated and not oracle_failed:
+        # A candidate whose own code changed its checkout during the check
+        # cannot turn an observed failing case into "undecided": a failure
+        # wins; a pass under mutation is not trusted.
         return CheckStatus.INDETERMINATE, "protected_bytes_mutated"
     if completed.launch_error is not None:
         return CheckStatus.INDETERMINATE, "launch_failed"
@@ -422,8 +426,8 @@ async def _execute_check(
     if not cwd.is_dir():
         completed = _Completed(None, b"", b"", False, f"cwd missing: {check.cwd}", 0.0)
     elif oracle is not None:
-        # Target processes in the project interpreter, then the comparator in
-        # the controller's own interpreter (boundary/oracle_run.py).
+        # Target processes in the project interpreter; the comparison runs in
+        # this process (boundary/oracle_run.py).
         oracle_run = await run_oracle_check(
             {item.path: item.content for item in package.files},
             oracle,
@@ -433,7 +437,6 @@ async def _execute_check(
             env=_command_env(env),
             interpreter=interpreter,
             binding=binding,
-            workspace_roots=(source.resolve(), copy_root.resolve()),
         )
         completed = _Completed(
             oracle_run.return_code,
@@ -445,17 +448,16 @@ async def _execute_check(
         )
     else:
         completed = await _run_argv(check.argv, cwd, timeout, env=env, interpreter=interpreter)
-    ctrl_mutated = oracle_run.ctrl_mutations if oracle_run is not None else ()
     after = tree_manifest(copy_root, unprotected_names=unprotected)
-    mutated_paths = (*changed_paths(protected, after), *ctrl_mutated)
+    mutated_paths = changed_paths(protected, after)
     new_paths = added_paths(protected, after)
     scratch = tuple(p for p in new_paths if any(_is_under(p, s) for s in package.scratch_paths))
     undeclared = tuple(p for p in new_paths if p not in scratch)
     combined = (completed.stdout + b"\n" + completed.stderr).decode("utf-8", errors="replace")
     signature = check.failure_signature
     if oracle_run is not None:
-        # Decided by the comparator's structured result, never by text the
-        # target could print.
+        # Decided by the in-process comparison's structured result, never by
+        # text the target could print.
         combined = oracle_run.output
         signature_seen = oracle_run.signature_seen
     else:
@@ -467,6 +469,7 @@ async def _execute_check(
         signature_seen=signature_seen,
         on_base=on_base,
         oracle_undecided=oracle_run is not None and oracle_run.return_code not in (0, 1),
+        oracle_failed=oracle_run is not None and not on_base and oracle_run.return_code == 1,
     )
     tail = combined if completed.launch_error is None else completed.launch_error
     return CheckExecution(

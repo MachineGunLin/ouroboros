@@ -350,11 +350,15 @@ async def test_a_forged_interpreter_cannot_forge_a_pass(base: Path, tmp_path: Pa
         "print('OUROBOROS_ORACLE_RESULT ' + json.dumps({'resolve': 'ok', 'cases': []}))\n",
     )
     lied = await verify_candidate(package, candidate, interpreter=str(liar))
-    assert lied.verdict is CandidateVerdict.INDETERMINATE
-    assert _oracle_result(lied.checks[0])["resolve"] == "setup_failed"
+    # The interpreter is candidate code: every case fails (no resolved frame).
+    assert lied.verdict is CandidateVerdict.FAIL
+    assert all(
+        c["detail"].endswith("observed crash (exit 0)")
+        for c in _oracle_result(lied.checks[0])["cases"]
+    )
     # (b) It speaks the frame protocol (it can read the nonce from its argv)
-    # and claims the stated answer for every call. The comparator, which runs
-    # in the controller's own interpreter, still sees the held-out cases fail.
+    # and claims the stated answer for every call. The comparison, which runs
+    # in the controller process, still sees the held-out cases fail.
     mimic = _forged_interpreter(
         tmp_path / "mimic/python3",
         "import json, os, sys\n"
@@ -391,8 +395,7 @@ async def test_a_workspace_sitecustomize_cannot_forge_a_pass(base: Path, tmp_pat
     python = candidate / ".venv/bin/python3"
     package = _package(_seed(), base)
     result = await verify_candidate(package, candidate, interpreter=str(python))
-    assert result.verdict is not CandidateVerdict.PASS
-    assert result.verdict is CandidateVerdict.INDETERMINATE
+    assert result.verdict is CandidateVerdict.FAIL
 
 
 async def test_a_target_crash_or_hang_on_a_case_is_a_failure_with_a_counterexample(
@@ -423,15 +426,26 @@ async def test_a_target_crash_or_hang_on_a_case_is_a_failure_with_a_counterexamp
     assert cases["held_2"]["detail"].endswith("expected 7, observed timeout")
 
 
-async def test_a_crash_before_the_target_is_resolved_is_indeterminate(
+async def test_a_crash_before_the_target_is_resolved_fails_a_candidate_not_a_base(
     base: Path, tmp_path: Path
 ) -> None:
+    # The candidate's own code crashed while it was imported: each case fails.
     package = _package(_seed(), base)
-    candidate = _repo(tmp_path / "cand", {"mathutils.py": "import os\nos._exit(4)\n" + FIXED})
+    crash = "import os\nos._exit(4)\n"
+    candidate = _repo(tmp_path / "cand", {"mathutils.py": crash + FIXED})
     result = await verify_candidate(package, candidate)
-    assert result.verdict is CandidateVerdict.INDETERMINATE
-    assert result.checks[0].reason == "failure_signature_absent"
-    assert _oracle_result(result.checks[0])["resolve"] == "setup_failed"
+    assert result.verdict is CandidateVerdict.FAIL
+    assert result.checks[0].reason == "reproduction_still_failing"
+    assert all(
+        c["detail"].endswith("observed crash (exit 4)")
+        for c in _oracle_result(result.checks[0])["cases"]
+    )
+    # On the base the same crash is never counted as the intended failure.
+    crashing_base = _repo(tmp_path / "crashing_base", {"mathutils.py": crash + BUGGY})
+    admission = await admit_check_package(package, crashing_base)
+    assert admission.verdict is PackageVerdict.INDETERMINATE
+    assert admission.checks[0].reason == "failure_signature_absent"
+    assert _oracle_result(admission.checks[0])["resolve"] == "setup_failed"
 
 
 async def test_receipts_keep_held_out_cases_as_ids_until_revealed(

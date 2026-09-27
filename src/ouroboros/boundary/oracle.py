@@ -12,17 +12,19 @@ outcome). The product turns that data into package files:
 Both files are covered by the package hash, so the failure signature, the
 cases, and the grammar are frozen before any worker starts. Neither file is
 written anywhere while a check runs: the controller (``boundary/oracle_run.py``)
-passes their content to the harness processes over stdin or argv.
+passes the harness source to each target process as an argument and keeps
+the oracle data in its own memory.
 
-Isolation: the harness has two roles, each in its own process. The target
-role runs in the project interpreter, one process per case, and receives the
-binding and one call's inputs, never an expected value; it returns what it
-observed as JSON framed by a per-process random nonce. The comparator role
-runs afterwards in the controller's own interpreter (``-I -S``, outside every
-checkout, no workspace import), holds the frozen expectations, and decides
-pass or fail. A workspace interpreter, ``sitecustomize``, or import-time
-monkeypatch can therefore change what the target returns, not the comparison.
-It never derives an expectation from the artifact.
+Isolation: the target role of the harness runs in the project interpreter,
+one process per case, and receives the binding and one call's inputs, never
+an expected value; it returns what it observed as JSON framed by a
+per-process random nonce. The comparison runs inside the controller process
+itself, with the harness's comparison functions compiled from this module's
+constant when the controller imports ``oracle_run`` (before any target runs),
+against frozen expectations held in memory. A workspace interpreter,
+``sitecustomize``, import-time monkeypatch, or an edit of the standard library
+on disk can therefore change what the target returns, not the comparison. It
+never derives an expectation from the artifact.
 
 Held-out cases: a case whose scalar literals (arguments and expected value)
 do not all appear in the Seed text a worker sees (goal, constraints, criterion
@@ -421,8 +423,7 @@ def repair_lines(result: Mapping[str, Any] | None, *, limit: int = 5) -> list[st
 
 ORACLE_HARNESS_SOURCE = r'''"""Ouroboros oracle harness (product code; the constructor writes data only).
 
-Two roles, each in its own process; the controller starts both and never
-runs them in the same process.
+One process role and one in-process role.
 
 target <nonce> <call_kind> <symbol>
     Runs in the project interpreter (-I -B) with the checkout copy under test
@@ -433,11 +434,13 @@ target <nonce> <call_kind> <symbol>
     the process's original stdout; everything the target code prints goes to
     stderr, which the controller discards.
 
-compare
-    Runs in the controller's own interpreter (-I -S), outside every checkout,
-    and never imports workspace code. It reads the frozen oracle data, the
-    binding, and the observations from stdin, decides every case, and writes
-    '<nonce> <result JSON>'.
+_compare(request)
+    Called inside the controller process (never a separate process), which
+    compiled this source before any target ran. It receives the frozen oracle
+    data, the binding, and the observations the controller parsed and
+    validated from the target frames, and decides every case. A case whose
+    observation cannot be judged (malformed, oversized, or out of range)
+    fails; it never makes the other cases undecided.
 """
 import json
 import math
@@ -647,11 +650,21 @@ def _render_call(symbol, args, kwargs):
     return symbol.rsplit(".", 1)[-1] + "(" + ", ".join(parts) + ")"
 
 
+ABNORMAL = ("crashed", "timeout", "malformed", "unresolved")
+MALFORMED = "malformed or oversized output"
+
+
 def _abnormal(entry, call_text, expected_text):
-    if entry["outcome"] == "timeout":
-        return call_text + ": expected " + expected_text + ", observed timeout"
-    return (call_text + ": expected " + expected_text + ", observed crash (exit "
-            + str(entry.get("exit")) + ")")
+    outcome = entry.get("outcome")
+    if outcome == "timeout":
+        seen = "timeout"
+    elif outcome == "crashed":
+        seen = "crash (exit " + str(entry.get("exit")) + ")"
+    elif outcome == "unresolved":
+        seen = "no target on this call (" + str(entry.get("detail") or "")[:200] + ")"
+    else:
+        seen = MALFORMED
+    return call_text + ": expected " + expected_text + ", observed " + seen
 
 
 def _judge_python(case, entry, call_text):
@@ -662,7 +675,7 @@ def _judge_python(case, entry, call_text):
         expected_text = _short(expect["value"])
     if entry is None:
         return False, call_text + ": no observation"
-    if entry["outcome"] in ("crashed", "timeout"):
+    if entry["outcome"] in ABNORMAL:
         return False, _abnormal(entry, call_text, expected_text)
     if expect["kind"] == "raises":
         if entry["outcome"] == "raised" and expect["exception"] in entry["exception"]:
@@ -682,7 +695,7 @@ def _judge_python(case, entry, call_text):
 def _judge_cli(case, entry):
     call_text = entry.get("call") or case["case_id"]
     expect = case["expect"]
-    if entry["outcome"] in ("crashed", "timeout"):
+    if entry["outcome"] in ABNORMAL:
         return False, _abnormal(entry, call_text, "a completed command")
     problems = []
     code = entry.get("exit_code")
@@ -708,20 +721,27 @@ def _compare(request):
     cases = []
     for case in spec["cases"]:
         entry = observed.get(case["case_id"])
-        if spec["call_kind"] == "cli":
-            call_text = (entry or {}).get("call") or case["case_id"]
-        else:
-            args, kwargs = _split_args(spec["params"], binding.get("arg_map") or {}, case["args"])
-            call_text = _render_call(binding["symbol"], args, kwargs)
-        if resolve == "missing":
-            passed, text = False, call_text + ": " + detail
-        elif resolve != "ok":
-            passed, text = False, ""
-        elif spec["call_kind"] == "cli":
-            passed, text = (False, call_text + ": no observation") if entry is None else _judge_cli(
-                case, entry)
-        else:
-            passed, text = _judge_python(case, entry, call_text)
+        call_text = case["case_id"]
+        try:
+            if spec["call_kind"] == "cli":
+                call_text = (entry or {}).get("call") or case["case_id"]
+            else:
+                args, kwargs = _split_args(
+                    spec["params"], binding.get("arg_map") or {}, case["args"])
+                call_text = _render_call(binding["symbol"], args, kwargs)
+            if resolve in ("missing", "import_error"):
+                passed, text = False, call_text + ": " + detail
+            elif resolve != "ok":
+                passed, text = False, ""
+            elif spec["call_kind"] == "cli":
+                passed, text = ((False, call_text + ": no observation") if entry is None
+                                else _judge_cli(case, entry))
+            else:
+                passed, text = _judge_python(case, entry, call_text)
+        except Exception:
+            # Overflow, recursion, or a shape the rules above do not expect:
+            # this case fails; the other cases are still decided.
+            passed, text = False, call_text + ": observed " + MALFORMED
         cases.append({"case_id": case["case_id"], "held_out": bool(case.get("held_out")),
                       "passed": passed, "detail": text})
     return {"check_id": check_id, "criterion_key": spec["criterion_key"],
@@ -733,13 +753,8 @@ def main():
     role = sys.argv[1] if len(sys.argv) > 1 else ""
     if role == "target":
         _target(sys.argv[2], sys.argv[3], sys.argv[4])
-    elif role == "compare":
-        request = json.loads(sys.stdin.read())
-        result = _compare(request)
-        sys.stdout.write(request["nonce"] + " " + json.dumps(result, sort_keys=True) + "\n")
-        sys.stdout.flush()
     else:
-        sys.stderr.write("usage: harness target <nonce> <kind> <symbol> | harness compare\n")
+        sys.stderr.write("usage: harness target <nonce> <kind> <symbol>\n")
         sys.exit(2)
 
 
