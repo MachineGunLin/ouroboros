@@ -20,7 +20,10 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   (``/dev/null`` and friends). Everything else, including the live
   workspace, the user's home directory and the system temp directory, is
   read-only. Reading and executing are not restricted.
-- **Network** (``deny_network=True``): IP traffic is denied. Unix-domain
+  "Read-only" covers content, names (create, remove, rename, link) and
+  metadata (mode, ownership, timestamps, extended attributes, inode flags).
+- **Network** (``deny_network=True``, reported as ``network_denied``):
+  non-loopback IP traffic is denied. Loopback (``localhost``) and Unix-domain
   sockets stay available for local IPC.
 - **Other processes' environments** (``ConfinedCommand.isolates_process_environments``):
   under Landlock a confined process cannot read ``/proc/<pid>/environ``,
@@ -53,8 +56,14 @@ Backends:
   profile parameters, so no path is ever spliced into the profile text) and
   the devices; network denial allows only loopback IP.
 - **Linux**: Landlock (ABI 3, Linux 6.2, or newer: below it truncation
-  cannot be denied), applied by the helper ``_confine_exec.py`` before it
-  execs the command. On macOS the same helper runs inside ``sandbox-exec``
+  cannot be denied) plus a seccomp filter, both applied by the helper
+  ``_confine_exec.py`` before it execs the command. Landlock does not mediate
+  metadata changes, so the filter denies the chmod, chown, utime and xattr
+  syscall families, the inode-flag ioctls and io_uring. It cannot see paths,
+  so on Linux metadata changes are denied inside the writable roots too
+  (``touch`` on an existing file, ``shutil.copy2``/``copystat``, cargo's
+  fingerprint timestamps, tar extraction that restores modes); such a
+  command fails, which fails closed. On macOS the same helper runs inside ``sandbox-exec``
   and only applies the command's environment. It is unprivileged and needs no mount or user
   namespace, so it works in containers. Network denial uses an unprivileged
   network namespace (``unshare --user --map-root-user --net``), or nothing
@@ -64,9 +73,12 @@ Backends:
   process that is already sandboxed): no backend, and ``confine`` returns
   ``SandboxUnavailable``. A command is never run unconfined as a fallback.
 
-Each backend is probed once per process by running a small Python program
-under it that must be able to write inside a writable root and must fail to
-create, write or truncate anything next to it.
+Each backend is probed once per process with ``_sandbox_probe.py``: every
+mutation class it can perform unconfined on this host (content, names and
+metadata; the required ones must all be possible) must be denied outside the
+writable root when confined, ordinary writes inside must still work, and the
+outside directory must be unchanged. Anything less reports the backend
+unavailable.
 
 Unsafe off switch: ``OUROBOROS_EXEC_SANDBOX=off`` in the environment, or
 ``execution.exec_sandbox: false`` in ``~/.ouroboros/config.yaml``, makes
@@ -97,8 +109,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+from typing import Any
 
 import structlog
+
+from ouroboros.runtime import _sandbox_probe as probe_module
 
 log = structlog.get_logger(__name__)
 
@@ -263,28 +278,66 @@ def _bootstrap_environment(command_env: Mapping[str, str]) -> dict[str, str]:
     return {"PATH": os.defpath, _COMMAND_ENV_VARIABLE: json.dumps(dict(command_env))}
 
 
-# The probe must write inside its root and fail to create, write or truncate
-# anything beside it.
-_PROBE_PROGRAM = (
-    "import os, sys\n"
-    "inside, outside = sys.argv[1], sys.argv[2]\n"
-    "with open(os.path.join(inside, 'probe'), 'w') as handle:\n"
-    "    handle.write('ok')\n"
-    "for attempt in (\n"
-    "    lambda: open(os.path.join(outside, 'probe'), 'w').close(),\n"
-    "    lambda: os.truncate(os.path.join(outside, 'existing'), 0),\n"
-    "):\n"
-    "    try:\n"
-    "        attempt()\n"
-    "    except OSError:\n"
-    "        continue\n"
-    "    sys.exit(3)\n"
-)
+_PROBE = Path(__file__).with_name("_sandbox_probe.py")
+
+
+def _probe_matrix(argv_prefix: Sequence[str] | None, root: Path) -> dict[str, Any] | None:
+    """Run ``_sandbox_probe.py`` on a fresh layout under ``root``; None on failure.
+
+    ``argv_prefix`` None runs it unconfined; otherwise it is the backend argv
+    builder's output for the probe command.
+    """
+    inside, outside = root / "inside", root / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    probe_module.prepare(str(outside))
+    before = probe_module.snapshot(str(outside))
+    command = (sys.executable, "-I", "-S", "-B", str(_PROBE), str(inside), str(outside))
+    argv = command if argv_prefix is None else (*argv_prefix, *command)
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            argv,
+            env=_bootstrap_environment({"PATH": os.defpath}),
+            capture_output=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        report = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(report, dict):
+        log.info(
+            "exec_sandbox.probe_failed",
+            returncode=result.returncode,
+            stderr=result.stderr.decode("utf-8", errors="replace")[-500:],
+        )
+        return None
+    report["unchanged"] = probe_module.snapshot(str(outside)) == before
+    return report
+
+
+def _matrix_confines(baseline: dict[str, Any] | None, confined: dict[str, Any] | None) -> bool:
+    """Whether ``confined`` denied every mutation ``baseline`` proved possible."""
+    if baseline is None or confined is None:
+        return False
+    possible = {name for name, outcome in baseline["outside"].items() if outcome == "ok"}
+    if not set(probe_module.REQUIRED) <= possible:
+        return False
+    return (
+        all(confined["outside"].get(name) == "denied" for name in possible)
+        and all(outcome == "ok" for outcome in confined["inside"].values())
+        and confined["unchanged"] is True
+    )
 
 
 @functools.cache
 def filesystem_backend() -> SandboxBackend | None:
-    """The backend that confines writes on this host, or None; probed once."""
+    """The backend that confines writes on this host, or None; probed once.
+
+    The backend must deny, outside its writable root, every mutation class of
+    ``_sandbox_probe.py`` (content, names and metadata) that the same probe
+    can perform unconfined on this host, and leave the outside unchanged.
+    """
     if sys.platform == "darwin":
         candidate = SandboxBackend.SANDBOX_EXEC
     elif sys.platform.startswith("linux"):
@@ -293,41 +346,20 @@ def filesystem_backend() -> SandboxBackend | None:
         return None
     probe_root = Path(tempfile.mkdtemp(prefix="ouroboros-sandbox-probe-")).resolve()
     try:
-        inside = probe_root / "inside"
-        outside = probe_root / "outside"
-        inside.mkdir()
-        outside.mkdir()
-        (outside / "existing").write_text("keep", encoding="utf-8")
-        argv = _backend_argv(
-            candidate,
-            (sys.executable, "-I", "-S", "-c", _PROBE_PROGRAM, str(inside), str(outside)),
-            (str(inside),),
-            None,
-        )
-        try:
-            result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                argv,
-                env=_bootstrap_environment({"PATH": os.defpath}),
-                capture_output=True,
-                timeout=_PROBE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        confined = (
-            result.returncode == 0
-            and (inside / "probe").is_file()
-            and not (outside / "probe").exists()
-            and (outside / "existing").read_text(encoding="utf-8") == "keep"
-        )
-        if not confined:
+        (probe_root / "baseline").mkdir()
+        (probe_root / "confined").mkdir()
+        baseline = _probe_matrix(None, probe_root / "baseline")
+        prefix = _backend_argv(candidate, (), (str(probe_root / "confined" / "inside"),), None)
+        confined = _probe_matrix(prefix, probe_root / "confined")
+        if not _matrix_confines(baseline, confined):
             log.info(
                 "exec_sandbox.backend_unavailable",
                 backend=candidate.value,
-                returncode=result.returncode,
-                stderr=result.stderr.decode("utf-8", errors="replace")[-500:],
+                baseline=baseline,
+                confined=confined,
             )
-        return candidate if confined else None
+            return None
+        return candidate
     finally:
         shutil.rmtree(probe_root, ignore_errors=True)
 

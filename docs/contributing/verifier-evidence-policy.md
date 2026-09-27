@@ -159,14 +159,23 @@ command text a second way. The rules:
   those roots; on Linux it is Landlock (ABI 3, Linux 6.2, or newer; below
   it truncation cannot be denied), applied in the child before it execs the
   command (unprivileged, no mount or user namespace, so it works in
-  containers). The launchers start with a fixed bootstrap environment; the
+  containers), plus a seccomp filter for what Landlock does not mediate:
+  changing metadata (the chmod, chown, utime and xattr syscall families, the
+  inode-flag ioctls, io_uring). The filter cannot see paths, so on Linux a
+  replay cannot change metadata inside its copy either (`touch` on an
+  existing file, `shutil.copy2`, cargo's fingerprint timestamps); such a
+  replay fails, which fails closed. The launchers start with a fixed bootstrap environment; the
   command's environment, including its own assignments such as
   `LD_PRELOAD=...`, takes effect only when the command itself is exec'd
   inside the sandbox. The sandbox policy is sealed in the run's
   execution-semantics contract, so a resume with the switch changed is
   refused rather than replaying under a different policy. Each backend is
-  probed once per process: a probe program must write inside a root and fail
-  to create, write or truncate anything next to it. Where no backend works
+  probed once per process with a mutation matrix (create, append, truncate,
+  unlink, rename in and out, mkdir, rmdir, symlink, hard link, chmod, fchmod
+  on a read-only descriptor, chown, utime, and where the host supports them
+  xattrs, file flags and inode-flag ioctls): every class the probe can
+  perform unconfined must be denied outside the root when confined, with the
+  outside left unchanged, or the backend is reported unavailable. Where no backend works
   (Windows, a kernel without Landlock ABI 3, an already-sandboxed macOS
   process),
   nothing is replayed, the claims keep the transcript-only rules, and the

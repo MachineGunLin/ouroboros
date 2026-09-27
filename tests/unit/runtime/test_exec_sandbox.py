@@ -18,6 +18,7 @@ import pytest
 
 from ouroboros.config.untrusted_env import UNTRUSTED_ENV_DENYLIST
 from ouroboros.runtime import _confine_exec, exec_sandbox
+from ouroboros.runtime import _sandbox_probe as probe_module
 from ouroboros.runtime.exec_sandbox import (
     DEFAULT_ENV_PASSTHROUGH,
     EXEC_SANDBOX_ENV_VAR,
@@ -122,6 +123,41 @@ class TestRealBackend:
 
         assert result.returncode != 0
         assert not target.exists()
+
+    def test_metadata_outside_cannot_change(self, layout: dict[str, Path]) -> None:
+        _require_backend()
+        victim = layout["outside"].resolve() / "victim"
+        victim.write_text("keep", encoding="utf-8")
+        victim.chmod(0o600)
+        os.utime(victim, (1_000_000, 1_000_000))
+        before = os.stat(victim)
+        code = (
+            "import os, sys\n"
+            "path = sys.argv[1]\n"
+            "fd = os.open(path, os.O_RDONLY)\n"
+            "for attempt in (lambda: os.chmod(path, 0o644), lambda: os.fchmod(fd, 0o644),\n"
+            "                lambda: os.utime(path, (0, 0)),\n"
+            "                lambda: os.chown(path, os.getuid(), -1)):\n"
+            "    try:\n"
+            "        attempt()\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    sys.exit(3)\n"
+        )
+        command = confine(
+            _python(code, str(victim)),
+            cwd=str(layout["copy"]),
+            writable_roots=(str(layout["copy"]),),
+            temp_dir=str(layout["temp"]),
+            deny_network=False,
+        )
+        assert isinstance(command, ConfinedCommand)
+
+        result = _run(command)
+
+        after = os.stat(victim)
+        assert result.returncode == 0, result.stderr
+        assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
 
     def test_writable_root_with_quote_and_backslash_in_its_name(self, tmp_path: Path) -> None:
         _require_backend()
@@ -472,6 +508,54 @@ class TestNothingRunsBeforeConfinement:
         # starts with it: the command, and none of the launchers before it.
         assert result.returncode == 0, result.stderr
         assert result.stderr.count(missing) == 1, result.stderr
+
+
+class TestProbeMatrix:
+    _ALL_OK = dict.fromkeys(probe_module.REQUIRED, "ok")
+
+    def _confined(self, **overrides: str) -> dict[str, object]:
+        outside = dict.fromkeys(probe_module.REQUIRED, "denied")
+        outside.update(overrides)
+        return {"outside": outside, "inside": {"create": "ok"}, "unchanged": True}
+
+    def test_every_possible_mutation_must_be_denied(self) -> None:
+        baseline = {"outside": {**self._ALL_OK, "setxattr": "ok"}}
+
+        assert exec_sandbox._matrix_confines(baseline, self._confined(setxattr="denied"))
+        assert not exec_sandbox._matrix_confines(baseline, self._confined(setxattr="ok"))
+        assert not exec_sandbox._matrix_confines(baseline, self._confined(chmod="ok"))
+
+    def test_a_probe_that_proves_nothing_confines_nothing(self) -> None:
+        baseline = {"outside": {**self._ALL_OK, "chmod": "unsupported"}}
+
+        assert not exec_sandbox._matrix_confines(baseline, self._confined())
+        assert not exec_sandbox._matrix_confines(None, self._confined())
+
+    def test_outside_changes_or_failed_inside_writes_fail_the_probe(self) -> None:
+        baseline = {"outside": dict(self._ALL_OK)}
+        changed = {**self._confined(), "unchanged": False}
+        blocked_inside = {**self._confined(), "inside": {"create": "denied"}}
+
+        assert not exec_sandbox._matrix_confines(baseline, changed)
+        assert not exec_sandbox._matrix_confines(baseline, blocked_inside)
+
+
+class TestMetadataFilter:
+    @pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+    def test_every_jump_lands_on_a_return(self, machine: str) -> None:
+        program = _confine_exec.metadata_filter(machine)
+        ret = 0x06
+        allow, deny = program[-2], program[-1]
+
+        assert allow == (ret, 0, 0, 0x7FFF0000) and deny == (ret, 0, 0, 0x00050001)
+        for index, (code, jt, jf, _k) in enumerate(program):
+            if code in (0x15, 0x35):
+                for offset in (jt, jf):
+                    assert index + 1 + offset < len(program)
+
+    def test_unknown_architecture_is_refused(self) -> None:
+        with pytest.raises(_confine_exec.SandboxError):
+            _confine_exec.metadata_filter("riscv64")
 
 
 class TestLandlockAccessMask:

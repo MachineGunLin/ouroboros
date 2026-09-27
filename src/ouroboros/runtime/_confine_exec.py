@@ -215,6 +215,144 @@ def restrict_writes(writable: list[str]) -> int:
     return abi
 
 
+# Landlock mediates creating, writing, truncating, removing, renaming and
+# linking, but not changing an existing inode's metadata: mode, ownership,
+# timestamps, extended attributes and inode flags. A seccomp filter denies those
+# syscalls with EPERM. It cannot see paths, so the denial is global, inside the
+# writable roots too. Numbers come from the kernel's syscall tables
+# (arch/x86/entry/syscalls/syscall_64.tbl and scripts/syscall.tbl, v6.15);
+# syscalls numbered 424 and up share one number on every architecture. The
+# backend probe (``_sandbox_probe.py``) checks each class against a real file,
+# so a wrong number reports the sandbox unavailable instead of weakening it.
+_METADATA_SYSCALLS: dict[str, dict[str, int]] = {
+    "x86_64": {
+        "chmod": 90,
+        "fchmod": 91,
+        "fchmodat": 268,
+        "chown": 92,
+        "fchown": 93,
+        "lchown": 94,
+        "fchownat": 260,
+        "utime": 132,
+        "utimes": 235,
+        "futimesat": 261,
+        "utimensat": 280,
+        "setxattr": 188,
+        "lsetxattr": 189,
+        "fsetxattr": 190,
+        "removexattr": 197,
+        "lremovexattr": 198,
+        "fremovexattr": 199,
+    },
+    "aarch64": {
+        "fchmod": 52,
+        "fchmodat": 53,
+        "fchown": 55,
+        "fchownat": 54,
+        "utimensat": 88,
+        "setxattr": 5,
+        "lsetxattr": 6,
+        "fsetxattr": 7,
+        "removexattr": 14,
+        "lremovexattr": 15,
+        "fremovexattr": 16,
+    },
+}
+_UNIFIED_METADATA_SYSCALLS = {
+    "fchmodat2": 452,
+    "setxattrat": 463,
+    "removexattrat": 466,
+    # io_uring has its own setxattr operations, which seccomp never sees.
+    "io_uring_setup": 425,
+}
+_IOCTL_SYSCALL = {"x86_64": 16, "aarch64": 29}
+# ioctl requests that set inode flags (chattr) or fsxattr on an fd opened for
+# reading: _IOW('f', 2, long), _IOW('f', 2, int), _IOW('X', 32, struct fsxattr).
+_METADATA_IOCTLS = (0x40086602, 0x40046602, 0x401C5820)
+_AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
+_X32_SYSCALL_BIT = 0x40000000
+_PR_SET_SECCOMP = 22
+_SECCOMP_MODE_FILTER = 2
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+_SECCOMP_RET_ERRNO_EPERM = 0x00050000 | 1
+_BPF_LD_W_ABS = 0x20
+_BPF_JEQ_K = 0x15
+_BPF_JGE_K = 0x35
+_BPF_RET_K = 0x06
+# struct seccomp_data: int nr; u32 arch; u64 instruction_pointer; u64 args[6].
+_SECCOMP_NR = 0
+_SECCOMP_ARCH = 4
+_SECCOMP_ARG1_LOW = 24  # little-endian low word of args[1]
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(_SockFilter))]
+
+
+def metadata_filter(machine: str) -> list[tuple[int, int, int, int]]:
+    """The BPF program denying metadata changes on ``machine``, as (code, jt, jf, k).
+
+    Any other architecture in ``seccomp_data.arch`` (a 32-bit compat call) and,
+    on x86_64, any x32 call is denied outright.
+    """
+    if machine not in _METADATA_SYSCALLS:
+        raise SandboxError(f"no metadata syscall table for {machine}")
+    denied = sorted({*_METADATA_SYSCALLS[machine].values(), *_UNIFIED_METADATA_SYSCALLS.values()})
+    # Laid out so every check jumps forward to one of the three returns at the
+    # end: [.., ioctl checks, ALLOW, DENY]. ``_to`` computes the offset.
+    body: list[tuple[int, int, int, int | str]] = [
+        (_BPF_LD_W_ABS, 0, 0, _SECCOMP_ARCH),
+        (_BPF_JEQ_K, 1, 0, _AUDIT_ARCH[machine]),
+        (_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO_EPERM),
+        (_BPF_LD_W_ABS, 0, 0, _SECCOMP_NR),
+    ]
+    if machine == "x86_64":
+        body.append((_BPF_JGE_K, -1, 0, _X32_SYSCALL_BIT))
+    body.extend((_BPF_JEQ_K, -1, 0, number) for number in denied)
+    body.append((_BPF_JEQ_K, 0, -2, _IOCTL_SYSCALL[machine]))
+    body.append((_BPF_LD_W_ABS, 0, 0, _SECCOMP_ARG1_LOW))
+    body.extend((_BPF_JEQ_K, -1, 0, request) for request in _METADATA_IOCTLS)
+    allow = len(body)
+    deny = allow + 1
+    body.extend(
+        [(_BPF_RET_K, 0, 0, _SECCOMP_RET_ALLOW), (_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO_EPERM)]
+    )
+    program: list[tuple[int, int, int, int]] = []
+    for index, (code, jt, jf, k) in enumerate(body):
+        # -1 jumps to DENY, -2 jumps to ALLOW; offsets count from the next instruction.
+        jt = deny - index - 1 if jt == -1 else jt
+        jf = allow - index - 1 if jf == -2 else jf
+        program.append((code, jt, jf, int(k)))
+    return program
+
+
+def deny_metadata_changes() -> None:
+    """Install the metadata seccomp filter on this process (needs no_new_privs)."""
+    program = metadata_filter(os.uname().machine)
+    filters = (_SockFilter * len(program))(*(_SockFilter(*item) for item in program))
+    fprog = _SockFprog(len(program), filters)
+    libc = ctypes.CDLL(None, use_errno=True)
+    _check(
+        libc.prctl(
+            ctypes.c_int(_PR_SET_SECCOMP),
+            ctypes.c_ulong(_SECCOMP_MODE_FILTER),
+            ctypes.byref(fprog),
+            ctypes.c_ulong(0),
+            ctypes.c_ulong(0),
+        ),
+        "prctl(PR_SET_SECCOMP)",
+    )
+
+
 def _parse(arguments: list[str]) -> tuple[bool, list[str], list[str]]:
     landlock = bool(arguments) and arguments[0] == "--landlock"
     index = 1 if landlock else 0
@@ -252,6 +390,7 @@ def main(arguments: list[str]) -> int:
         env = _command_environment()
         if landlock:
             restrict_writes(writable)
+            deny_metadata_changes()
     except (SandboxError, OSError) as exc:
         sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
         return EXIT_SANDBOX_FAILED
