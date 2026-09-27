@@ -165,8 +165,11 @@ async def construct_pieces(
     partial_dir: Path | None,
     concurrency: int = DEFAULT_CONCURRENCY,
     tools: Sequence[str] = (),
+    numbers: Sequence[int] | None = None,
 ) -> list[CriterionPiece]:
     """Run one read-only call per criterion under one shared deadline.
+
+    ``numbers`` (1-based) limits the calls to those criteria (default: all).
 
     ``constructor`` supplies ``_create_runtime(cwd)``, ``_timeout``,
     ``_max_output_chars`` and ``generator`` (and, when present,
@@ -275,7 +278,8 @@ async def construct_pieces(
         persist_piece(partial_dir, piece)
         return piece
 
-    return list(await asyncio.gather(*(one(number) for number in range(1, total + 1))))
+    wanted = range(1, total + 1) if numbers is None else numbers
+    return list(await asyncio.gather(*(one(number) for number in wanted)))
 
 
 __all__ = [

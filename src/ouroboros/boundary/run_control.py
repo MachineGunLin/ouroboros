@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ouroboros.boundary.acceptance import VerificationCoverage
 from ouroboros.boundary.authority import (
     AuthorityOutcome,
     CheckPackageAuthority,
@@ -101,6 +102,22 @@ def reference_check_meta(state: BoundaryRunState | None) -> dict[str, str]:
     }
 
 
+def coverage_meta(state: BoundaryRunState | None) -> dict[str, str]:
+    """Bucketed pre-dispatch coverage counts, when this process built the package (else empty).
+
+    ``non_behavioral_count``: criteria the behavioral filter gave no check;
+    ``excluded_check_count``: checks per-check admission excluded, over every
+    version; ``replacement_call_count``: replacement constructor calls (0 or 1).
+    """
+    if state is None:
+        return {}
+    return {
+        "non_behavioral_count": _count_bucket(len(state.non_behavioral)),
+        "excluded_check_count": _count_bucket(len(state.exclusions)),
+        "replacement_call_count": _count_bucket(state.replacement_calls),
+    }
+
+
 def legacy_failure_class_from_annotations(legacy: dict[int, Any]) -> tuple[str, str]:
     """``(class, count bucket)`` from the legacy verdicts the authority annotated."""
     rejected = sorted(
@@ -168,6 +185,14 @@ async def legacy_failure_dimensions(
         list(reversed(events)), session_id=session_id
     )
     return {"legacy_failure_class": failure_class, "legacy_failure_class_count": count}
+
+
+def _no_package_coverage_line(state: BoundaryRunState | None) -> str:
+    total = len(state.criterion_keys) if state is not None else 0
+    return (
+        "WARNING: insufficient verification: the check package decided 0 of "
+        f"{total} criteria (verification_coverage=low)."
+    )
 
 
 ConstructorFactory = Callable[..., Any]
@@ -415,7 +440,7 @@ class CheckPackageRun:
             return self.resumed.render()
         if self.authority is None:
             if self.state is not None and not self.state.admitted:
-                return [unavailable_line(self.state)]
+                return [unavailable_line(self.state), _no_package_coverage_line(self.state)]
             return []
         outcome = self.authority.outcome
         if outcome is None:
@@ -426,7 +451,8 @@ class CheckPackageRun:
         if outcome.fallback_reason is not None:
             return [
                 f"Check package could not decide this run ({outcome.fallback_reason}); "
-                "legacy verification decided this run."
+                "legacy verification decided this run.",
+                _no_package_coverage_line(self.state),
             ]
         if outcome.error is not None:
             return [
@@ -438,7 +464,12 @@ class CheckPackageRun:
         if repairs:
             lines.append(
                 f"Repairs driven by check package counterexamples: {len(repairs)} "
-                "(the legacy verifier triggered none)."
+                "(the legacy verifier drives retries only for legacy-decided criteria)."
+            )
+        if self.authority.gate.legacy_failures:
+            lines.append(
+                "Attempts the legacy verifier rejected on legacy-decided criteria: "
+                f"{self.authority.gate.legacy_failures}."
             )
         reconciliation = outcome.reconciliation
         if reconciliation is not None:
@@ -453,6 +484,16 @@ class CheckPackageRun:
             elif outcome.legacy_run_accepted and not reconciliation.run_accepted:
                 lines.append("The finished workspace fails the frozen check package.")
         return lines
+
+    def _coverage(self) -> str | None:
+        """``verification_coverage``: ``low`` when the package decided nothing (arm on)."""
+        if self.status == "not_run" and self.resumed is None:
+            return None
+        outcome = self._outcome()
+        reconciliation = outcome.reconciliation if outcome is not None else None
+        if reconciliation is None or not reconciliation.legacy_rule:
+            return VerificationCoverage.LOW.value
+        return reconciliation.coverage.value
 
     def _outcome(self) -> AuthorityOutcome | None:
         """The decision of this run's authority, live or resumed."""
@@ -482,7 +523,15 @@ class CheckPackageRun:
         if self.status == "not_run":
             return "none"
         outcome = self._outcome()
-        if outcome is None or outcome.reconciliation is None or not outcome.package_decided:
+        if outcome is None or outcome.reconciliation is None:
+            return "fallback_to_legacy"
+        reconciliation = outcome.reconciliation
+        rejected = [d for d in reconciliation.decisions if not d.accepted]
+        if rejected and all(d.legacy_decided for d in rejected):
+            # Every rejection came from the legacy verifier on a criterion the
+            # package could not verify (user decision, 2026-09-27).
+            return "legacy_decided_unverified"
+        if not outcome.package_decided:
             return "fallback_to_legacy"
         accepted = outcome.reconciliation.run_accepted
         legacy_accepted = legacy_verdict == "accept"
@@ -538,6 +587,10 @@ class CheckPackageRun:
             meta["unverified_count"] = _count_bucket(len(reconciliation.unverified))
             meta["check_tier_summary"] = tier_summary_value(reconciliation.tiers)
         meta.update(reference_check_meta(self.state))
+        meta.update(coverage_meta(self.state))
+        coverage = self._coverage()
+        if coverage is not None:
+            meta["verification_coverage"] = coverage
         if self.authority is not None and self.authority.installed:
             # Criteria asked once for an entry_points declaration.
             meta["binding_request_count"] = _count_bucket(len(self.authority.binding_requested))

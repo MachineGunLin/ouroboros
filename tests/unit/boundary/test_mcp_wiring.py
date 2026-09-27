@@ -178,9 +178,11 @@ async def test_mcp_execute_seed_prepares_verifies_and_reconciles(
     )
     assert events[-1].type == ACCEPTANCE_RECONCILED
     tool = result.value
-    assert tool.is_error is False
-    assert tool.meta["status"] == "completed"
-    # Script-check package: its pass is advisory (only oracle checks verify).
+    # Script-check package: its pass is advisory (only oracle checks verify),
+    # so the criterion is unverified and the legacy rejection decides it
+    # (user decision, 2026-09-27): the run fails.
+    assert tool.is_error is True
+    assert tool.meta["status"] == "failed"
     assert "Check package verdict: unverified" in tool.text_content
     assert {key: tool.meta[key] for key in ("check_package_arm", "check_package_assignment")} == {
         "check_package_arm": "on",
@@ -189,7 +191,8 @@ async def test_mcp_execute_seed_prepares_verifies_and_reconciles(
     assert tool.meta["check_package_status"] == "admitted"
     assert tool.meta["package_verdict"] == "unverified"
     assert tool.meta["legacy_verdict"] == "reject"
-    assert tool.meta["reconciliation"] == "package_accepted_over_legacy_reject"
+    assert tool.meta["reconciliation"] == "legacy_decided_unverified"
+    assert tool.meta["verification_coverage"] == "low"
 
 
 async def test_mcp_execute_seed_with_the_arm_off_is_the_legacy_run(

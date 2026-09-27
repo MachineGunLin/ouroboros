@@ -25,7 +25,7 @@ across CLI runtimes, so none are claimed here.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 import inspect
@@ -38,8 +38,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ouroboros.boundary.behavioral import NON_BEHAVIORAL
 from ouroboros.boundary.constructor_session import disable_session_persistence
-from ouroboros.boundary.incremental import construct_pieces, merge_pieces
+from ouroboros.boundary.incremental import construct_pieces, merge_pieces, restrict_reply
 from ouroboros.boundary.oracle import is_oracle_file
 from ouroboros.boundary.oracle_build import assemble_package, build_oracle_spec
 from ouroboros.boundary.package import (
@@ -111,12 +112,17 @@ def _criterion_lines(seed: Seed) -> list[str]:
 
 
 def build_constructor_prompt(
-    seed: Seed, feedback: Sequence[str] = (), *, criterion: int | None = None
+    seed: Seed,
+    feedback: Sequence[str] = (),
+    *,
+    criterion: int | None = None,
+    skip: Collection[int] = (),
 ) -> str:
     """Render the user message: goal, constraints, numbered criteria, feedback.
 
     With ``criterion`` (1-based) the message asks for that criterion only;
-    the other criteria are shown for context.
+    the other criteria are shown for context. ``skip`` (1-based numbers)
+    names criteria that get no check (non-behavioral, ``boundary/behavioral.py``).
     """
     parts = [
         "Repository: the current working directory (read-only copy of the base).",
@@ -139,7 +145,49 @@ def build_constructor_prompt(
             "only; the other criteria are context. Use check ids that start with "
             f"`c{criterion}_`.",
         ]
+    if skip:
+        numbers = ", ".join(str(number) for number in sorted(skip))
+        parts += [
+            "",
+            f"Criteria {numbers} name no observable behavior: write no check for them and "
+            f'list each under "uncovered" with reason "{NON_BEHAVIORAL}".',
+        ]
     parts += ["", "Reply with the JSON object only."]
+    return "\n".join(parts)
+
+
+REPLACEMENT_CHECK_PREFIX = "r"
+
+
+def build_replacement_prompt(seed: Seed, targets: Mapping[int, str]) -> str:
+    """The user message of the one replacement call (1-based criterion to why).
+
+    Only the listed criteria get checks; each is told why the earlier package
+    has no admitted check for it (reasons only, never case values), and
+    check ids start with ``r<number>_`` so they cannot collide with the
+    admitted checks that are kept.
+    """
+    parts = [
+        "Repository: the current working directory (read-only copy of the base).",
+        "",
+        f"Goal: {seed.goal}",
+    ]
+    if seed.constraints:
+        parts += ["", "Constraints:", *(f"- {item}" for item in seed.constraints)]
+    parts += ["", "Acceptance criteria:", *_criterion_lines(seed)]
+    parts += [
+        "",
+        "An earlier check package for this Seed was admitted, but the criteria below have "
+        "no admitted check. Write replacement checks for these criteria only; the other "
+        "criteria are context and already have checks:",
+        *(f"- criterion {number}: {why}" for number, why in sorted(targets.items())),
+        "",
+        "Use check ids that start with `r<criterion number>_` (for example "
+        f"`r{min(targets) if targets else 1}_repro`). A criterion you still cannot check "
+        'goes under "uncovered" with its reason.',
+        "",
+        "Reply with the JSON object only.",
+    ]
     return "\n".join(parts)
 
 
@@ -319,6 +367,16 @@ def package_from_reply(
 RuntimeFactory = Callable[..., Any]
 
 
+def _restricted(reply: Mapping[str, Any], numbers: Collection[int]) -> dict[str, Any]:
+    """The part of ``reply`` that concerns the 1-based criteria ``numbers``."""
+    merged: dict[str, list[Any]] = {"oracles": [], "checks": [], "files": [], "uncovered": []}
+    for number in sorted(numbers):
+        part = restrict_reply(reply, number)
+        for key in merged:
+            merged[key].extend(part[key])
+    return merged
+
+
 def _concrete_model(value: object) -> str | None:
     """A model id, or None for an unset or ``default`` placeholder."""
     if not isinstance(value, str):
@@ -412,17 +470,46 @@ class CheckConstructor:
         base_checkout: Path,
         *,
         feedback: Sequence[str] = (),
+        skip_criteria: Collection[int] = (),
     ) -> ConstructionOutcome:
         """Run one attempt and return a package or a typed failure reason.
 
         By default (``per_criterion``) the attempt is incremental: one call
         per criterion under one shared deadline, each reply kept as produced
-        (``boundary/incremental.py``).
+        (``boundary/incremental.py``). ``skip_criteria`` (1-based numbers)
+        get no call and no check: they are uncovered with reason
+        ``non_behavioral``.
         """
         if self._per_criterion:
-            return await self._construct_incremental(seed, base_checkout, feedback=feedback)
+            return await self._construct_incremental(
+                seed, base_checkout, feedback=feedback, skip=frozenset(skip_criteria)
+            )
+        return await self._construct_single(
+            seed, base_checkout, build_constructor_prompt(seed, feedback, skip=skip_criteria)
+        )
+
+    async def construct_replacements(
+        self, seed: Seed, base_checkout: Path, *, targets: Mapping[int, str]
+    ) -> ConstructionOutcome:
+        """One call for replacement checks of ``targets`` (1-based criterion to why).
+
+        Always a single read-only call, whatever ``per_criterion`` says, under
+        the same timeout and isolation as ``construct``. The reply is kept
+        only for the target criteria (``incremental.restrict_reply``).
+        """
+        return await self._construct_single(
+            seed, base_checkout, build_replacement_prompt(seed, targets), only=frozenset(targets)
+        )
+
+    async def _construct_single(
+        self,
+        seed: Seed,
+        base_checkout: Path,
+        user_prompt: str,
+        *,
+        only: frozenset[int] | None = None,
+    ) -> ConstructionOutcome:
         system_prompt = self._system_prompt or load_constructor_system_prompt()
-        user_prompt = build_constructor_prompt(seed, feedback)
         base = base_checkout.resolve()
         base_before = await asyncio.to_thread(tree_digest, base)
         scratch = Path(tempfile.mkdtemp(prefix="ouroboros-constructor-"))
@@ -485,6 +572,8 @@ class CheckConstructor:
             return failed("constructor_reply_too_large", reply_sha)
         try:
             parsed = extract_json_object(reply)
+            if only is not None:
+                parsed = _restricted(parsed, only)
             package = package_from_reply(
                 parsed,
                 seed,
@@ -517,6 +606,7 @@ class CheckConstructor:
         base_checkout: Path,
         *,
         feedback: Sequence[str] = (),
+        skip: frozenset[int] = frozenset(),
     ) -> ConstructionOutcome:
         system_prompt = self._system_prompt or load_constructor_system_prompt()
         base = base_checkout.resolve()
@@ -558,6 +648,13 @@ class CheckConstructor:
                 partial_dir=self._partial_dir,
                 concurrency=self._concurrency,
                 tools=CONSTRUCTOR_TOOLS,
+                numbers=[
+                    number
+                    for number in range(1, len(seed.acceptance_criteria) + 1)
+                    if number not in skip
+                ]
+                if skip
+                else None,
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -580,6 +677,9 @@ class CheckConstructor:
             first = next(piece for piece in pieces if piece.status != "ok")
             return failed(first.reason or "constructor_failed")
         merged, _missing = merge_pieces(pieces)
+        merged["uncovered"].extend(
+            {"criterion": number, "reason": NON_BEHAVIORAL} for number in sorted(skip)
+        )
         try:
             package = package_from_reply(
                 merged,

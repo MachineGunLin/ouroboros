@@ -565,6 +565,7 @@ async def _run_cli(
     monkeypatch.delenv("OUROBOROS_CHECK_PACKAGE", raising=False)
     store = EventStore(f"sqlite+aiosqlite:///{tmp_path / 'events.db'}")
     seen = {} if seen is None else seen
+    seen["store"] = store
 
     async def execute_seed(**kwargs: Any):
         seen["kwargs"] = kwargs
@@ -721,6 +722,12 @@ async def test_cli_flag_on_admits_before_dispatch_and_verifies_after(
         "legacy_failure_class_count": "0",
         "unverified_count": "1",
         "check_tier_summary": "A:0,A_prime:0,U:1",
+        # The legacy double gives no verifier verdict: neither verifier has
+        # evidence, so the criterion stays unverified and coverage is low.
+        "non_behavioral_count": "0",
+        "excluded_check_count": "0",
+        "replacement_call_count": "0",
+        "verification_coverage": "low",
     }
     await store.close()
 
@@ -771,38 +778,47 @@ async def test_cli_refuses_to_dispatch_into_a_leaking_workspace(
     assert seen["runner"].execute_seed.await_count == 0
 
 
-async def test_cli_package_pass_overrides_an_evidence_form_rejection(
+async def test_cli_unverified_criterion_with_a_legacy_rejection_exits_non_zero(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The existing verifier rejected a correct fix; the covering package passed it."""
-    store, _runner, seen = await _run_cli(
-        tmp_path,
-        repo,
-        check_package=True,
-        constructor_cls=_constructor_factory(BUGFIX_SCRIPT, []),
-        worker_edit=FIXED,
-        monkeypatch=monkeypatch,
-        run_success=False,
-    )  # no typer.Exit: the run is accepted
+    """A script-only criterion is unverified; the legacy rejection decides it (2026-09-27).
+
+    Before this rule the run was accepted as unverified (exit 0); now the
+    legacy verifier decides every criterion the package cannot verify.
+    """
+    seen: dict[str, Any] = {}
+    with pytest.raises(typer.Exit) as exit_info:
+        await _run_cli(
+            tmp_path,
+            repo,
+            check_package=True,
+            constructor_cls=_constructor_factory(BUGFIX_SCRIPT, []),
+            worker_edit=FIXED,
+            monkeypatch=monkeypatch,
+            run_success=False,
+            seen=seen,
+        )
+    assert exit_info.value.exit_code == 1
+    store = seen["store"]
     boundary_id = f"{seen['kwargs']['execution_id']}/check_package/v1"
     events = await store.replay(BOUNDARY_AGGREGATE_TYPE, boundary_id)
     reconciled = events[-1]
     assert reconciled.type == ACCEPTANCE_RECONCILED
-    assert reconciled.data["run_accepted"] is True
+    assert reconciled.data["schema_version"] == "ouroboros.acceptance_reconciliation.v3"
+    assert reconciled.data["run_accepted"] is False
     assert reconciled.data["existing_run_accepted"] is False
     (criterion,) = reconciled.data["criteria"]
-    assert criterion["governed_by"] == "check_package"
+    assert criterion["governed_by"] == "existing_verifier"
     assert criterion["package_status"] == "unverified"
     assert criterion["existing_outcome"] == "failed"
     assert verify_boundary_order(events) == ()
-    # The runner receives the reconciled result, so the terminal status it
-    # persists (and the telemetry terminal_status) is the reconciled one.
     (result,) = seen["parallel_result"].results
-    assert result.success is True and result.outcome.value == "succeeded"
-    assert seen["telemetry"]["terminal_status"] == "completed"
+    assert result.success is False and result.outcome.value == "failed"
+    assert seen["telemetry"]["terminal_status"] == "failed"
     meta = _check_package_meta(seen)
     assert meta["legacy_verdict"] == "reject"
-    assert meta["reconciliation"] == "package_accepted_over_legacy_reject"
+    assert meta["reconciliation"] == "legacy_decided_unverified"
+    assert meta["verification_coverage"] == "low"
     assert meta["legacy_failure_class"] == "other"  # no recovery record in this double
     await store.close()
 

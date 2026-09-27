@@ -287,34 +287,19 @@ async def test_package_fail_drives_repair_and_names_the_declared_binding(
     assert authority.gate.log[0]["tier"] == "A_prime"
 
 
-async def test_authority_matrix_and_exit_semantics(
-    store: EventStore, repo: Path, tmp_path: Path
-) -> None:
-    seed, authority = await _authority(store, repo, tmp_path)
-    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
-    authority.install(_executor(repo))
-    results = (
-        _legacy_rejected(0),  # A, passes; the legacy rejection is advisory
-        _legacy_rejected(1, entry=MIX_ENTRY),  # A', passes
-        _legacy_rejected(2),  # uncovered: unverified
+def _legacy_accepted(index: int) -> ACExecutionResult:
+    """What the leaf returns when the legacy verifier accepted on evidence."""
+    return ACExecutionResult(
+        ac_index=index,
+        ac_content=f"criterion {index}",
+        success=True,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        atomic_verifier_verdict=VerifierVerdict(passed=True, reasons=(), failure_class=None),
     )
-    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
-    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
-    keys = seed_criterion_keys(seed)
-    verdicts = authority.outcome.verdict.verdicts
-    assert [(verdicts[k].status, verdicts[k].tier) for k in keys] == [
-        (PackageCriterionStatus.PASS, CheckTier.A),
-        (PackageCriterionStatus.PASS, CheckTier.A_PRIME),
-        (PackageCriterionStatus.UNCOVERED, CheckTier.U),
-    ]
-    reconciliation = authority.outcome.reconciliation
-    # 2 of 3 verified, 0 failed, 1 unverified: accepted, durable status completed.
-    assert reconciliation.run_accepted and decided.all_succeeded
-    assert authority.outcome.legacy_run_accepted is False  # annotation only
-    assert [d.existing_failure_class for d in reconciliation.decisions] == [
-        "EVIDENCE_FORM_MISMATCH"
-    ] * 3
-    run = CheckPackageRun(
+
+
+def _run_for_matrix(authority: CheckPackageAuthority) -> CheckPackageRun:
+    return CheckPackageRun(
         CheckPackageSettings(
             enabled=True, assignment=CheckPackageAssignment(Arm.ON, AssignmentSource.USER_FORCED_ON)
         ),
@@ -322,26 +307,159 @@ async def test_authority_matrix_and_exit_semantics(
         authority=authority,
         attempted=True,
     )
+
+
+async def test_authority_matrix_and_exit_semantics(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    """A and A' criteria are decided by the package; the README one by the legacy verifier."""
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
+    authority.install(_executor(repo))
+    results = (
+        _legacy_rejected(0),  # A, passes; the legacy rejection is advisory
+        _legacy_rejected(1, entry=MIX_ENTRY),  # A', passes
+        _legacy_rejected(2),  # non-behavioral: the legacy rejection decides it
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    keys = seed_criterion_keys(seed)
+    verdicts = authority.outcome.verdict.verdicts
+    assert [(verdicts[k].status, verdicts[k].tier, verdicts[k].reason) for k in keys] == [
+        (PackageCriterionStatus.PASS, CheckTier.A, "passed"),
+        (PackageCriterionStatus.PASS, CheckTier.A_PRIME, "passed"),
+        (PackageCriterionStatus.UNCOVERED, CheckTier.U, "uncovered:non_behavioral"),
+    ]
+    reconciliation = authority.outcome.reconciliation
+    # A and A' are accepted over the legacy rejection; the legacy-decided
+    # criterion fails, so the run fails (exit 1, durable status failed).
+    assert [(d.accepted, d.governed_by.value) for d in reconciliation.decisions] == [
+        (True, "check_package"),
+        (True, "check_package"),
+        (False, "existing_verifier"),
+    ]
+    assert not reconciliation.run_accepted and not decided.all_succeeded
+    assert [r.outcome for r in decided.results] == [
+        ACExecutionOutcome.SUCCEEDED,
+        ACExecutionOutcome.SUCCEEDED,
+        ACExecutionOutcome.FAILED,
+    ]
+    assert decided.results[2].error == (
+        "legacy-decided (uncovered:non_behavioral): legacy verifier: evidence form mismatch"
+    )
+    assert [d.existing_failure_class for d in reconciliation.decisions] == [
+        "EVIDENCE_FORM_MISMATCH"
+    ] * 3
+    run = _run_for_matrix(authority)
     lines = run.render_outcome()
-    assert any(line.startswith("Verified: 2 of 3 passed; unverified: 1") for line in lines)
-    assert any(line.startswith("- unverified AC 3: uncovered:not executable") for line in lines)
-
-    class _Store:
-        async def query_events(self, **_kwargs: Any) -> list[Any]:
-            return []
-
+    assert any(
+        line.startswith("AC 3: not accepted by the legacy verifier (legacy-decided, non-behavioral")
+        for line in lines
+    )
+    assert any(
+        line.startswith(
+            "Verified by the check package: 2 of 3 passed; legacy-decided: 1 "
+            "(non_behavioral: 1); unverified: 0"
+        )
+        for line in lines
+    )
+    assert not any(line.startswith("WARNING: insufficient verification") for line in lines)
     meta = await run.outcome_meta(
-        _Store(), execution_id="exec_oracle", session_id="s", terminal_status="completed"
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
     )  # type: ignore[arg-type]
     assert meta["package_verdict"] == "pass"
-    assert meta["unverified_count"] == "1"
+    assert meta["unverified_count"] == "0"
     assert meta["check_tier_summary"] == "A:1,A_prime:1,U:1"
     assert meta["legacy_verdict"] == "reject"
-    assert meta["reconciliation"] == "package_accepted_over_legacy_reject"
+    assert meta["reconciliation"] == "legacy_decided_unverified"
+    assert meta["verification_coverage"] == "partial"
+    assert meta["non_behavioral_count"] == "1"
     assert meta["legacy_failure_class"] == "evidence_form_mismatch"
     assert meta["legacy_failure_class_count"] == "3+"
     sent = _check_package_properties(meta)
-    assert sent["unverified_count"] == "1" and sent["check_tier_summary"] == "A:1,A_prime:1,U:1"
+    assert sent["reconciliation"] == "legacy_decided_unverified"
+    assert sent["verification_coverage"] == "partial" and sent["non_behavioral_count"] == "1"
+
+
+async def test_a_legacy_accepted_unverified_criterion_exits_zero(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
+    authority.install(_executor(repo))
+    results = (
+        _legacy_rejected(0),
+        _legacy_rejected(1, entry=MIX_ENTRY),
+        _legacy_accepted(2),  # the legacy verifier accepts it on evidence
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    reconciliation = authority.outcome.reconciliation
+    assert reconciliation.run_accepted and decided.all_succeeded
+    assert reconciliation.decisions[2].legacy_decided and reconciliation.decisions[2].accepted
+    assert reconciliation.accepted_unverified == ()
+    meta = await _run_for_matrix(authority).outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="completed"
+    )  # type: ignore[arg-type]
+    assert meta["reconciliation"] == "package_accepted_over_legacy_reject"
+    assert meta["verification_coverage"] == "partial"
+
+
+async def test_a_package_failure_is_not_masked_by_a_legacy_acceptance(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    """A criteria stay decided by the package: legacy acceptance changes nothing."""
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(BUGGY + GOOD_MIX)
+    authority.install(_executor(repo))
+    results = (
+        _legacy_accepted(0),
+        _legacy_rejected(1, entry=MIX_ENTRY),
+        _legacy_accepted(2),
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    first = authority.outcome.reconciliation.decisions[0]
+    assert first.governed_by.value == "check_package" and not first.accepted
+    assert first.package_status is PackageCriterionStatus.FAIL
+    assert not decided.all_succeeded
+    # The rejection comes from the package (tier A), not from a legacy-decided criterion.
+    meta = await _run_for_matrix(authority).outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
+    )  # type: ignore[arg-type]
+    assert meta["reconciliation"] == "agree"
+
+
+async def test_both_verifiers_without_evidence_leave_the_criterion_unverified(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    """Transcript unavailable on the legacy side, no check on the package side: exit 0, flagged."""
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(FIXED + GOOD_MIX)
+    authority.install(_executor(repo))
+    results = (
+        _legacy_rejected(0),
+        _legacy_rejected(1, entry=MIX_ENTRY),
+        _transcript_unavailable(2),
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    reconciliation = authority.outcome.reconciliation
+    assert reconciliation.run_accepted and decided.all_succeeded
+    (unverified,) = reconciliation.accepted_unverified
+    assert unverified.root_ac_index == 2 and not unverified.legacy_decided
+    run = _run_for_matrix(authority)
+    lines = run.render_outcome()
+    assert "- unverified AC 3: uncovered:non_behavioral" in lines
+    assert any(
+        line.startswith("WARNING: insufficient verification: the check package decided 2 of 3")
+        for line in lines
+    )
+    meta = await run.outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="completed"
+    )  # type: ignore[arg-type]
+    assert meta["unverified_count"] == "1"
+    assert meta["verification_coverage"] == "low"
 
 
 async def test_failures_and_unattempted_criteria_are_not_accepted(
@@ -533,7 +651,9 @@ async def test_outage_falls_back_to_the_legacy_path(
     assert runner.acceptance_authority is None and run.authority is None
     assert any("No admitted package (constructor_timeout)" in line for line in lines)
     assert run.render_outcome() == [
-        "Check package unavailable (constructor_timeout); legacy verification decided this run."
+        "Check package unavailable (constructor_timeout); legacy verification decided this run.",
+        "WARNING: insufficient verification: the check package decided 0 of 3 criteria "
+        "(verification_coverage=low).",
     ]
     meta = await run.outcome_meta(
         _EmptyStore(),
@@ -546,6 +666,7 @@ async def test_outage_falls_back_to_the_legacy_path(
     assert meta["package_verdict"] == "none"
     assert meta["legacy_verdict"] == legacy
     assert "unverified_count" not in meta and "check_tier_summary" not in meta
+    assert meta["verification_coverage"] == "low"
     # The executor gets no gate: its prompt and retry loop are the legacy ones.
     executor = _executor(repo)
     assert not hasattr(executor, "check_package_gate")
@@ -658,7 +779,9 @@ async def test_authority_error_with_the_gate_installed_falls_back_to_the_legacy_
     run = _run_for(authority)
     assert run.render_outcome() == [
         "Check package could not decide this run (authority_error:OSError); "
-        "legacy verification decided this run."
+        "legacy verification decided this run.",
+        "WARNING: insufficient verification: the check package decided 0 of 3 criteria "
+        "(verification_coverage=low).",
     ]
     meta = await run.outcome_meta(
         _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
@@ -1090,3 +1213,28 @@ async def test_telemetry_never_reads_an_unavailable_transcript_as_a_rejection(
     assert meta["legacy_verdict"] == "accept"
     assert meta["reconciliation"] == "agree"
     assert meta["legacy_failure_class"] == "accepted"
+
+
+async def test_a_legacy_rejection_of_a_legacy_decided_criterion_drives_the_retry(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    """The README criterion has no admitted check: its legacy rejection fails the attempt."""
+    seed, authority = await _authority(store, repo, tmp_path)
+    executor = _executor(repo)
+    authority.install(executor)
+    prompts: list[dict[int, str]] = []
+
+    async def fake_batch(**kwargs: Any) -> list[ACExecutionResult]:
+        prompts.append(dict(kwargs.get("retry_prompts") or {}))
+        first = len(prompts) == 1
+        result = _legacy_rejected(2) if first else _legacy_accepted(2)
+        return [replace(result, retry_attempt=len(prompts) - 1)]
+
+    executor._execute_ac_batch = fake_batch  # type: ignore[method-assign]
+    results = await _batch(executor, seed, [2])
+    assert len(prompts) == 2 and results[0].success is True
+    assert authority.gate.legacy_failures == 1
+    retry = prompts[1][2]
+    assert "### Check package counterexample" not in retry
+    assert "LEGACY_DECIDED:EVIDENCE_FORM_MISMATCH" in retry
+    assert authority.gate.log == []  # no package verification ran for it

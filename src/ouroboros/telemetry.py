@@ -295,6 +295,10 @@ _WORKFLOW_OUTCOME_KEYS = frozenset(
         "reference_contradiction_count",
         "reference_unavailable_count",
         "binding_request_count",
+        "non_behavioral_count",
+        "excluded_check_count",
+        "replacement_call_count",
+        "verification_coverage",
         "$insert_id",
         "runtime_backend",
         "app_version",
@@ -334,6 +338,7 @@ _CHECK_PACKAGE_PROPERTY_VALUES: dict[str, frozenset[str]] = {
             "package_accepted_over_legacy_reject",
             "package_rejected_over_legacy_accept",
             "fallback_to_legacy",
+            "legacy_decided_unverified",
             "none",
         }
     ),
@@ -347,6 +352,11 @@ _CHECK_PACKAGE_PROPERTY_VALUES: dict[str, frozenset[str]] = {
     "reference_unavailable_count": frozenset({"0", "1", "2", "3+"}),
     # Criteria asked once for an entry_points declaration (boundary/authority.py).
     "binding_request_count": frozenset({"0", "1", "2", "3+"}),
+    # Pre-dispatch coverage (boundary/behavioral.py, per_check.py, coverage.py).
+    "non_behavioral_count": frozenset({"0", "1", "2", "3+"}),
+    "excluded_check_count": frozenset({"0", "1", "2", "3+"}),
+    "replacement_call_count": frozenset({"0", "1", "2", "3+"}),
+    "verification_coverage": frozenset({"full", "partial", "low"}),
     # "A:<n>,A_prime:<n>,U:<n>" with each n in 0, 1, 2, 3+ (64 values).
     "check_tier_summary": frozenset(
         f"A:{a},A_prime:{b},U:{u}"

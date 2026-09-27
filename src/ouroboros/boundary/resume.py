@@ -29,7 +29,9 @@ current workspace, with no model call:
 A covered criterion without a package decision (the record or the journal is
 unreadable, or the record disagrees with the journal) is indeterminate: not
 accepted, a non-zero exit, never a legacy decision. Uncovered criteria keep
-the rule of the live run (unverified, accepted when attempted). What counts
+the rule of the live run: the legacy verifier decides them (legacy-decided),
+and one it has no evidence for stays unverified and is accepted when
+attempted. A check excluded at admission covers nothing. What counts
 as an attempt is the live arm-on rule
 (``existing_outcomes_from_results(..., gated=True)``): a root that failed for
 any reason other than the package gate (a failed session, a failed verify
@@ -94,6 +96,7 @@ from ouroboros.boundary.package import (
     seed_criterion_keys,
     sha256_bytes,
 )
+from ouroboros.boundary.per_check import excluded_check_ids
 from ouroboros.boundary.run_wiring import (
     BoundaryVerdict,
     CheckPackageSettings,
@@ -209,11 +212,14 @@ async def load_resumed_boundary(
     reference = cited_reference(frozen.data)
     if not isinstance(reference, str) or not _REFERENCE.fullmatch(reference):
         return None
+    # A check excluded at admission (tier ``C``, ``per_check.py``) covers nothing.
+    excluded = excluded_check_ids(admission.data.get("check_tiers"))
     covered = tuple(
         sorted(
             {
                 key
                 for check in (frozen.data.get("manifest") or {}).get("checks") or ()
+                if check.get("check_id") not in excluded
                 for key in check.get("criterion_keys") or ()
             }
         )
@@ -516,6 +522,7 @@ class ResumedCheckPackageAuthority:
                 verdict.verdicts,
                 legacy,
                 existing_run_accepted=bool(parallel_result.all_succeeded),
+                legacy_decides_unverified=True,
             )
             await BoundaryLedger(self._event_store).record_acceptance_resumed(
                 self.boundary.boundary_id,

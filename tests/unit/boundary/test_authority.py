@@ -168,17 +168,20 @@ async def _authority(store: EventStore, repo: Path, tmp_path: Path) -> tuple[Any
     return seed, authority
 
 
-async def test_authority_accepts_a_correct_fix_the_legacy_verifier_rejected(
+async def test_a_script_only_criterion_is_decided_by_the_legacy_verifier(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
+    """A script check's pass is advisory (U); the legacy rejection decides (2026-09-27)."""
     seed, authority = await _authority(store, repo, tmp_path)
     (repo / "calc.py").write_text(FIXED)
     decided = await authority(
         seed=seed, execution_id="exec_auth", parallel_result=_parallel(ACExecutionOutcome.FAILED)
     )
-    assert decided.all_succeeded is True
+    assert decided.all_succeeded is False
     assert authority.outcome.legacy_run_accepted is False
-    assert authority.outcome.package_decided is True
+    assert authority.outcome.package_decided is False
+    (decision,) = authority.outcome.reconciliation.decisions
+    assert decision.legacy_decided and decision.reason == "script_check_advisory"
     events = await store.replay(BOUNDARY_AGGREGATE_TYPE, "exec_auth/check_package/v1")
     assert events[-1].type == ACCEPTANCE_RECONCILED
     # A second call keeps the first decision and records nothing more.

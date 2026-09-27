@@ -864,6 +864,10 @@ class TestCapture:
             "reference_contradiction_count": "0",
             "reference_unavailable_count": "3+",
             "binding_request_count": "1",
+            "non_behavioral_count": "2",
+            "excluded_check_count": "3+",
+            "replacement_call_count": "1",
+            "verification_coverage": "low",
         }
         telemetry.capture_job_outcome(
             "job-private-id",

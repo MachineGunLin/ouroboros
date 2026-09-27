@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+import inspect
 import json
 import os
 from pathlib import Path
@@ -72,6 +73,7 @@ from ouroboros.boundary.admission import (
     admit_check_package,
     write_receipt,
 )
+from ouroboros.boundary.behavioral import BEHAVIORAL_RULE, NON_BEHAVIORAL, non_behavioral_criteria
 from ouroboros.boundary.binding import CheckTier, TierAssignment
 from ouroboros.boundary.binding_flow import (
     BoundVerification,
@@ -89,10 +91,17 @@ from ouroboros.boundary.check_env import (
     scrubbed_check_environment,
 )
 from ouroboros.boundary.constructor import ALL_CRITERIA_UNCOVERED
+from ouroboros.boundary.coverage import (
+    merge_replacement,
+    replacement_targets,
+    strip_criteria,
+    why_excluded,
+)
 from ouroboros.boundary.ledger import BoundaryLedger
 from ouroboros.boundary.oracle import apply_reveals, first_failing_heldout, repair_lines
 from ouroboros.boundary.package import (
     CheckPackage,
+    canonical_json_bytes,
     commit_package,
     new_commitment_salt,
     private_directory,
@@ -125,6 +134,8 @@ if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
     from ouroboros.persistence.event_store import EventStore
 
+ALL_CRITERIA_NON_BEHAVIORAL = "all_criteria_non_behavioral"
+REPLACEMENT_REASON = "replacement_checks"
 _FEEDBACK_TAIL_CHARS = 400
 _COUNTEREXAMPLE_TAIL_CHARS = 1500
 
@@ -256,6 +267,13 @@ class BoundaryRunState:
     commitments: tuple[FrozenCommitment, ...] = field(default=(), repr=False)
     reference_check: ReferenceCheck | None = None
     """What the reference check excluded from the bound version (``None``: not run)."""
+    non_behavioral: tuple[str, ...] = ()
+    """Criterion keys the behavioral filter left without a check (``behavioral.py``)."""
+    exclusions: tuple[tuple[str, str, str], ...] = ()
+    """``(boundary_id, check_id, reason)`` for every check excluded by per-check admission."""
+    replacement_calls: int = 0
+    """Replacement constructor calls made before the worker started (0 or 1)."""
+    replacement_outcome: str | None = None
 
     @property
     def admitted(self) -> bool:
@@ -330,6 +348,93 @@ def _admission_feedback(admission: AdmissionResult) -> list[str]:
     return feedback
 
 
+async def _construct(
+    constructor: CheckConstructor, seed: Seed, base: Path, feedback: list[str], skip: frozenset[int]
+) -> Any:
+    """``constructor.construct``, telling it which criteria get no check when it can listen."""
+    if skip and "skip_criteria" in inspect.signature(constructor.construct).parameters:
+        return await constructor.construct(seed, base, feedback=feedback, skip_criteria=skip)
+    return await constructor.construct(seed, base, feedback=feedback)
+
+
+@dataclass
+class _Sealer:
+    """Seal, record and admit one package version (shared by every version of a run)."""
+
+    ledger: BoundaryLedger
+    seed: Seed
+    base: Path
+    store: Path
+    settings: CheckPackageSettings
+    interpreter: CheckInterpreter
+    # Keys the held-out case hashes of the stored package record; never stored.
+    record_key: bytes = field(default_factory=lambda: secrets.token_bytes(32), repr=False)
+    commitments: list[FrozenCommitment] = field(default_factory=list, repr=False)
+    exclusions: list[tuple[str, str, str]] = field(default_factory=list)
+
+    async def seal_and_admit(
+        self, boundary_id: str, package: CheckPackage, reference_check: ReferenceCheck | None
+    ) -> tuple[CheckPackage, AdmissionResult, Path]:
+        # A fresh salt per package; the record, the journal and every receipt
+        # cite the commitment (I2 orders it before the worker).
+        salt = new_commitment_salt()
+        package = commit_package(package, salt)
+        assert package.commitment is not None
+        self.commitments.append(FrozenCommitment(boundary_id, package.commitment, salt))
+        package_path = write_package_record(package, self.store / "packages", self.record_key)
+        # The digest of the bytes on disk goes into the journal before the
+        # worker starts: a resume in another process detects any edit of the
+        # record, visible case values included (R5 follow-up).
+        await self.ledger.record_package_frozen(
+            boundary_id,
+            package,
+            seed=self.seed,
+            record_sha256=sha256_bytes(package_path.read_bytes()),
+        )
+        if reference_check is not None:
+            await self.ledger.record_reference_checked(
+                boundary_id, package_sha256=package.reference, payload=reference_check.payload()
+            )
+        admission = await admit_check_package(
+            package,
+            self.base,
+            timeout_seconds=self.settings.check_timeout_seconds,
+            env=scrubbed_check_environment(),
+            interpreter=self.interpreter.path,
+            interpreter_source=self.interpreter.source,
+            reject_prose_only_checks=True,
+            reject_unsafe_checks=True,
+            check_tiers=admission_tiers(package, self.seed, self.base),
+            # Per-check admission (A29): a reproduction check that passes on
+            # the base or a preservation check that fails on it is excluded
+            # on its own; the rest of the package is admitted.
+            exclude_checks_individually=True,
+        )
+        write_receipt(admission, self.store / "receipts")
+        await self.ledger.record_admission(boundary_id, admission)
+        self.exclusions.extend(
+            (boundary_id, check_id, reason)
+            for check_id, reason in sorted((admission.excluded_checks or {}).items())
+        )
+        return package, admission, package_path
+
+    async def reference_checked(
+        self, package: CheckPackage, references: Any
+    ) -> tuple[CheckPackage | None, ReferenceCheck | None]:
+        """Derived-expectation admission (``boundary/reference_check.py``), before the seal."""
+        if references is None or not package.oracles:
+            return package, None
+        checked, report = await check_references(
+            package,
+            references,
+            seed=self.seed,
+            env=scrubbed_check_environment(),
+            interpreter=self.interpreter.path,
+            timeout_seconds=self.settings.check_timeout_seconds,
+        )
+        return (checked if checked.checks else None), report
+
+
 async def prepare_check_package(
     seed: Seed,
     *,
@@ -344,6 +449,12 @@ async def prepare_check_package(
 ) -> BoundaryRunState:
     """Construct, freeze, and admit a package, then record the actor start.
 
+    Non-behavioral criteria (``boundary/behavioral.py``) get no check. Each
+    version is admitted per check (``boundary/per_check.py``). With the
+    product policy, the behavioral criteria an admitted version leaves
+    without an admitted check get one replacement call before the worker
+    starts (``_replace_uncovered``).
+
     Raises ``BoundaryOrderError`` / ``BoundaryLeakError`` from the ledger; the
     caller must not dispatch the worker in that case.
     """
@@ -351,6 +462,7 @@ async def prepare_check_package(
     ledger = BoundaryLedger(event_store)
     digest = seed_digest(seed)
     base = base_checkout.resolve()
+    keys = seed_criterion_keys(seed)
     versions: list[str] = []
     feedback: list[str] = []
     previous: str | None = None
@@ -362,35 +474,45 @@ async def prepare_check_package(
     # Model-written checks run with a scrubbed environment and the project's
     # interpreter when one exists (boundary/check_env.py).
     interpreter = resolve_check_interpreter(base)
-    # Keys the held-out case hashes of the stored package record; never stored.
-    record_key = secrets.token_bytes(32)
-    commitments: list[FrozenCommitment] = []
+    sealer = _Sealer(ledger, seed, base, store, settings, interpreter)
     reference_check: ReferenceCheck | None = None
+    skip_indices = non_behavioral_criteria(seed)
+    non_behavioral = tuple(keys[index] for index in skip_indices)
+    skip = frozenset(index + 1 for index in skip_indices)
+    attempts = 0 if keys and len(non_behavioral) == len(keys) else settings.attempts
 
-    for attempt in range(1, settings.attempts + 1):
+    if not attempts:
+        # Nothing names an observable behavior: no construction, no package;
+        # the legacy verifier decides the run.
+        failure_reason = ALL_CRITERIA_NON_BEHAVIORAL
+        await ledger.record_construction_failed(
+            f"{execution_id}/check_package/v1",
+            seed_digest=digest,
+            input_digest=sha256_bytes(
+                canonical_json_bytes({"seed_digest": digest, "rule": BEHAVIORAL_RULE})
+            ),
+            reason=failure_reason,
+        )
+        versions.append(f"{execution_id}/check_package/v1")
+
+    for attempt in range(1, attempts + 1):
         boundary_id = f"{execution_id}/check_package/v{attempt}"
         persist = getattr(constructor, "persist_partials_to", None)
         if persist is not None:
             # Each criterion's oracle is kept as soon as it is produced.
             persist(store / "partial" / f"v{attempt}")
-        outcome = await constructor.construct(seed, base, feedback=feedback)
+        outcome = await _construct(constructor, seed, base, feedback, skip)
         package, admission, package_path = outcome.package, None, None
-        reference_check = None
         references = getattr(outcome, "references", None)
-        if package is not None and references is not None and package.oracles:
-            # Derived-expectation admission (``boundary/reference_check.py``):
-            # before the package is frozen, cases that disagree with the
-            # constructor's reference are excluded.
-            package, reference_check = await check_references(
-                package,
-                references,
-                seed=seed,
-                env=scrubbed_check_environment(),
-                interpreter=interpreter.path,
-                timeout_seconds=settings.check_timeout_seconds,
-            )
+        if package is not None and non_behavioral:
+            package = strip_criteria(package, seed, dict.fromkeys(non_behavioral, NON_BEHAVIORAL))
             if not package.checks:
                 package = None
+                outcome = replace(outcome, package=None, failure_reason=ALL_CRITERIA_UNCOVERED)
+        reference_check = None
+        if package is not None:
+            package, reference_check = await sealer.reference_checked(package, references)
+            if package is None:
                 outcome = replace(outcome, package=None, failure_reason=REFERENCE_LEFT_NO_CHECKS)
         if package is None:
             failure_reason = outcome.failure_reason or "constructor_failed"
@@ -402,39 +524,9 @@ async def prepare_check_package(
             )
             feedback = [failure_reason]
         else:
-            # A fresh salt per package; the record, the journal and every
-            # receipt cite the commitment (I2 orders it before the worker).
-            salt = new_commitment_salt()
-            package = commit_package(package, salt)
-            assert package.commitment is not None
-            commitments.append(FrozenCommitment(boundary_id, package.commitment, salt))
-            package_path = write_package_record(package, store / "packages", record_key)
-            # The digest of the bytes on disk goes into the journal before the
-            # worker starts: a resume in another process detects any edit of
-            # the record, visible case values included (R5 follow-up).
-            await ledger.record_package_frozen(
-                boundary_id,
-                package,
-                seed=seed,
-                record_sha256=sha256_bytes(package_path.read_bytes()),
+            package, admission, package_path = await sealer.seal_and_admit(
+                boundary_id, package, reference_check
             )
-            if reference_check is not None:
-                await ledger.record_reference_checked(
-                    boundary_id, package_sha256=package.reference, payload=reference_check.payload()
-                )
-            admission = await admit_check_package(
-                package,
-                base,
-                timeout_seconds=settings.check_timeout_seconds,
-                env=scrubbed_check_environment(),
-                interpreter=interpreter.path,
-                interpreter_source=interpreter.source,
-                reject_prose_only_checks=True,
-                reject_unsafe_checks=True,
-                check_tiers=admission_tiers(package, seed, base),
-            )
-            write_receipt(admission, store / "receipts")
-            await ledger.record_admission(boundary_id, admission)
             failure_reason = (
                 None
                 if admission.verdict is PackageVerdict.ADMITTED
@@ -453,6 +545,27 @@ async def prepare_check_package(
         previous, previous_reason = boundary_id, failure_reason
 
     bound = versions[-1]
+    replacement = _ReplacementReport()
+    if (
+        failure_reason is None
+        and package is not None
+        and admission is not None
+        and package_path is not None
+        and settings.policy is RegenerationPolicy.PRODUCT
+    ):
+        replaced = await _replace_uncovered(
+            constructor,
+            sealer,
+            versions,
+            bound,
+            package,
+            admission,
+            skip=non_behavioral,
+            references_kept=reference_check,
+            report=replacement,
+        )
+        if replaced is not None:
+            bound, package, admission, package_path, reference_check = replaced
     if package is not None and failure_reason is not None:
         # A frozen but unadmitted version cannot host a worker. Seal a final
         # version that records the absence of an admitted package.
@@ -499,15 +612,114 @@ async def prepare_check_package(
         store_dir=store,
         package_path=package_path if admitted else None,
         interpreter=interpreter,
-        criterion_keys=seed_criterion_keys(seed),
+        criterion_keys=keys,
         base_snapshot=snapshot[0] if snapshot else None,
         base_manifest_path=snapshot[1] if snapshot else None,
         reference_check=reference_check,
-        commitments=tuple(commitments),
+        commitments=tuple(sealer.commitments),
+        non_behavioral=non_behavioral,
+        exclusions=tuple(sealer.exclusions),
+        replacement_calls=replacement.calls,
+        replacement_outcome=replacement.outcome,
     )
     if state.admitted:
         _LIVE_STATES[execution_id] = state
     return state
+
+
+@dataclass
+class _ReplacementReport:
+    calls: int = 0
+    outcome: str | None = None
+    """``admitted``, ``not_admitted``, ``construction_failed`` or ``None`` (no call)."""
+
+
+async def _replace_uncovered(
+    constructor: Any,
+    sealer: _Sealer,
+    versions: list[str],
+    bound: str,
+    package: CheckPackage,
+    admission: AdmissionResult,
+    *,
+    skip: Sequence[str],
+    references_kept: ReferenceCheck | None,
+    report: _ReplacementReport,
+) -> tuple[str, CheckPackage, AdmissionResult, Path, ReferenceCheck | None] | None:
+    """One replacement call for the behavioral criteria left without an admitted check.
+
+    The new version (the admitted checks kept, plus the replacements) goes
+    through the reference check, the seal and per-check admission, and
+    supersedes ``bound`` when admitted. When the call fails, or the new
+    version is not admitted, the new version is marked superseded by
+    ``bound``, which stays the version the worker is bound to. Returns the
+    new ``(boundary_id, package, admission, path, reference_check)`` or
+    ``None``.
+    """
+    call = getattr(constructor, "construct_replacements", None)
+    excluded = tuple((admission.excluded_checks or {}).keys())
+    targets = replacement_targets(package, excluded, skip)
+    if call is None or not targets:
+        return None
+    keys = package.criterion_keys
+    numbers = {keys.index(key) + 1: why_excluded(reason) for key, reason in targets.items()}
+    new_id = f"{bound.rsplit('/v', 1)[0]}/v{len(versions) + 1}"
+    report.calls = 1
+    outcome = await call(sealer.seed, sealer.base, targets=numbers)
+    candidate: CheckPackage | None = outcome.package
+    reason = outcome.failure_reason or "constructor_failed"
+    reference_check: ReferenceCheck | None = None
+    if candidate is not None:
+        candidate, reference_check = await sealer.reference_checked(
+            candidate, getattr(outcome, "references", None)
+        )
+        if candidate is None:
+            reason = REFERENCE_LEFT_NO_CHECKS
+    merged: CheckPackage | None = None
+    if candidate is not None:
+        merged, _still = merge_replacement(package, excluded, candidate, targets, sealer.seed)
+        if len(merged.checks) == len(package.checks) - len(excluded):
+            # The replacement linked none of its targets.
+            merged, reason = None, "replacement_linked_no_target"
+    versions.append(new_id)
+    if merged is None:
+        report.outcome = "construction_failed"
+        await sealer.ledger.record_construction_failed(
+            new_id,
+            seed_digest=package.seed_digest,
+            input_digest=outcome.input_digest,
+            reason=f"replacement_failed:{reason}",
+        )
+        await sealer.ledger.record_superseded(
+            new_id, superseded_by=bound, reason=f"replacement_failed:{reason}"
+        )
+        return None
+    new_package, new_admission, new_path = await sealer.seal_and_admit(
+        new_id, merged, reference_check
+    )
+    if new_admission.verdict is not PackageVerdict.ADMITTED:
+        report.outcome = "not_admitted"
+        await sealer.ledger.record_superseded(
+            new_id,
+            superseded_by=bound,
+            reason=f"replacement_not_admitted:{new_admission.verdict.value}",
+        )
+        return None
+    report.outcome = "admitted"
+    await sealer.ledger.record_superseded(bound, superseded_by=new_id, reason=REPLACEMENT_REASON)
+    combined = references_kept
+    if reference_check is not None:
+        combined = ReferenceCheck(
+            excluded={
+                **(references_kept.excluded if references_kept else {}),
+                **reference_check.excluded,
+            },
+            uncovered={
+                **(references_kept.uncovered if references_kept else {}),
+                **reference_check.uncovered,
+            },
+        )
+    return new_id, new_package, new_admission, new_path, combined
 
 
 # The admitted boundary of each run still in progress in this process, with
@@ -795,8 +1007,21 @@ def repair_message(verdict: BoundaryVerdict, criterion_key: str) -> str | None:
 def render_preparation(state: BoundaryRunState) -> list[str]:
     """Plain-text lines describing the boundary the worker is bound to."""
     lines = [f"Check package boundary: {state.boundary_id}"]
-    if len(state.versions) > 1:
-        lines.append(f"Superseded versions: {', '.join(state.versions[:-1])}")
+    superseded = [version for version in state.versions if version != state.boundary_id]
+    if superseded:
+        lines.append(f"Superseded versions: {', '.join(superseded)}")
+    if state.non_behavioral:
+        lines.append(
+            f"Non-behavioral criteria (no check; the legacy verifier decides them): "
+            f"{len(state.non_behavioral)} of {len(state.criterion_keys)}"
+        )
+    if state.exclusions:
+        lines.append(
+            "Checks excluded at admission: "
+            + ", ".join(f"{check_id} ({reason})" for _v, check_id, reason in state.exclusions)
+        )
+    if state.replacement_calls:
+        lines.append(f"Replacement checks: one constructor call, {state.replacement_outcome}")
     if state.admitted and state.package is not None:
         package = state.package
         roles = ", ".join(f"{check.check_id} ({check.role.value})" for check in package.checks)

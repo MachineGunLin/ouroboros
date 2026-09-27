@@ -9,25 +9,29 @@ While the worker runs (``CheckPackageGate``, installed as the executor's
 ``check_package_gate``):
 
 - the legacy per-criterion verifier (typed evidence plus the transcript
-  verifier) no longer rejects an attempt; its verdict stays on the result as
-  an annotation (advisory reason and failure class for telemetry), so it
-  triggers no retry;
+  verifier) no longer rejects an attempt of a criterion an admitted check
+  covers; its verdict stays on the result as an annotation (advisory reason
+  and failure class for telemetry), so it triggers no retry. For a criterion
+  no admitted check covers (uncovered, non-behavioral, or every check
+  excluded at admission) the legacy verifier decides: its rejection fails
+  the attempt and drives the retry, as with the check package off;
 - after each attempt of a root criterion the gate runs that criterion's
   checks on the workspace, through the default binding or the entry point
   the worker declared in its evidence; a fail marks the attempt failed with
   the counterexample (``ACExecutionResult.check_package_repair``), which the
   executor's retry loop carries into the next attempt. A failure through a
   worker-declared binding names that binding. Held-out inputs are withheld.
-  Nothing else drives a retry.
 
 After the worker stops (``CheckPackageAuthority.__call__``):
 
 1. ``verify_check_package`` records the final bindings, verifies the
    finished workspace, and records verification and selection;
-2. ``reconcile_acceptance`` decides every criterion (pass and unverified
-   accept, fail and indeterminate reject, a criterion the worker never
-   attempted is not accepted); the legacy verdict is kept per criterion as
-   advisory; ``boundary.acceptance.reconciled`` records it;
+2. ``reconcile_acceptance`` decides every criterion (pass accepts, fail and
+   indeterminate reject, a criterion the worker never attempted is not
+   accepted; an unverified, uncovered or non-behavioral criterion is decided
+   by the legacy verifier, and stays unverified and accepted only when the
+   legacy verifier has no evidence either); the legacy verdict is kept per
+   criterion; ``boundary.acceptance.reconciled`` records it;
 3. the executor result is returned with each root result's ``success`` and
    ``outcome`` set to the decision and the counts recomputed, so the durable
    status, the panel, the exit code, and ``workflow_outcome`` carry it.
@@ -75,6 +79,7 @@ from ouroboros.boundary.binding_flow import (
 from ouroboros.boundary.check_env import resolve_check_interpreter, scrubbed_check_environment
 from ouroboros.boundary.ledger import BoundaryLedger
 from ouroboros.boundary.package import seed_criterion_keys
+from ouroboros.boundary.per_check import criteria_without_admitted_check, excluded_check_ids
 from ouroboros.boundary.run_wiring import (
     BoundaryRunState,
     BoundaryVerdict,
@@ -100,6 +105,8 @@ PACKAGE_INDETERMINATE_ERROR = (
 )
 PACKAGE_FAILURE_CLASS_PREFIX = "CHECK_PACKAGE_FAIL"
 LEGACY_REJECTION_ERROR = "legacy verifier rejected this criterion"
+LEGACY_DECIDED_PREFIX = "legacy-decided"
+LEGACY_DECIDED_FAILURE_CLASS_PREFIX = "LEGACY_DECIDED"
 NO_BINDING = "no_binding"
 NO_BINDING_AFTER_REQUEST = "no_binding_after_request"
 NO_BINDING_BUDGET_EXHAUSTED = "no_binding_budget_exhausted"
@@ -174,6 +181,29 @@ def legacy_verdict_in_tree(result: Any) -> tuple[bool, str | None, str | None]:
     return False, None, None
 
 
+def _legacy_evidence(result: Any) -> bool:
+    """Whether the legacy verifier accepted ``result`` on evidence.
+
+    A passing verifier verdict, or a passing ``verify_command`` whose
+    environment was verifiable; a decomposed root has evidence when every
+    sub-result has. A success with no verdict, an unavailable transcript
+    (``TRANSCRIPT_MISSING_INFRASTRUCTURE``) or an unverifiable environment
+    is an acceptance without evidence.
+    """
+    gate = getattr(result, "verify_gate_outcome", None)
+    if (
+        gate is not None
+        and bool(getattr(gate, "passed", False))
+        and not bool(getattr(gate, "environment_unverifiable", False))
+    ):
+        return True
+    verdict = getattr(result, "atomic_verifier_verdict", None)
+    if verdict is not None and bool(getattr(verdict, "passed", False)):
+        return True
+    subs = tuple(getattr(result, "sub_results", ()) or ())
+    return bool(subs) and all(_legacy_evidence(sub) for sub in subs)
+
+
 def existing_outcomes_from_results(
     parallel_result: Any, *, gated: bool = False
 ) -> dict[int, ExistingOutcome]:
@@ -222,6 +252,7 @@ def existing_outcomes_from_results(
             disposition="accepted" if outcome in _ACCEPTED_OUTCOMES else outcome,
             terminal_status=terminal,
             failure_class=failure_class,
+            no_evidence=outcome in _ACCEPTED_OUTCOMES and not _legacy_evidence(result),
         )
     return outcomes
 
@@ -251,11 +282,12 @@ def apply_reconciliation(parallel_result: Any, reconciliation: AcceptanceReconci
             ACExecutionOutcome.SUCCEEDED,
             ACExecutionOutcome.SATISFIED_EXTERNALLY,
         ):
-            error = (
-                PACKAGE_REJECTION_ERROR
-                if decision.package_status is PackageCriterionStatus.FAIL
-                else f"{PACKAGE_INDETERMINATE_ERROR} ({decision.reason})"
-            )
+            if decision.legacy_decided:
+                error = legacy_decided_error(result, decision.reason)
+            elif decision.package_status is PackageCriterionStatus.FAIL:
+                error = PACKAGE_REJECTION_ERROR
+            else:
+                error = f"{PACKAGE_INDETERMINATE_ERROR} ({decision.reason})"
             results.append(
                 replace(result, success=False, outcome=ACExecutionOutcome.FAILED, error=error)
             )
@@ -276,6 +308,12 @@ def apply_reconciliation(parallel_result: Any, reconciliation: AcceptanceReconci
         failure_count=parallel_result.failure_count + failure_delta,
         externally_satisfied_count=parallel_result.externally_satisfied_count + external_delta,
     )
+
+
+def legacy_decided_error(result: Any, reason: str) -> str:
+    """The error of a criterion the legacy verifier decided and rejected."""
+    text = legacy_verdict_in_tree(result)[2] or LEGACY_REJECTION_ERROR
+    return f"{LEGACY_DECIDED_PREFIX} ({reason}): {text}"
 
 
 def apply_legacy_fallback(parallel_result: Any, legacy: Mapping[int, ExistingOutcome]) -> Any:
@@ -343,6 +381,9 @@ class CheckPackageGate:
     def __init__(self, authority: CheckPackageAuthority) -> None:
         self._authority = authority
         self.log: list[dict[str, Any]] = []
+        # Attempts the legacy verifier failed on a criterion no admitted
+        # check covers (it decides those criteria, retries included).
+        self.legacy_failures = 0
         # One decision per attempt: settlement paths hand the same attempt to
         # the gate again; they get the stored decision, not a new verification.
         self._decided: dict[tuple[int, int], dict[str, Any] | None] = {}
@@ -379,13 +420,16 @@ class CheckPackageGate:
         if not 0 <= ac_index < len(keys):
             return result
         key = keys[ac_index]
-        check_ids = [
-            check.check_id
-            for check in package.checks
-            if any(link.criterion_key == key for link in check.assertions)
-        ]
-        if not check_ids:
-            return result
+        check_ids = authority.admitted_check_ids(key)
+        if not check_ids or key in authority.legacy_decided_keys():
+            # No admitted check covers it (uncovered, non-behavioral, or
+            # every check excluded at admission): the legacy verifier decides
+            # it, so its rejection fails the attempt and drives the retry,
+            # exactly as with the check package off.
+            decided = self._legacy_decides(result)
+            if decided is not result:
+                self.legacy_failures += 1
+            return decided
         entries = authority.remember_declaration(key, _declared_from(result))
         options = authority.run_options()
         assignments, results = await assign_tiers(
@@ -487,6 +531,23 @@ class CheckPackageGate:
             )
             self.log[-1]["revealed_case_id"] = plan.revealed_case_id
         return self._repair(result, message)
+
+    @staticmethod
+    def _legacy_decides(result: Any) -> Any:
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+        rejected, failure_class, _text = legacy_verdict_in_tree(result)
+        if not rejected:
+            return result
+        return replace(
+            result,
+            success=False,
+            outcome=ACExecutionOutcome.FAILED,
+            error=legacy_decided_error(result, "no admitted check"),
+            check_package_failure_class=(
+                f"{LEGACY_DECIDED_FAILURE_CLASS_PREFIX}:{failure_class or 'rejected'}"
+            ),
+        )
 
     @staticmethod
     def _repair(result: Any, message: str) -> Any:
@@ -611,11 +672,40 @@ class CheckPackageAuthority:
         if package is None:
             return {}
         index = {key: number for number, key in enumerate(self._state.criterion_keys)}
+        excluded = self._excluded()
+        lost = self.legacy_decided_keys()
         return {
             index[spec.criterion_key]: spec.interface()
             for spec in package.oracles
             if spec.criterion_key in index
+            and spec.check_id not in excluded
+            and spec.criterion_key not in lost
         }
+
+    def _excluded(self) -> frozenset[str]:
+        admission = self._state.admission
+        return excluded_check_ids(admission.check_tiers if admission is not None else None)
+
+    def admitted_check_ids(self, key: str) -> list[str]:
+        """The admitted (not excluded) checks linked to criterion ``key``."""
+        package = self._state.package
+        if package is None:
+            return []
+        excluded = self._excluded()
+        return [
+            check.check_id
+            for check in package.checks
+            if check.check_id not in excluded
+            and any(link.criterion_key == key for link in check.assertions)
+        ]
+
+    def legacy_decided_keys(self) -> frozenset[str]:
+        """Criteria that lost their authority to per-check admission (``per_check.py``)."""
+        package = self._state.package
+        excluded = self._excluded()
+        if package is None or not excluded:
+            return frozenset()
+        return frozenset(criteria_without_admitted_check(package, excluded))
 
     def install(self, executor: Any) -> None:
         """Make the legacy verifier advisory and the package the repair signal."""
@@ -675,6 +765,7 @@ class CheckPackageAuthority:
                 verdict.verdicts,
                 legacy,
                 existing_run_accepted=bool(parallel_result.all_succeeded),
+                legacy_decides_unverified=True,
             )
             await BoundaryLedger(self._event_store).record_acceptance_reconciled(
                 self._state.boundary_id,
