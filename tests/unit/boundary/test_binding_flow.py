@@ -31,6 +31,7 @@ from ouroboros.boundary.run_wiring import (
     CheckPackageSettings,
     RegenerationPolicy,
     prepare_check_package,
+    render_verdict,
     repair_message,
     verify_check_package,
 )
@@ -528,3 +529,75 @@ def test_only_one_of_several_failing_held_out_cases_is_revealed() -> None:
     retired = apply_reveals(result, ["h1"])
     assert retired is not None and not failed_heldout_only(retired)
     assert sum(1 for c in retired["cases"] if c["held_out"]) == 2
+
+
+async def test_store_is_owner_only_and_receipts_hide_held_out_values(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # S3: the store holding the package is 0700; a stored receipt keeps a
+    # held-out case's id and pass/fail only.
+    import stat
+
+    seed, state = await _prepare(store, repo, tmp_path)
+    assert stat.S_IMODE((tmp_path / "store").stat().st_mode) == 0o700
+    _write(
+        repo,
+        {
+            "mathutils.py": FIXED
+            + "\ndef mix(start, end, weight):\n    return start + end * weight\n"
+        },
+    )
+    keys = seed_criterion_keys(seed)
+    declared = {
+        keys[1]: [{"symbol": "mathutils.mix", "arg_map": {"a": "start", "b": "end", "t": "weight"}}]
+    }
+    verdict = await verify_check_package(
+        state,
+        event_store=store,
+        candidate_checkout=repo,
+        settings=CheckPackageSettings(True),
+        declared_entry_points=declared,
+    )
+    assert verdict.verdicts[keys[1]].failed_heldout_only
+    receipts = [path.read_text() for path in (tmp_path / "store" / "receipts").iterdir()]
+    assert receipts
+    for text in receipts:
+        assert "weight=0.25" not in text and "expected 2.5" not in text
+    assert all("weight=0.25" not in line for line in render_verdict(verdict))
+
+
+async def test_all_unverified_criteria_give_the_all_unverified_reason(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # A7: every criterion unverified is the artifact verdict "unverified",
+    # reason "all_unverified".
+    seed = _seed()
+    reply = _reply()
+    reply["oracles"] = reply["oracles"][1:]
+    reply["uncovered"].append({"criterion": 1, "reason": "not executable"})
+    constructor = _Constructor(seed, repo)
+    constructor.outcome = ConstructionOutcome(
+        package_from_reply(
+            reply, seed, input_digest="1" * 64, generator="fake", base_checkout=repo
+        ),
+        None,
+        "1" * 64,
+        "fake",
+    )
+    state = await prepare_check_package(
+        seed,
+        event_store=store,
+        constructor=constructor,
+        execution_id="exec_all_u",
+        base_checkout=repo,
+        worker_workspace=repo,
+        runtime_label="test",
+        settings=CheckPackageSettings(True, policy=RegenerationPolicy.STUDY),
+        store_dir=tmp_path / "store",
+    )
+    assert state.admitted
+    verdict = await verify_check_package(
+        state, event_store=store, candidate_checkout=repo, settings=CheckPackageSettings(True)
+    )
+    assert verdict.artifact_verdict is ArtifactVerdict.UNVERIFIED
+    assert verdict.reasons == ("all_unverified",)

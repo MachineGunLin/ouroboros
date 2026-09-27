@@ -26,7 +26,9 @@ verdict is indeterminate. The study policy allows exactly one attempt.
 The worker never receives the package: it runs from the unchanged Seed, whose
 worker prompt already omits ``verify_command`` and ``output_assertion``.
 Packages and full receipts are stored under ``<store_dir>/packages`` and
-``<store_dir>/receipts``, outside every checkout.
+``<store_dir>/receipts``, outside every checkout. The store directory is
+owner-only (0700), and a stored receipt keeps a held-out case's id and
+pass/fail only until the case is revealed (``oracle.redact_held_out``).
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -165,6 +168,26 @@ def default_store_dir(execution_id: str) -> Path:
     return get_config_dir() / "boundary" / execution_id
 
 
+def private_store_dir(store: Path) -> Path:
+    """Create ``store`` owner-only (0700); the ``boundary`` parent too when it is one.
+
+    The store holds the package (every held-out case with its expected value),
+    the constructor's partial replies, and the base snapshot. The mode keeps
+    other users out; code running as the same user can still read it (there is
+    no OS sandbox), which is why receipts never carry held-out values.
+    """
+    store.mkdir(parents=True, exist_ok=True)
+    targets = [store]
+    if store.parent.name == "boundary":
+        targets.append(store.parent)
+    for target in targets:
+        try:
+            os.chmod(target, 0o700)
+        except OSError:
+            continue
+    return store
+
+
 @dataclass(frozen=True, slots=True)
 class BoundaryRunState:
     """What the run holds between worker dispatch and candidate verification."""
@@ -272,7 +295,7 @@ async def prepare_check_package(
     Raises ``BoundaryOrderError`` / ``BoundaryLeakError`` from the ledger; the
     caller must not dispatch the worker in that case.
     """
-    store = store_dir or default_store_dir(execution_id)
+    store = private_store_dir(store_dir or default_store_dir(execution_id))
     ledger = BoundaryLedger(event_store)
     digest = seed_digest(seed)
     base = base_checkout.resolve()
@@ -511,9 +534,13 @@ async def verify_check_package(
         or decision.reason is not SelectionReason.CANDIDATE_IDENTITY_MISMATCH,
     )
     overall = artifact_verdict(item.status for item in verdicts.values())
+    if overall is ArtifactVerdict.UNVERIFIED:
+        reasons: tuple[str, ...] = ("all_unverified",)
+    else:
+        reasons = verification.reasons if verification is not None else ("no_bound_checks",)
     return BoundaryVerdict(
         verdict=overall.value,
-        reasons=verification.reasons if verification is not None else ("no_bound_checks",),
+        reasons=reasons,
         boundary_id=state.boundary_id,
         package_sha256=package.sha256,
         counterexamples=_counterexamples(verification) if verification is not None else (),
@@ -542,15 +569,19 @@ class RepairPlan:
     revealed_case_id: str | None = None
 
 
-def plan_repair(verdict: BoundaryVerdict, criterion_key: str) -> RepairPlan | None:
+def plan_repair(
+    verdict: BoundaryVerdict, criterion_key: str, *, allow_reveal: bool = True
+) -> RepairPlan | None:
     """Counterexample repair for one failing criterion, or ``None``.
 
     Visible cases are shown in full. When the criterion failed only on
-    held-out cases, exactly one failing held-out case is revealed (input,
-    expected and observed output) and named in the plan, so the caller can
-    retire it (``boundary.oracle.case_revealed``); the other held-out cases
-    stay hidden and are counted. For a worker-declared binding (tier A') the
-    message names the binding the check ran through.
+    held-out cases and ``allow_reveal`` is true, exactly one failing held-out
+    case is revealed (input, expected and observed output) and named in the
+    plan, so the caller can retire it (``boundary.oracle.case_revealed``); the
+    other held-out cases stay hidden and are counted. The caller passes
+    ``allow_reveal=False`` when no repair attempt will follow or when this
+    criterion already had its one reveal in the run. For a worker-declared
+    binding (tier A') the message names the binding the check ran through.
     """
     item = verdict.verdicts.get(criterion_key)
     if item is None or item.status is not PackageCriterionStatus.FAIL:
@@ -581,7 +612,7 @@ def plan_repair(verdict: BoundaryVerdict, criterion_key: str) -> RepairPlan | No
         for case in result.get("cases") or ()
         if not case.get("passed")
     ]
-    if failing and all(case.get("held_out") for case in failing):
+    if allow_reveal and failing and all(case.get("held_out") for case in failing):
         for check_id, result in results.items():
             case = first_failing_heldout(result)
             if case is not None:
@@ -598,8 +629,14 @@ def plan_repair(verdict: BoundaryVerdict, criterion_key: str) -> RepairPlan | No
         lines.extend(counter)
         shown = shown or bool(counter)
     if not shown:
+        # Script checks only: an oracle check's counterexamples come from its
+        # structured result above, never from its output.
         for example in verdict.counterexamples:
-            if example.check_id in item.check_ids and example.output_tail.strip():
+            if (
+                example.check_id in item.check_ids
+                and example.check_id not in verdict.oracle_results
+                and example.output_tail.strip()
+            ):
                 lines.append(example.output_tail.strip()[-600:])
     return RepairPlan(
         "\n".join(lines),
