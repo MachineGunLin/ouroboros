@@ -222,3 +222,79 @@ async def test_a_target_that_never_reads_its_input_times_out_on_the_case_budget(
     (case,) = run.result["cases"]
     assert case["passed"] is False and case["detail"].endswith("observed timeout")
     assert elapsed < 15, elapsed
+
+
+# A child that leaves the process group (setsid) and keeps the pipes open.
+_SURVIVOR = """
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    open(sys.argv[1], "w").write(str(os.getpid()))
+    time.sleep(60)
+    os._exit(0)
+time.sleep(0.3)
+{tail}
+"""
+
+
+def _stop_survivor(pidfile: Path) -> None:
+    import signal
+
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+
+
+async def test_a_flood_that_ends_in_the_timeout_is_still_oversized(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4-S4: a survivor holding the pipe sends the overflow to the timeout path."""
+    monkeypatch.setattr(admission_module, "_REAP_GRACE_SECONDS", 1)
+    pidfile = tmp_path / "pid"
+    script = tmp_path / "flood.py"
+    script.write_text(
+        _SURVIVOR.format(
+            tail="sys.stdout.buffer.write(b'x' * (9 * 1024 * 1024)); sys.stdout.flush()"
+            "; time.sleep(60)"
+        )
+    )
+    try:
+        done = await admission_module._run_argv(
+            [sys.executable, str(script), str(pidfile)], tmp_path, 3
+        )
+    finally:
+        _stop_survivor(pidfile)
+    assert done.timed_out and done.output_overflow
+    check = CheckSpec(
+        check_id="flood",
+        role=CheckRole.PRESERVATION,
+        argv=("python3", "flood.py"),
+        assertions=(AssertionLink(assertion_id="flood.a", criterion_key="ac_x", locator="x"),),
+    )
+    status = admission_module._classify(
+        check, done, mutated=False, signature_seen=False, on_base=False
+    )
+    assert status == (CheckStatus.VIOLATED, "output_oversized")
+
+
+async def test_a_cancelled_script_check_does_not_wait_on_a_survivor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4-S2: cancelling (Ctrl-C, MCP cancel) is bounded like the timeout path."""
+    import asyncio
+
+    monkeypatch.setattr(admission_module, "_REAP_GRACE_SECONDS", 1)
+    pidfile = tmp_path / "pid"
+    script = tmp_path / "hold.py"
+    script.write_text(_SURVIVOR.format(tail="time.sleep(60)"))
+    task = asyncio.create_task(
+        admission_module._run_argv([sys.executable, str(script), str(pidfile)], tmp_path, 60)
+    )
+    try:
+        await asyncio.sleep(1.0)
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=8)
+    finally:
+        _stop_survivor(pidfile)
+    assert done == {task} and task.cancelled()

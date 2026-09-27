@@ -75,6 +75,9 @@ ADMISSION_TIMEOUT_SECONDS = 120
 _OUTPUT_TAIL_CHARS = 2000
 # Per stream of a script check; more is ``output_oversized`` (R3-S2).
 _SCRIPT_OUTPUT_LIMIT = 8 * 1024 * 1024
+# How long a killed check may take to release its pipes before the controller
+# stops waiting (a descendant that left the process group can hold them).
+_REAP_GRACE_SECONDS = 10
 
 
 class CheckStatus(StrEnum):
@@ -312,16 +315,28 @@ async def _run_argv(
         try:
             # A descendant that left the process group can keep the pipes open;
             # never let draining them outlive the command budget.
-            await asyncio.wait_for(drain(), timeout=10)
+            await asyncio.wait_for(drain(), timeout=_REAP_GRACE_SECONDS)
         except TimeoutError:
             process.kill()
             await process.wait()
+        # An overflow that ended in the timeout is still an overflow (R4-S4).
         return _Completed(
-            process.returncode, out.data, err.data, True, None, time.monotonic() - started
+            process.returncode,
+            out.data,
+            err.data,
+            True,
+            None,
+            time.monotonic() - started,
+            out.overflow or err.overflow,
         )
     except asyncio.CancelledError:
         _kill(process, posix)
-        await process.wait()
+        # Bounded like the timeout path: a descendant holding a pipe must not
+        # hang a cancelled run (R4-S2).
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_REAP_GRACE_SECONDS)
+        except TimeoutError:
+            process.kill()
         raise
     return _Completed(
         process.returncode,
