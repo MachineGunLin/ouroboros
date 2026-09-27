@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 import pytest
@@ -645,11 +646,13 @@ async def test_no_held_out_value_reaches_the_store(
     assert verdict.verdict == "fail"
     stored = [path for path in (tmp_path / "store").rglob("*") if path.is_file()]
     assert {path.parent.name for path in stored} >= {"packages", "receipts"}
+    # A standalone number only: not part of a hex digest, a longer number, or
+    # a timestamp's fraction.
     hits = [
         (str(path), token)
         for path in stored
         for token in (b"6173", b"4409")
-        if token in path.read_bytes()
+        if re.search(rb"(?<![0-9A-Za-z.])" + token + rb"(?![0-9A-Za-z])", path.read_bytes())
     ]
     assert hits == []
     (record,) = (tmp_path / "store" / "packages").iterdir()

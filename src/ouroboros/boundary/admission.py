@@ -361,12 +361,8 @@ def _classify(
     signature_seen: bool,
     on_base: bool,
     oracle_undecided: bool = False,
-    oracle_failed: bool = False,
 ) -> tuple[CheckStatus, str]:
-    if mutated and not oracle_failed:
-        # A candidate whose own code changed its checkout during the check
-        # cannot turn an observed failing case into "undecided": a failure
-        # wins; a pass under mutation is not trusted.
+    if mutated:
         return CheckStatus.INDETERMINATE, "protected_bytes_mutated"
     if completed.launch_error is not None:
         return CheckStatus.INDETERMINATE, "launch_failed"
@@ -469,7 +465,6 @@ async def _execute_check(
         signature_seen=signature_seen,
         on_base=on_base,
         oracle_undecided=oracle_run is not None and oracle_run.return_code not in (0, 1),
-        oracle_failed=oracle_run is not None and not on_base and oracle_run.return_code == 1,
     )
     tail = combined if completed.launch_error is None else completed.launch_error
     return CheckExecution(

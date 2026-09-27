@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -914,7 +915,16 @@ async def test_held_out_values_never_reach_the_boundary_store(
         "args": {"a": 3079, "b": 3083, "t": 0.5},
         "expect": {"kind": "returns", "value": 3081, "approx": 1e-9},
     }
-    secrets = (b"6173", b"4409", b"3079", b"3083", b"3081")
+    secrets = ("6173", "4409", "3079", "3083", "3081")
+
+    def found(token: str, data: bytes) -> bool:
+        # A standalone number: not part of a hex digest, a longer number, or
+        # a timestamp's fraction.
+        return (
+            re.search(rb"(?<![0-9A-Za-z.])" + token.encode() + rb"(?![0-9A-Za-z])", data)
+            is not None
+        )
+
     seed = _seed()
     constructor = _Constructor(seed, repo)
     constructor.outcome = ConstructionOutcome(
@@ -973,15 +983,17 @@ async def test_held_out_values_never_reach_the_boundary_store(
     assert any(path.parent.name == "packages" for path in stored)
     assert any(path.parent.name == "receipts" for path in stored)
     hits = [
-        (str(path), token.decode())
+        (str(path), token)
         for path in stored
         for token in secrets
-        if token in path.read_bytes()
+        if found(token, path.read_bytes())
     ]
     assert hits == []
     events = await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
     journal = json.dumps([event.data for event in events]).encode()
-    assert [token for token in secrets if token in journal] == []
+    assert [token for token in secrets if found(token, journal)] == []
+    # The matcher does find a value where it would be leaked.
+    assert found("4409", b'{"value": 4409}') and not found("4409", b"ab4409cd")
     # The record names the full package and keeps held-out cases as ids.
     (record_path,) = (tmp_path / "store" / "packages").iterdir()
     record = json.loads(record_path.read_text())
