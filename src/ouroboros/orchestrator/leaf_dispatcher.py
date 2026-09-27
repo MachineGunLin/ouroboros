@@ -18,6 +18,7 @@ partial message list must remain visible for teardown.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import errno
@@ -48,6 +49,7 @@ from ouroboros.orchestrator.evidence.claims import (
 )
 from ouroboros.orchestrator.evidence.command_replay import (
     replay_commands,
+    replay_unavailable_reason,
     select_replay_candidates,
 )
 from ouroboros.orchestrator.evidence.harness_observation import (
@@ -960,6 +962,11 @@ class LeafDispatcher:
         )
         if not candidates:
             return observation
+        skipped = await asyncio.to_thread(replay_unavailable_reason)
+        if skipped is not None:
+            # No network isolation: nothing is replayed, and the claims keep
+            # the transcript-only rules.
+            return replace(observation, replay_skipped=skipped)
         timeout_seconds = getattr(executor, "_verify_command_timeout_seconds", 600)
         runs = await replay_commands(
             candidates,

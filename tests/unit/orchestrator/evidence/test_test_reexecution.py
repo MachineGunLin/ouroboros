@@ -205,6 +205,11 @@ class TestSafeArgv:
         assert safe_test_invocation('FLAG="$(id)" pytest -q') is None
 
 
+# Replay refuses an absolute-path program outside the workspace, so the
+# interpreter is reached by name through PATH.
+PATH_WITH_PYTHON = f"{Path(sys.executable).parent}:/usr/bin:/bin"
+
+
 def _candidate(command: str, workspace: Path) -> ReplayCandidate:
     candidate = replay_candidate(command, str(workspace))
     assert candidate is not None, command
@@ -214,15 +219,14 @@ def _candidate(command: str, workspace: Path) -> ReplayCandidate:
 class TestReexecution:
     async def test_records_exit_status_and_output(self, tmp_path: Path) -> None:
         (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-        python = sys.executable
 
         runs = await replay_commands(
             (
-                _candidate(f"{python} -m pytest -q -p no:cacheprovider test_ok.py", tmp_path),
-                _candidate(f"{python} -m pytest -q -p no:cacheprovider test_absent.py", tmp_path),
+                _candidate("python -m pytest -q -p no:cacheprovider test_ok.py", tmp_path),
+                _candidate("python -m pytest -q -p no:cacheprovider test_absent.py", tmp_path),
             ),
             workspace=str(tmp_path),
-            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            env={"PATH": PATH_WITH_PYTHON},
             timeout_seconds=60,
         )
 
@@ -237,8 +241,7 @@ class TestReexecution:
             "import os\n\ndef test_env():\n    assert os.environ['REEXEC_FLAG'] == 'yes'\n",
             encoding="utf-8",
         )
-        python = sys.executable
-        command = f"REEXEC_FLAG=yes {python} -m pytest -q -p no:cacheprovider test_env.py"
+        command = "REEXEC_FLAG=yes python -m pytest -q -p no:cacheprovider test_env.py"
 
         selected = select_replay_candidates(
             final_message=json.dumps({"tests_passed": [command]}),
@@ -250,7 +253,7 @@ class TestReexecution:
         runs = await replay_commands(
             selected,
             workspace=str(tmp_path),
-            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            env={"PATH": PATH_WITH_PYTHON},
             timeout_seconds=60,
         )
 
@@ -259,8 +262,11 @@ class TestReexecution:
         assert runs[0].succeeded
 
     async def test_timeout_is_recorded_not_raised(self, tmp_path: Path) -> None:
+        script = tmp_path / "slow_tests.sh"
+        script.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        script.chmod(0o755)
         runs = await replay_commands(
-            (_candidate("sleep 5", tmp_path),),
+            (_candidate("./slow_tests.sh", tmp_path),),
             workspace=str(tmp_path),
             env={"PATH": "/usr/bin:/bin"},
             timeout_seconds=0.2,

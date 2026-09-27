@@ -21,8 +21,10 @@ from ouroboros.orchestrator.evidence.claims import (
 )
 from ouroboros.orchestrator.evidence.common import _normalized_evidence_text
 from ouroboros.orchestrator.evidence.harness_observation import (
+    CommandObservation,
     observation_from_message,
 )
+from ouroboros.orchestrator.evidence.replay_policy import run_may_back_test_claim
 from ouroboros.orchestrator.evidence.shell_parsing import (
     _has_trailing_output_filter_pipeline,
     _is_django_test_subcommand,
@@ -713,6 +715,23 @@ def _functional_command_has_authoritative_zero_exit(
     return False
 
 
+def _replayed_argv(run: CommandObservation) -> tuple[str, ...]:
+    """Return the argv a replayed run executed (parsed from its command if unset)."""
+    if run.argv:
+        return run.argv
+    try:
+        parts = shlex.split(run.command)
+    except ValueError:
+        return ()
+    leading_cd = _split_leading_cd(run.command)
+    if leading_cd is not None:
+        try:
+            parts = shlex.split(leading_cd[1])
+        except ValueError:
+            return ()
+    return tuple(_strip_env_prefix(parts))
+
+
 def _harness_reexecution_supports_test_claim(
     *,
     value: str,
@@ -751,6 +770,10 @@ def _harness_reexecution_supports_test_claim(
             if not run.succeeded or not _looks_like_test_command(run.command):
                 continue
             if not _text_proves_test_execution_success(run.output_tail):
+                continue
+            if not run_may_back_test_claim(_replayed_argv(run), claimed_file):
+                # An excluding option, or the claimed file named in the command
+                # without being executed (``--ignore tests/test_x.py``).
                 continue
             if _test_command_targets_claim(
                 command=run.command,
@@ -912,6 +935,8 @@ def _reexecuted_runner_label_covers(label: str, messages: tuple[AgentMessage, ..
             if not run.succeeded or not _looks_like_test_command(run.command):
                 continue
             if not _text_proves_test_execution_success(run.output_tail):
+                continue
+            if not run_may_back_test_claim(_replayed_argv(run), None):
                 continue
             if any(
                 label == run_label or label.startswith(run_label + ".")

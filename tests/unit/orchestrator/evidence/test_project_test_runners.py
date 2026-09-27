@@ -363,6 +363,11 @@ class TestDjangoDevRunRegression:
         )
 
 
+# Replay refuses an absolute-path program outside the workspace, so the
+# interpreter is reached by name through PATH.
+PATH_WITH_PYTHON = f"{Path(sys.executable).parent}:/usr/bin:/bin"
+
+
 class TestExecution:
     RUNNER = (
         "import os, sys\n"
@@ -378,14 +383,14 @@ class TestExecution:
 
     async def test_django_runner_runs_as_direct_argv(self, tmp_path: Path) -> None:
         workspace = self._workspace(tmp_path / "ws")
-        command = f"{sys.executable} tests/runtests.py migrations"
+        command = "python tests/runtests.py migrations"
         candidate = replay_candidate(command, str(workspace))
         assert candidate is not None
 
         runs = await replay_commands(
             (candidate,),
             workspace=str(workspace),
-            env={"PATH": "/usr/bin:/bin"},
+            env={"PATH": PATH_WITH_PYTHON},
             timeout_seconds=60,
         )
 
@@ -398,7 +403,7 @@ class TestExecution:
     async def test_cd_prefix_changes_only_the_working_directory(self, tmp_path: Path) -> None:
         workspace = self._workspace(tmp_path / "ws")
         marker = tmp_path / "marker"
-        command = f"cd tests && {sys.executable} runtests.py migrations"
+        command = "cd tests && python runtests.py migrations"
 
         selected = select_replay_candidates(
             final_message=json.dumps({"tests_passed": [command]}),
@@ -407,7 +412,7 @@ class TestExecution:
         )
         assert [candidate.core_command for candidate in selected] == [command]
         runs = await replay_commands(
-            selected, workspace=str(workspace), env={"PATH": "/usr/bin:/bin"}, timeout_seconds=60
+            selected, workspace=str(workspace), env={"PATH": PATH_WITH_PYTHON}, timeout_seconds=60
         )
 
         assert len(runs) == 1 and runs[0].succeeded

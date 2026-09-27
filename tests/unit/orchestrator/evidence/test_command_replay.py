@@ -23,6 +23,8 @@ from ouroboros.orchestrator.adapter import AgentMessage
 from ouroboros.orchestrator.evidence import command_replay
 from ouroboros.orchestrator.evidence.command_replay import (
     REPLAY_OUTPUT_FILTERS,
+    REPLAY_SKIPPED_NETWORK,
+    ReplayCandidate,
     claim_links_to_command,
     output_filter_core,
     replay_candidate,
@@ -35,6 +37,11 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     WorkspaceObservation,
     build_observation_message,
     insert_observation_message,
+)
+from ouroboros.orchestrator.evidence.replay_policy import (
+    VIEWER_PROGRAMS,
+    claim_target_operands,
+    replay_allowed,
 )
 from ouroboros.orchestrator.evidence.verification import (
     _verify_atomic_evidence_against_runtime_messages,
@@ -67,6 +74,18 @@ def _bash_call(command: str, call_id: str) -> AgentMessage:
         content=f"Bash: {command}",
         tool_name="Bash",
         data={"tool_input": {"command": command}, "tool_call_id": call_id},
+    )
+
+
+def _edit(path: Path, call_id: str) -> tuple[AgentMessage, ...]:
+    return (
+        AgentMessage(
+            type="tool",
+            content=f"Edit {path.name}",
+            tool_name="Edit",
+            data={"tool_input": {"file_path": str(path)}, "tool_call_id": call_id},
+        ),
+        _bash_result(call_id, exit_code=0),
     )
 
 
@@ -465,13 +484,127 @@ class TestFabricationNegativeControls:
         assert verdict.failure_class == "FABRICATION_SUSPECTED"
 
     async def test_run_that_exited_nonzero_is_rejected(self, tmp_path: Path) -> None:
+        # No exit recorded in the transcript: the replay decides, and fails.
         workspace = _workspace(tmp_path / "ws", correct=False)
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, _ran("make test", "c1"), _evidence("make test")
+        )
+
+        assert observation.command_runs[0].returncode != 0
+        assert verdict.passed is False
+
+    async def test_recorded_nonzero_exit_is_rejected_although_a_replay_would_pass(
+        self, tmp_path: Path
+    ) -> None:
+        # The transcript run exited 2; the final workspace passes. The run the
+        # claim reports failed, so it is not replayed and the claim is rejected.
+        workspace = _workspace(tmp_path / "ws")
 
         verdict, observation = await _dispatch_and_verify(
             workspace, _ran("make test", "c1", exit_code=2), _evidence("make test")
         )
 
-        assert observation.command_runs[0].returncode != 0
+        assert observation.command_runs == ()
+        assert verdict.passed is False
+
+    async def test_failed_tool_result_without_exit_code_is_not_replayed(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        transcript = (
+            _bash_call("/bin/zsh -lc 'make test'", "c1"),
+            _bash_result("c1", is_error=True),
+        )
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, transcript, _evidence("make test")
+        )
+
+        assert observation.command_runs == ()
+        assert verdict.passed is False
+
+    async def test_latest_failed_run_is_not_replaced_by_an_earlier_pass(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+
+        selected = select_replay_candidates(
+            final_message=json.dumps({"tests_passed": ["make test"]}),
+            messages=(*_ran("make test", "c1", exit_code=0), *_ran("make test", "c2", exit_code=1)),
+            task_cwd=str(workspace),
+        )
+
+        assert selected == ()
+
+    async def test_replay_exit_differing_from_the_recorded_exit_is_not_success(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        parsed = replay_candidate("make test", str(workspace))
+        assert parsed is not None
+        candidate = ReplayCandidate(
+            transcript_command=parsed.transcript_command,
+            core_command=parsed.core_command,
+            argv=parsed.argv,
+            transcript_returncode=2,
+        )
+
+        runs = await replay_commands(
+            (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
+        )
+
+        assert runs[0].returncode == 0 and runs[0].transcript_returncode == 2
+        assert not runs[0].succeeded
+        assert not command_replay.replayed_command_supports_claim(
+            "make test",
+            (build_observation_message(WorkspaceObservation(frozenset(), command_runs=runs)),),
+        )
+
+    async def test_recorded_zero_exit_with_failing_replay_is_not_success(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws", correct=False)
+        parsed = replay_candidate("make test", str(workspace))
+        assert parsed is not None
+        candidate = ReplayCandidate(
+            transcript_command=parsed.transcript_command,
+            core_command=parsed.core_command,
+            argv=parsed.argv,
+            transcript_returncode=0,
+        )
+
+        runs = await replay_commands(
+            (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
+        )
+
+        assert runs[0].returncode != 0 and not runs[0].succeeded
+        message = build_observation_message(WorkspaceObservation(frozenset(), command_runs=runs))
+        assert not command_replay.replayed_command_supports_claim("make test", (message,))
+
+    async def test_shorter_command_does_not_back_a_longer_claim(self, tmp_path: Path) -> None:
+        # Review R2 (a): the default target passes, ``make test`` fails, and
+        # the leaf only ran ``make``.
+        workspace = _workspace(tmp_path / "ws")
+        (workspace / "Makefile").write_text("build:\n\ttrue\ntest:\n\tfalse\n", encoding="utf-8")
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, _ran("make", "c1"), _evidence("make test")
+        )
+
+        assert all(run.command != "make test" for run in observation.command_runs)
+        assert verdict.passed is False
+
+    async def test_unrelated_command_inside_a_claim_does_not_back_it(self, tmp_path: Path) -> None:
+        # Review R2 (b).
+        workspace = _workspace(tmp_path / "ws")
+        claim = "python -m pytest tests/test_bad.py passed, checked with ls"
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, _ran("ls", "c1"), _evidence("ls", [claim])
+        )
+
+        assert observation.command_runs == ()
         assert verdict.passed is False
 
     async def test_unlinked_passing_run_does_not_back_another_claim(self, tmp_path: Path) -> None:
@@ -520,13 +653,16 @@ class TestClaimLinkage:
         [
             ("make test", "make test"),
             ("make   test", "make test"),
-            ("Ran `make test`: 12 passed", "make test"),
+            ("make test (12 passed)", "make test"),
+            ("pytest -q (3 passed in 0.1s)", "pytest -q | tail -5"),
             ("pytest -q | tail -5", "pytest -q | tail -5"),
             ("pytest -q", "pytest -q | tail -5"),
             ("migrations (578 tests)", "python tests/runtests.py migrations"),
             (DJANGO_WRITER_CLAIM, DJANGO_WRITER),
             (DJANGO_WRITER, DJANGO_WRITER),
             ("`tests/test_calc.py`", "pytest -q tests/test_calc.py"),
+            ("tests/test_calc.py", "python -m pytest -q -p no:cacheprovider tests/test_calc.py"),
+            ("tests/test_calc.py (4 tests)", "timeout 60 python -m pytest tests/test_calc.py"),
         ],
     )
     def test_linked(self, claim: str, command: str) -> None:
@@ -544,6 +680,31 @@ class TestClaimLinkage:
             ("pytest", "pytest -q"),
             ("-q", "pytest -q"),
             ("", "make test"),
+            # Containment is not linkage (review R2).
+            ("Ran `make test`: 12 passed", "make test"),
+            ("make test", "make"),
+            ("python -m pytest tests/test_bad.py passed, checked with ls", "ls"),
+            ("./run_tests.sh --integration", "./run_tests.sh"),
+            ("cargo build && cargo test", "cargo build"),
+            ("make test (12 passed) (and lint)", "make test"),
+            # A target is linked only as an executed operand (review R1, R9).
+            ("tests/test_bad.py", "sed -n 1,40p tests/test_bad.py"),
+            ("tests/test_a.py", "cat tests/test_a.py"),
+            ("tests/test_a.py", "git log -- tests/test_a.py"),
+            ("tests/test_a.py", "head -40 tests/test_a.py"),
+            ("tests/test_bad.py", "python -m pytest -q --ignore tests/test_bad.py"),
+            ("tests/test_bad.py", "python -m pytest -q --ignore=tests/test_bad.py tests"),
+            ("tests/test_bad.py", "pytest --deselect tests/test_bad.py::test_x tests/test_bad.py"),
+            ("tests/test_bad.py", 'pytest -k "not slow" tests/test_bad.py'),
+            ("tests/test_bad.py", "pytest -m smoke tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --rootdir tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --some-plugin-option tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --collect-only tests/test_bad.py"),
+            ("tests/test_bad.py", "./run_tests.sh tests/test_bad.py"),
+            ("tests/test_bad.py", "make tests/test_bad.py"),
+            ("pytest", "python -m pytest -q tests/test_calc.py"),
+            ("migrations", "python tests/runtests.py --exclude-tag slow migrations"),
+            ("migrations", "python tests/runtests.py --start-after migrations.a migrations"),
         ],
     )
     def test_not_linked(self, claim: str, command: str) -> None:
@@ -580,10 +741,12 @@ class TestDevRunStrings:
 
 
 class TestIsolationRecord:
-    async def test_network_isolation_is_recorded(
+    async def test_no_replay_without_network_isolation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         workspace = _workspace(tmp_path / "ws")
+        marker = workspace / "ran"
+        _executable(workspace / "run_tests.sh", "#!/bin/sh\ntouch ran\n")
         candidate = replay_candidate("./run_tests.sh", str(workspace))
         assert candidate is not None
         monkeypatch.setattr(command_replay, "network_isolation_prefix", lambda: None)
@@ -592,16 +755,58 @@ class TestIsolationRecord:
             (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
         )
 
-        assert runs[0].succeeded and runs[0].network_isolated is False
-        message = build_observation_message(
-            WorkspaceObservation(changed_paths=frozenset(), command_runs=runs)
+        assert runs == ()
+        assert command_replay.replay_unavailable_reason() == REPLAY_SKIPPED_NETWORK
+        assert not marker.exists()
+
+    async def test_skip_is_recorded_and_claims_keep_transcript_rules(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        monkeypatch.setattr(command_replay, "network_isolation_prefix", lambda: None)
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, _ran("make test", "c1"), _evidence("make test")
         )
-        assert "network not isolated" in message.content
+
+        assert observation.command_runs == ()
+        assert observation.replay_skipped == "network_isolation_unavailable"
+        message = build_observation_message(observation)
+        assert "replay skipped: network_isolation_unavailable" in message.content
+        # "make test" passes here, but only a replay could have backed it.
+        assert verdict.passed is False
+
+    @pytest.mark.parametrize(
+        ("interfaces", "offline"),
+        [
+            ([(1, "lo")], True),
+            ([(1, "lo"), (2, "eth0")], False),
+            ([], False),
+        ],
+    )
+    def test_linux_process_with_only_loopback_counts_as_isolated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        real_replay_isolation: None,
+        interfaces: list[tuple[int, str]],
+        offline: bool,
+    ) -> None:
+        monkeypatch.setattr(command_replay.socket, "if_nameindex", lambda: interfaces)
+        monkeypatch.setattr(command_replay.sys, "platform", "linux")
+        monkeypatch.setattr(command_replay.shutil, "which", lambda _name: None)
+
+        probe = command_replay.network_isolation_prefix.__wrapped__  # type: ignore[attr-defined]
+
+        assert command_replay._process_has_only_loopback() is offline
+        assert probe() == (() if offline else None)
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS only")
-    async def test_macos_replay_has_no_network(self, tmp_path: Path) -> None:
+    async def test_macos_replay_has_no_network(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_replay_isolation: None
+    ) -> None:
         if command_replay.network_isolation_prefix() is None:
             pytest.skip("sandbox-exec unavailable in this process")
+        monkeypatch.setenv("PATH", os.pathsep.join([PYTHON_BIN, "/usr/bin", "/bin"]))
         workspace = _workspace(tmp_path / "ws")
         probe = (
             "import socket, sys\n"
@@ -612,7 +817,7 @@ class TestIsolationRecord:
             "sys.exit(1)\n"
         )
         (workspace / "probe.py").write_text(probe, encoding="utf-8")
-        candidate = replay_candidate(f"{sys.executable} probe.py", str(workspace))
+        candidate = replay_candidate("python probe.py", str(workspace))
         assert candidate is not None
 
         runs = await replay_commands(
@@ -624,3 +829,333 @@ class TestIsolationRecord:
     def test_default_observation_fields_keep_old_constructors_valid(self) -> None:
         run = CommandObservation(command="pytest", returncode=0, output_tail="1 passed")
         assert run.succeeded and not run.mutated and run.argv == ()
+
+
+PYTEST_WORKSPACE_TESTS = {
+    "test_good.py": "def test_good():\n    assert True\n",
+    "test_bad.py": "def test_bad():\n    assert False\n",
+}
+
+
+class TestTargetLinkageEndToEnd:
+    """Review R1: a command that names a target without executing it backs nothing."""
+
+    @pytest.fixture(autouse=True)
+    def _path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PATH", os.pathsep.join([PYTHON_BIN, "/usr/bin", "/bin"]))
+
+    def _pytest_workspace(self, root: Path) -> Path:
+        workspace = _workspace(root)
+        for name, body in PYTEST_WORKSPACE_TESTS.items():
+            (workspace / "tests" / name).write_text(body, encoding="utf-8")
+        return workspace
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sed -n 1,40p tests/test_bad.py",
+            "cat tests/test_bad.py",
+            "git log -- tests/test_bad.py",
+            "python -m pytest -q -p no:cacheprovider --ignore tests/test_bad.py",
+            "python -m pytest -q -p no:cacheprovider --deselect tests/test_bad.py::test_bad "
+            "tests/test_bad.py",
+        ],
+    )
+    async def test_non_executing_or_excluding_command_does_not_back_the_target(
+        self, tmp_path: Path, command: str
+    ) -> None:
+        workspace = self._pytest_workspace(tmp_path / "ws")
+        transcript = (
+            *_edit(workspace / "tests" / "test_bad.py", "e2"),
+            *_ran(command, "c1", exit_code=0),
+        )
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, transcript, _evidence(command, ["tests/test_bad.py"])
+        )
+
+        assert verdict.passed is False
+        assert all(run.command == command for run in observation.command_runs)
+
+    async def test_executing_runner_backs_its_passing_target(self, tmp_path: Path) -> None:
+        workspace = self._pytest_workspace(tmp_path / "ws")
+        command = "python -m pytest -q -p no:cacheprovider tests/test_good.py"
+        transcript = (
+            *_edit(workspace / "tests" / "test_good.py", "e2"),
+            *_ran(command, "c1"),
+        )
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, transcript, _evidence(command, ["tests/test_good.py"])
+        )
+
+        assert verdict.passed is True, verdict.reasons
+        assert observation.command_runs[0].succeeded
+
+    def test_viewer_set_is_explicit(self) -> None:
+        assert {"cat", "sed", "head", "tail", "less", "grep", "rg", "awk", "wc", "ls"} <= (
+            VIEWER_PROGRAMS
+        )
+        assert {"find", "stat", "file", "diff", "git"} <= VIEWER_PROGRAMS
+        for viewer in ("sed -n 1,40p tests/x.py", "cat tests/x.py", "git show HEAD:tests/x.py"):
+            assert claim_target_operands(viewer.split()) == frozenset()
+
+
+class TestAllowlist:
+    """Review R4 and R5: only allowlisted programs are replayed."""
+
+    @pytest.fixture(autouse=True)
+    def _project(self, tmp_path: Path) -> None:
+        self.workspace = _workspace(tmp_path / "ws")
+        (self.workspace / "bin").mkdir()
+        _executable(self.workspace / "bin" / "test", "#!/bin/sh\n")
+        _executable(self.workspace / "gradlew", "#!/bin/sh\n")
+        (self.workspace / "manage.py").write_text("", encoding="utf-8")
+
+    def _allowed(self, command: str) -> bool:
+        candidate = replay_candidate(command, str(self.workspace))
+        return candidate is not None and command_replay.replay_admissible(
+            candidate, str(self.workspace)
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "make test",
+            "make",
+            "make -j4 check",
+            "npm test",
+            "npm run test",
+            "pnpm test",
+            "yarn test",
+            "bun test",
+            "./run_tests.sh",
+            "./run_tests.sh --integration",
+            "bash run_tests.sh",
+            "tests/runtests.py migrations",
+            "python tests/runtests.py migrations",
+            "python -m pytest -q",
+            "python3 -u -m pytest -q",
+            "python -m unittest -v",
+            "python -m django test app",
+            "python manage.py test app",
+            "pytest -q tests/test_calc.py",
+            "tox -e py311",
+            "nox -s tests",
+            "go test ./...",
+            "cargo test",
+            "cargo +nightly test",
+            "mvn -q test",
+            "./gradlew test",
+            "gradle check",
+            "dotnet test",
+            "rspec",
+            "bundle exec rspec",
+            "uv run pytest -q",
+            "uv run --with pytest-xdist python -m pytest -q",
+            "poetry run pytest",
+            "npx jest",
+            "bin/test",
+            "timeout 60 make test",
+            "timeout -s TERM 5 make test",
+            "stdbuf -o L make test",
+            "stdbuf -oL make test",
+            "time -o /dev/null make test",
+            "nice -n 5 pytest",
+            "FOO=1 make test",
+        ],
+    )
+    def test_admitted(self, command: str) -> None:
+        assert self._allowed(command), command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Review R4: wrapper options that take a separate value.
+            "timeout -s TERM 5 rm -rf x",
+            "stdbuf -o L rm -rf x",
+            "time -o /dev/null rm -rf x",
+            "time -f %e rm -rf x",
+            "env -u X rm x",
+            "timeout -s TERM make test --unknown-wrapper-form",
+            "timeout --bogus 5 make test",
+            "nice -Z make test",
+            "xargs pytest",
+            "watch make test",
+            # Review R5: not on the allowlist, or an install/deploy/publish form.
+            "make install",
+            "make install-deps",
+            "make deploy",
+            "make -n test",
+            "make -C .. test",
+            "npm install",
+            "npm run deploy",
+            "npm exec -- rimraf x",
+            "npx rimraf x",
+            "uv run pip install x",
+            "uv run --directory /tmp pytest",
+            "poetry run pip install x",
+            "pipenv install x",
+            "pdm add x",
+            "bun install",
+            "pip3.11 install x",
+            "mvn install",
+            "gradle publish",
+            "cargo install x",
+            "go get x",
+            "find . -delete",
+            "busybox rm x",
+            "truncate -s0 calc.py",
+            "mv calc.py /tmp/x",
+            "chmod -R 000 .",
+            "twine upload dist/a.whl",
+            "gh repo delete x --yes",
+            "git diff --stat",
+            "ls",
+            "sed -n 1,40p calc.py",
+            "python3 -c 'print(1)'",
+            "python",
+            "python tests/absent.py",
+            "sh",
+            # ``env`` is peeled into an environment delta before the argv, so
+            # an ``env`` option is left as the program.
+            "env -u HOME make test",
+            "pytest --collect-only",
+            "pytest --basetemp=/tmp/elsewhere",
+            f"{sys.executable} -m pytest",
+            "/bin/sh run_tests.sh",
+            "./absent.sh",
+        ],
+    )
+    def test_refused(self, command: str) -> None:
+        assert not self._allowed(command), command
+
+    def test_absolute_workspace_program_is_admitted(self) -> None:
+        script = self.workspace.resolve() / "run_tests.sh"
+        assert replay_allowed((str(script),), workspace=str(self.workspace))
+
+    async def test_refused_command_is_never_run(self, tmp_path: Path) -> None:
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        command = f"timeout -s TERM 5 rm -f {victim}"
+        candidate = replay_candidate(command, str(self.workspace))
+        assert candidate is not None
+
+        runs = await replay_commands(
+            (candidate,), workspace=str(self.workspace), env=dict(os.environ), timeout_seconds=30
+        )
+
+        assert runs == ()
+        assert victim.read_text(encoding="utf-8") == "keep"
+
+
+class TestLinkedLiveTrees:
+    """Review R3: live trees the copy links to are protected."""
+
+    async def _run(self, workspace: Path, script: str) -> CommandObservation:
+        _executable(workspace / "run_tests.sh", script)
+        candidate = replay_candidate("./run_tests.sh", str(workspace))
+        assert candidate is not None
+        runs = await replay_commands(
+            (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
+        )
+        assert len(runs) == 1
+        return runs[0]
+
+    def _venv(self, workspace: Path) -> Path:
+        venv = workspace / ".venv"
+        (venv / "lib").mkdir(parents=True)
+        (venv / "marker.txt").write_text("live", encoding="utf-8")
+        return venv
+
+    async def test_deleting_a_file_under_a_linked_directory_is_detected(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        self._venv(workspace)
+
+        run = await self._run(workspace, "#!/bin/sh\nfind .venv/ -name marker.txt -delete\n")
+
+        assert run.returncode == 0 and run.mutated and not run.succeeded
+
+    async def test_creating_a_file_under_a_linked_directory_is_detected(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        venv = self._venv(workspace)
+
+        run = await self._run(workspace, "#!/bin/sh\ntouch .venv/new_from_replay\n")
+
+        assert run.mutated and not run.succeeded
+        assert (venv / "new_from_replay").exists()
+
+    async def test_writing_through_an_absolute_symlink_is_detected(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        outside = tmp_path / "shared"
+        outside.mkdir()
+        (outside / "data.txt").write_text("live", encoding="utf-8")
+        (workspace / "shared").symlink_to(outside)
+
+        run = await self._run(workspace, "#!/bin/sh\necho x >> shared/data.txt\n")
+
+        assert run.mutated and not run.succeeded
+
+    async def test_reading_linked_trees_is_not_mutation(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        venv = self._venv(workspace)
+        (venv / "lib" / "livemod.py").write_text("VALUE = 5\n", encoding="utf-8")
+        script = (
+            "#!/bin/sh\n"
+            f'{sys.executable} -c \'import sys; sys.path.insert(0, ".venv/lib"); '
+            "import livemod; assert livemod.VALUE == 5'\n"
+            "cat .venv/marker.txt\n"
+        )
+
+        run = await self._run(workspace, script)
+
+        assert run.succeeded, run.output_tail
+        # PYTHONDONTWRITEBYTECODE keeps imports from writing into the live tree.
+        assert not (venv / "lib" / "__pycache__").exists()
+
+    async def test_linked_tree_over_the_fingerprint_budget_is_not_replayed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        venv = self._venv(workspace)
+        for index in range(5):
+            (venv / f"f{index}").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(command_replay, "MAX_PROTECTED_LINK_ENTRIES", 3)
+        candidate = replay_candidate("./run_tests.sh", str(workspace))
+        assert candidate is not None
+
+        runs = await replay_commands(
+            (candidate,), workspace=str(workspace), env=dict(os.environ), timeout_seconds=30
+        )
+
+        assert runs == ()
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS only")
+    async def test_macos_sandbox_denies_writes_to_linked_trees_and_the_workspace(
+        self, tmp_path: Path, real_replay_isolation: None
+    ) -> None:
+        if command_replay.network_isolation_prefix() is None:
+            pytest.skip("sandbox-exec unavailable in this process")
+        workspace = _workspace(tmp_path / "ws")
+        venv = self._venv(workspace)
+        live_calc = workspace.resolve() / "calc.py"
+        original = live_calc.read_bytes()
+
+        run = await self._run(
+            workspace,
+            "#!/bin/sh\n"
+            "find .venv/ -name marker.txt -delete\n"
+            "touch .venv/new_from_replay\n"
+            f"echo '# live' >> {live_calc}\n"
+            "echo copy-ok > copy_write.txt\n"
+            "exit 0\n",
+        )
+
+        assert (venv / "marker.txt").read_text(encoding="utf-8") == "live"
+        assert not (venv / "new_from_replay").exists()
+        assert live_calc.read_bytes() == original
+        assert run.network_isolated

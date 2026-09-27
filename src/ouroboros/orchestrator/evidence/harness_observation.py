@@ -88,8 +88,11 @@ class CommandObservation:
     in front of the filters); ``transcript_command`` is the command as the
     transcript recorded it and ``argv`` the argv that ran, before workspace
     paths were pointed at the replay copy. ``mutated`` means the run changed
-    or deleted a pre-existing file, which is never success.
-    ``network_isolated`` records whether network access was denied.
+    or deleted a pre-existing file, or changed a live path the copy links to,
+    which is never success. ``network_isolated`` records whether network
+    access was denied. ``transcript_returncode`` is the exit status the
+    transcript recorded for the original run, when it recorded one; a replay
+    whose exit differs from it is never success.
     """
 
     command: str
@@ -100,10 +103,16 @@ class CommandObservation:
     argv: tuple[str, ...] = ()
     mutated: bool = False
     network_isolated: bool = False
+    transcript_returncode: int | None = None
 
     @property
     def succeeded(self) -> bool:
-        return self.returncode == 0 and not self.timed_out and not self.mutated
+        return (
+            self.returncode == 0
+            and not self.timed_out
+            and not self.mutated
+            and self.transcript_returncode in (None, self.returncode)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,12 +123,15 @@ class WorkspaceObservation:
     between the pre- and post-leaf snapshots; ``deleted_paths`` are paths the
     complete post-snapshot no longer contains. ``command_runs`` are commands
     the harness replayed in a copy of the workspace, with their real exit status.
+    ``replay_skipped`` names why replay did not run although a claim needed it
+    (``network_isolation_unavailable``), or is None.
     """
 
     changed_paths: frozenset[str]
     truncated: bool = False
     command_runs: tuple[CommandObservation, ...] = ()
     deleted_paths: frozenset[str] = frozenset()
+    replay_skipped: str | None = None
 
     def supports_file_claim(self, claim: str) -> bool:
         """Return True when the claimed workspace-relative path changed."""
@@ -238,6 +250,8 @@ def build_observation_message(observation: WorkspaceObservation) -> AgentMessage
     runs_note = f"; replayed {runs} transcript command(s)" if runs else ""
     if any(not run.network_isolated for run in observation.command_runs):
         runs_note += " (network not isolated)"
+    if observation.replay_skipped is not None:
+        runs_note += f"; replay skipped: {observation.replay_skipped}"
     return AgentMessage(
         type=HARNESS_OBSERVATION_MESSAGE_TYPE,
         content=f"Harness observed {count} changed workspace file(s){suffix}{runs_note}",
