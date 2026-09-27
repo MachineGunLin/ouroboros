@@ -1238,3 +1238,6 @@ async def test_a_legacy_rejection_of_a_legacy_decided_criterion_drives_the_retry
     assert "### Check package counterexample" not in retry
     assert "LEGACY_DECIDED:EVIDENCE_FORM_MISMATCH" in retry
     assert authority.gate.log == []  # no package verification ran for it
+    # A settlement path handing the same attempt to the gate again is not recounted.
+    again = await authority.gate(seed=seed, ac_index=2, result=_legacy_rejected(2))
+    assert again.success is False and authority.gate.legacy_failures == 1

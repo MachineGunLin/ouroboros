@@ -397,7 +397,12 @@ class CheckPackageGate:
             decided = await self._decide(ac_index, result)
             if decided is result:
                 self._decided[attempt] = None
-            elif getattr(decided, "check_package_repair", None):
+            elif getattr(decided, "check_package_repair", None) or str(
+                getattr(decided, "check_package_failure_class", None) or ""
+            ).startswith(LEGACY_DECIDED_FAILURE_CLASS_PREFIX):
+                if not getattr(decided, "check_package_repair", None):
+                    # A legacy-decided rejection, counted once per attempt.
+                    self.legacy_failures += 1
                 self._decided[attempt] = {
                     "success": False,
                     "outcome": decided.outcome,
@@ -426,10 +431,7 @@ class CheckPackageGate:
             # every check excluded at admission): the legacy verifier decides
             # it, so its rejection fails the attempt and drives the retry,
             # exactly as with the check package off.
-            decided = self._legacy_decides(result)
-            if decided is not result:
-                self.legacy_failures += 1
-            return decided
+            return self._legacy_decides(result)
         entries = authority.remember_declaration(key, _declared_from(result))
         options = authority.run_options()
         assignments, results = await assign_tiers(

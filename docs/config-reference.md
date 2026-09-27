@@ -462,7 +462,7 @@ boundary:
 | `check_package` | `"on"` \| `"off"` \| unset | unset | `on` or `off` fixes the behavior for every run. Unset uses this installation's randomized arm, which is `off` when telemetry is disabled (see [TELEMETRY.md](../TELEMETRY.md#randomized-defaults)). `--check-package/--no-check-package` and `OUROBOROS_CHECK_PACKAGE` take precedence, in that order. A bare YAML `on`/`off` is accepted. |
 | `constructor_timeout_seconds` | `int` (30..3600) | `600` | Wall-clock budget of one constructor call. |
 | `check_timeout_seconds` | `int` (5..1800) | `120` | Per-check timeout during admission and verification. |
-| `max_construction_attempts` | `int` (1..5) | `2` | Package versions tried before the worker starts; a version that is not admitted is superseded by the next. |
+| `max_construction_attempts` | `int` (1..5) | `2` | Package versions tried before the worker starts; a version that is not admitted is superseded by the next. The one replacement call for criteria left without an admitted check adds a version outside this budget. |
 
 Checks are model-written Python scripts. They run on throwaway copies of the
 project, with the project's virtualenv interpreter when one is found (else

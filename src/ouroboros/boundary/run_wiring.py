@@ -111,6 +111,7 @@ from ouroboros.boundary.package import (
     write_commitment_salt,
     write_package_record,
 )
+from ouroboros.boundary.per_check import criteria_without_admitted_check, excluded_check_ids
 from ouroboros.boundary.reference_check import (
     REFERENCE_LEFT_NO_CHECKS,
     ReferenceCheck,
@@ -899,7 +900,13 @@ async def verify_check_package(
         counterexamples=_counterexamples(verification) if verification is not None else (),
         selection=decision,
         receipt_path=receipt,
-        uncovered=tuple(item.criterion_key for item in package.uncovered),
+        uncovered=(
+            *(item.criterion_key for item in package.uncovered),
+            # Criteria that lost every admitted check to per-check admission.
+            *criteria_without_admitted_check(
+                package, excluded_check_ids(state.admission.check_tiers)
+            ),
+        ),
         criteria={key: item.status for key, item in verdicts.items()},
         verdicts=verdicts,
         artifact_verdict=overall,

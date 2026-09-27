@@ -226,6 +226,8 @@ async def test_each_exclusion_reason_excludes_only_its_check(
         (PackageCriterionStatus.UNCOVERED, f"uncovered:{REPRO_PASSES_ON_BASE}"),
         (PackageCriterionStatus.UNCOVERED, f"uncovered:{PRESERVATION_FAILS_ON_BASE}"),
     ]
+    # The CLI's "Criteria without a check" line counts them too.
+    assert set(verdict.uncovered) == {keys[1], keys[2]}
     # The excluded checks never ran on the candidate.
     ran = {
         check["check_id"]
