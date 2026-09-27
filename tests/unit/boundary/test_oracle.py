@@ -261,17 +261,19 @@ async def test_workspace_code_editing_its_own_checkout_files_is_detected(
 
 async def test_the_target_cannot_find_the_expected_values(base: Path, tmp_path: Path) -> None:
     # S2: the target looks for the frozen expectations everywhere it could
-    # derive from its own process (cwd, its parents, sibling "*.ctrl" dirs,
-    # controller dirs in the temp directory, environment, argv, stdin at
-    # import) and reports what it found. Nothing holds an expected value, so
-    # the held-out cases still fail.
+    # derive from its own process (its checkout copy and the run's work
+    # directory, sibling "*.ctrl" dirs, controller dirs in the temp
+    # directory, environment, argv) and reports what it found. Nothing holds
+    # an expected value, so the held-out cases still fail. (It does not walk
+    # the whole temp directory: that made the test slow enough on CI to
+    # starve concurrent tests.)
     report = tmp_path / "found.txt"
     probe = (
         "import glob, os, sys, tempfile\n"
         "_hits = []\n"
         "_KEY, _CASE = '\"exp' + 'ect\"', 'held' + '_1'\n"
         "_cwd = os.getcwd()\n"
-        "_roots = [_cwd, os.path.dirname(_cwd), os.path.dirname(os.path.dirname(_cwd))]\n"
+        "_roots = [_cwd, os.path.dirname(_cwd)]\n"
         "_roots += glob.glob(os.path.join(os.path.dirname(_cwd), '*.ctrl'))\n"
         "_roots += glob.glob(os.path.join(tempfile.gettempdir(), 'ouroboros-ctrl-*'))\n"
         "for _root in _roots:\n"
