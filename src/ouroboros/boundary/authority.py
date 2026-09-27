@@ -136,6 +136,28 @@ def _declared_from(result: Any) -> list[Any]:
     return []
 
 
+def legacy_verdict_in_tree(result: Any) -> tuple[bool, str | None, str | None]:
+    """``(rejected, failure_class, rejection_text)`` over a result and its sub-results.
+
+    A decomposed root is assembled from its sub-ACs' successes; with the gate
+    installed a sub-AC's legacy rejection is advisory and stays on that
+    sub-result, not on the root. The legacy verdict of the root is therefore
+    the whole tree's: rejected when the legacy verifier rejected the root or
+    any sub-AC.
+    """
+    verdict = getattr(result, "atomic_verifier_verdict", None)
+    text = getattr(result, "legacy_rejection", None) or None
+    if verdict is not None and not bool(getattr(verdict, "passed", True)):
+        return True, getattr(verdict, "failure_class", None), text
+    if text:
+        return True, None, text
+    for sub in getattr(result, "sub_results", ()) or ():
+        rejected, failure_class, sub_text = legacy_verdict_in_tree(sub)
+        if rejected:
+            return True, failure_class, sub_text
+    return False, None, None
+
+
 def existing_outcomes_from_results(
     parallel_result: Any, *, gated: bool = False
 ) -> dict[int, ExistingOutcome]:
@@ -158,12 +180,10 @@ def existing_outcomes_from_results(
         base = getattr(getattr(result, "outcome", None), "value", None)
         if not isinstance(base, str):
             base = "succeeded" if getattr(result, "success", False) else "failed"
-        verdict = getattr(result, "atomic_verifier_verdict", None)
-        verdict_rejected = verdict is not None and not bool(getattr(verdict, "passed", True))
-        failure_class = getattr(verdict, "failure_class", None) if verdict_rejected else None
         # The executor keeps the rejection it made advisory (typed evidence or
-        # transcript verifier) on the result.
-        legacy_rejected = verdict_rejected or bool(getattr(result, "legacy_rejection", None))
+        # transcript verifier) on the result, or on a sub-AC's result for a
+        # decomposed root.
+        legacy_rejected, failure_class, _text = legacy_verdict_in_tree(result)
         if gated:
             judged = bool(getattr(result, "success", False)) or bool(
                 getattr(result, "check_package_failure_class", None)
@@ -274,7 +294,7 @@ def apply_legacy_fallback(parallel_result: Any, legacy: Mapping[int, ExistingOut
             success_delta += 1
             failure_delta -= 1
         elif not item.passed and (previous in accepted_outcomes or gate_failed):
-            error = getattr(result, "legacy_rejection", None) or (
+            error = legacy_verdict_in_tree(result)[2] or (
                 f"{LEGACY_REJECTION_ERROR} ({item.failure_class})"
                 if item.failure_class
                 else LEGACY_REJECTION_ERROR
@@ -642,7 +662,18 @@ class CheckPackageAuthority:
         error: str | None = None,
         verdict: BoundaryVerdict | None = None,
     ) -> Any:
-        """Decide the run with the legacy verdicts the gate made advisory (never raises)."""
+        """Decide the run with the legacy verdicts the gate made advisory (never raises).
+
+        The outcome and the ledger event are written only after the legacy
+        verdicts were applied. If applying them fails, no verifier decided the
+        run, so every attempted root is failed (``<reason>:fallback_failed``).
+        """
+        try:
+            decided = apply_legacy_fallback(parallel_result, legacy)
+        except Exception:  # noqa: BLE001 - never raise into the run
+            log.warning("boundary.authority.fallback_failed", reason=reason)
+            reason = f"{reason}:fallback_failed"
+            decided = _fail_attempted(parallel_result, legacy)
         self.outcome = AuthorityOutcome(
             legacy_accepted, verdict=verdict, error=error, legacy=legacy, fallback_reason=reason
         )
@@ -657,11 +688,39 @@ class CheckPackageAuthority:
             )
         except Exception:  # noqa: BLE001 - the fallback itself must stand
             log.warning("boundary.authority.fallback_not_recorded", reason=reason)
-        try:
-            return apply_legacy_fallback(parallel_result, legacy)
-        except Exception:  # noqa: BLE001 - never raise into the run
-            log.warning("boundary.authority.fallback_failed", reason=reason)
-            return parallel_result
+        return decided
+
+
+def _fail_attempted(parallel_result: Any, legacy: Mapping[int, ExistingOutcome]) -> Any:
+    """Every attempted root failed: the run was decided by no verifier."""
+    try:
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+        results = tuple(
+            replace(
+                result,
+                success=False,
+                outcome=ACExecutionOutcome.FAILED,
+                error=PACKAGE_INDETERMINATE_ERROR,
+            )
+            if result.ac_index in legacy
+            and legacy[result.ac_index].terminal_status != "not_attempted"
+            else result
+            for result in parallel_result.results
+        )
+        failed = sum(1 for result in results if result.outcome is ACExecutionOutcome.FAILED)
+        return replace(
+            parallel_result,
+            results=results,
+            success_count=sum(1 for r in results if r.outcome is ACExecutionOutcome.SUCCEEDED),
+            failure_count=failed,
+            externally_satisfied_count=sum(
+                1 for r in results if r.outcome is ACExecutionOutcome.SATISFIED_EXTERNALLY
+            ),
+        )
+    except Exception:  # noqa: BLE001 - never raise into the run
+        log.warning("boundary.authority.fail_attempted_failed")
+        return parallel_result
 
 
 __all__ = [
@@ -674,4 +733,5 @@ __all__ = [
     "apply_legacy_fallback",
     "apply_reconciliation",
     "existing_outcomes_from_results",
+    "legacy_verdict_in_tree",
 ]

@@ -759,3 +759,134 @@ async def test_a_rejected_declaration_gets_a_repair_message_with_its_reason(
         seed=seed, ac_index=1, result=replace(_legacy_rejected(1, entry=MIX_ENTRY), retry_attempt=1)
     )
     assert fixed.success is True
+
+
+def _decomposed_root(index: int, *, via: str) -> ACExecutionResult:
+    """A decomposed root whose second sub-AC the legacy verifier rejected (gate on)."""
+    sub_ok = ACExecutionResult(
+        ac_index=index, ac_content="sub a", success=True, outcome=ACExecutionOutcome.SUCCEEDED
+    )
+    if via == "verdict":
+        sub_rejected = replace(_legacy_rejected(index), ac_content="sub b")
+    else:
+        sub_rejected = ACExecutionResult(
+            ac_index=index,
+            ac_content="sub b",
+            success=True,
+            outcome=ACExecutionOutcome.SUCCEEDED,
+            legacy_rejection="evidence form mismatch",
+        )
+    return ACExecutionResult(
+        ac_index=index,
+        ac_content=f"criterion {index}",
+        success=True,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        is_decomposed=True,
+        sub_results=(sub_ok, sub_rejected),
+    )
+
+
+@pytest.mark.parametrize("via", ["verdict", "annotation"])
+async def test_the_fallback_uses_the_legacy_verdicts_of_sub_acs(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
+) -> None:
+    # R2-A1: a decomposed root carries no legacy rejection itself; its sub-AC
+    # does. When the authority fails, the legacy verdict tree decides, so the
+    # root fails and the run does not exit 0.
+    seed, authority = await _authority(store, repo, tmp_path)
+    authority.install(_executor(repo))
+
+    async def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("ouroboros.boundary.authority.verify_check_package", broken)
+    results = (
+        _decomposed_root(0, via=via),
+        ACExecutionResult(ac_index=1, ac_content="c1", success=True),
+        ACExecutionResult(ac_index=2, ac_content="c2", success=True),
+    )
+    parallel = ParallelExecutionResult(results=results, success_count=3, failure_count=0)
+    assert not existing_outcomes_from_results(parallel, gated=True)[0].passed
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert authority.outcome.fallback_reason == "authority_error:OSError"
+    assert not decided.all_succeeded
+    assert decided.results[0].outcome is ACExecutionOutcome.FAILED
+    if via == "annotation":
+        assert decided.results[0].error == "evidence form mismatch"
+    meta = await _run_for(authority).outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
+    )  # type: ignore[arg-type]
+    assert meta["legacy_verdict"] == "reject"
+
+
+async def test_a_failing_fallback_fails_every_attempted_criterion(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R2-A5: the run never reports a legacy decision it did not apply.
+    seed, authority = await _authority(store, repo, tmp_path)
+    authority.install(_executor(repo))
+
+    async def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    def broken_apply(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("apply")
+
+    monkeypatch.setattr("ouroboros.boundary.authority.verify_check_package", broken)
+    monkeypatch.setattr("ouroboros.boundary.authority.apply_legacy_fallback", broken_apply)
+    parallel = ParallelExecutionResult(
+        results=tuple(
+            ACExecutionResult(ac_index=i, ac_content=f"c{i}", success=True) for i in range(3)
+        ),
+        success_count=3,
+        failure_count=0,
+    )
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert authority.outcome.fallback_reason == "authority_error:OSError:fallback_failed"
+    assert not decided.all_succeeded
+    assert (decided.success_count, decided.failure_count) == (0, 3)
+
+
+DEEP_FRAME = (
+    "import os, stat, sys\n"
+    "_fd = next(fd for fd in range(3, 64) if os.path.exists(f'/dev/fd/{fd}')"
+    " and stat.S_ISFIFO(os.fstat(fd).st_mode))\n"
+    "os.write(_fd, ('\\n' + sys.argv[2] + ' ' + '[' * 200000 + ']' * 200000 + '\\n').encode())\n"
+)
+
+
+async def test_a_hostile_frame_is_a_package_fail_not_a_legacy_fallback(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # R2-S1 end to end: the candidate writes a deeply nested frame while it is
+    # imported. Every case of its checks fails with a counterexample; the gate
+    # sends a repair, and the authority decides (no legacy fallback): not
+    # accepted, so the run exits 1.
+    seed, authority = await _authority(store, repo, tmp_path)
+    (repo / "mathutils.py").write_text(DEEP_FRAME + BUGGY + GOOD_MIX)
+    authority.install(_executor(repo))
+    ok = ACExecutionResult(
+        ac_index=0, ac_content="c0", success=True, outcome=ACExecutionOutcome.SUCCEEDED
+    )
+    gated = await authority.gate(seed=seed, ac_index=0, result=ok)
+    assert gated.check_package_repair
+    assert "observed malformed or oversized output" in gated.check_package_repair
+    parallel = ParallelExecutionResult(
+        results=(
+            ok,
+            ACExecutionResult(
+                ac_index=1,
+                ac_content="c1",
+                success=True,
+                typed_evidence=EvidenceRecord(data={"entry_points": [MIX_ENTRY]}),
+            ),
+            ACExecutionResult(ac_index=2, ac_content="c2", success=True),
+        ),
+        success_count=3,
+        failure_count=0,
+    )
+    decided = await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert authority.outcome.fallback_reason is None
+    assert authority.outcome.verdict is not None
+    assert authority.outcome.verdict.verdict == "fail"
+    assert not decided.all_succeeded
