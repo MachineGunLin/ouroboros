@@ -17,24 +17,31 @@ current workspace, with no model call:
   whose check had held-out cases is indeterminate (``held_out_unavailable``),
   because passing only the visible cases is exactly what killing the
   controller would buy. A criterion whose cases were all visible is decided
-  normally.
+  normally. The store is as writable as the workspace, so the record is used
+  only when it agrees with what the journal recorded before the worker
+  started (``record_mismatch``): the manifest recomputed from the record
+  (case ids, case and held-out counts, file digests) and the held-out flag
+  of every case the admission run saw. Otherwise every covered criterion is
+  indeterminate (``package_record_tampered``).
 
 A covered criterion without a package decision (the record or the journal is
-unreadable) is indeterminate: not accepted, a non-zero exit, never a legacy
-decision. Uncovered criteria keep the rule of the live run (unverified,
-accepted when attempted). What counts as an attempt is the live arm-on rule
+unreadable, or the record disagrees with the journal) is indeterminate: not
+accepted, a non-zero exit, never a legacy decision. Uncovered criteria keep
+the rule of the live run (unverified, accepted when attempted). What counts
+as an attempt is the live arm-on rule
 (``existing_outcomes_from_results(..., gated=True)``): a root that failed for
 any reason other than the package gate (a failed session, a failed verify
 command, or a legacy rejection of a resumed attempt, which runs without the
-gate) is not accepted, whatever the package says. The recomputed decision is recorded as
-``boundary.acceptance.resumed``; the frozen boundary's single-shot records
-(final bindings, candidate verification) are not written again.
+gate) is not accepted, whatever the package says. The recomputed decision is
+recorded as ``boundary.acceptance.resumed``; the frozen boundary's single-shot
+records (final bindings, candidate verification) are not written again.
 """
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -75,13 +82,15 @@ from ouroboros.boundary.events import (
     PACKAGE_FROZEN,
 )
 from ouroboros.boundary.ledger import BoundaryLedger
-from ouroboros.boundary.oracle import OracleSpec, is_oracle_file
+from ouroboros.boundary.oracle import ORACLE_DATA_PATH, OracleSpec, is_oracle_file
 from ouroboros.boundary.package import (
     CHECK_PACKAGE_SCHEMA,
     CheckPackage,
+    canonical_json_bytes,
     cited_reference,
     oracle_files,
     seed_criterion_keys,
+    sha256_bytes,
 )
 from ouroboros.boundary.run_wiring import (
     BoundaryVerdict,
@@ -99,6 +108,7 @@ log = structlog.get_logger(__name__)
 
 HELD_OUT_UNAVAILABLE = "held_out_unavailable"
 PACKAGE_UNAVAILABLE = "package_unavailable_on_resume"
+PACKAGE_RECORD_TAMPERED = "package_record_tampered"
 RESUMED_SCHEMA = "ouroboros.acceptance_resumed.v1"
 _MAX_VERSIONS = 64
 _REFERENCE = re.compile(r"^[0-9a-f]{64}$")
@@ -234,7 +244,133 @@ async def load_resumed_boundary(
     except Exception as exc:  # noqa: BLE001 - an unreadable record leaves the criteria undecided
         log.warning("boundary.resume.record_unavailable", error_type=type(exc).__name__)
         return ResumedBoundary(package=None, reason=PACKAGE_UNAVAILABLE, **base)
-    return ResumedBoundary(package=package, held_out_checks=held, **base)
+    # The store is as writable as the workspace; the journal recorded the
+    # manifest and the admission before the worker started (R4-S1).
+    manifest = frozen.data.get("manifest") or {}
+    mismatch = record_mismatch(record, manifest, admission.data)
+    if mismatch is not None:
+        log.warning("boundary.resume.record_tampered", mismatch=mismatch)
+        return ResumedBoundary(package=None, reason=PACKAGE_RECORD_TAMPERED, **base)
+    held |= {
+        str(spec.get("check_id"))
+        for spec in manifest.get("oracles") or ()
+        if spec.get("held_out_count")
+    }
+    return ResumedBoundary(package=package, held_out_checks=frozenset(held), **base)
+
+
+def _record_manifest(record: dict[str, Any]) -> dict[str, Any]:
+    """The frozen manifest (``CheckPackage.manifest_summary``) recomputed from a record.
+
+    File digests are recomputed from the stored content, and case counts and
+    held-out counts from the stored cases, so an edit to either shows.
+    """
+    data = record["package"]
+    oracles = data.get("oracles") or ()
+    manifest: dict[str, Any] = {
+        "schema_version": data["schema_version"],
+        "package_commitment": record["package_commitment"],
+        "commitment_scheme": record["commitment_scheme"],
+        "seed_digest": data["seed_digest"],
+        "input_digest": data["input_digest"],
+        "generated_at": data["generated_at"],
+        "generator": data["generator"],
+        "criterion_keys": list(data["criterion_keys"]),
+        "checks": [
+            {
+                "check_id": check["check_id"],
+                "role": check["role"],
+                "criterion_keys": sorted({link["criterion_key"] for link in check["assertions"]}),
+                "assertion_ids": [link["assertion_id"] for link in check["assertions"]],
+            }
+            for check in data["checks"]
+        ],
+        "files": [
+            {"path": item["path"], "held_out_redacted": True}
+            if item["path"] == ORACLE_DATA_PATH
+            else {
+                "path": item["path"],
+                "sha256": sha256_bytes(item["content"].encode("utf-8")),
+                "size": len(item["content"].encode("utf-8")),
+            }
+            for item in data["files"]
+        ],
+        "base_files": list(data["base_files"]),
+        "scratch_paths": list(data["scratch_paths"]),
+        "uncovered": list(data["uncovered"]),
+    }
+    if oracles:
+        manifest["binding_grammar"] = data.get("binding_grammar")
+        manifest["oracles"] = [
+            {
+                "check_id": spec["check_id"],
+                "criterion_key": spec["criterion_key"],
+                "call_kind": spec["call_kind"],
+                "params": list(spec["params"]),
+                "default_symbol": spec["default_binding"]["symbol"],
+                "default_resolves": spec["default_resolves"],
+                "case_count": len(spec["cases"]),
+                "held_out_count": sum(1 for case in spec["cases"] if case.get("held_out")),
+            }
+            for spec in oracles
+        ]
+    return manifest
+
+
+def _manifest_digest(manifest: dict[str, Any]) -> str:
+    """Digest of a manifest with ``generated_at`` in one spelling (``Z`` or ``+00:00``)."""
+    stamp = manifest.get("generated_at")
+    normalized = {
+        **manifest,
+        "generated_at": datetime.fromisoformat(stamp).isoformat() if stamp else stamp,
+    }
+    return sha256_bytes(canonical_json_bytes(normalized))
+
+
+def record_mismatch(
+    record: dict[str, Any], manifest: dict[str, Any], admission: dict[str, Any]
+) -> str | None:
+    """Where the stored record disagrees with the journal, or ``None`` when it agrees.
+
+    The journal holds, from before the worker started: the manifest (every
+    case id per check through its assertion ids, case and held-out counts per
+    oracle, and the digest of every file but the oracle data), and the
+    admission receipt (the held-out flag of every case the base run saw).
+    Either may catch a held-out case that was deleted, added, or made
+    visible. Returns a short label, never a value from the package.
+    """
+    try:
+        if _manifest_digest(_record_manifest(record)) != _manifest_digest(dict(manifest)):
+            return "manifest_digest"
+        cases = {
+            spec["check_id"]: {
+                case["case_id"]: bool(case.get("held_out")) for case in spec["cases"]
+            }
+            for spec in record["package"].get("oracles") or ()
+        }
+        assertion_ids = {
+            check["check_id"]: list(check["assertion_ids"]) for check in manifest["checks"]
+        }
+        for spec in record["package"].get("oracles") or ():
+            ids = [f"{spec['check_id']}.{case['case_id']}" for case in spec["cases"]]
+            if ids != assertion_ids.get(spec["check_id"]):
+                return "case_ids"
+        for check in admission.get("checks") or ():
+            result = check.get("oracle_result") or {}
+            if not result.get("cases"):
+                continue
+            seen = {case.get("case_id"): bool(case.get("held_out")) for case in result["cases"]}
+            if cases.get(check.get("check_id")) != seen:
+                return "held_out_cases"
+        listed = {(item["check_id"], item["case_id"]) for item in record.get("held_out") or ()}
+        flagged = {
+            (check, case) for check, flags in cases.items() for case, held in flags.items() if held
+        }
+        if listed != flagged:
+            return "held_out_list"
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return "record_shape"
+    return None
 
 
 def _undecided(key: str, reason: str) -> CriterionVerdict:
@@ -424,10 +560,12 @@ class ResumedCheckPackageAuthority:
 
 __all__ = [
     "HELD_OUT_UNAVAILABLE",
+    "PACKAGE_RECORD_TAMPERED",
     "PACKAGE_UNAVAILABLE",
     "ResumedBoundary",
     "ResumedCheckPackageAuthority",
     "decide_resumed",
     "load_resumed_boundary",
+    "record_mismatch",
     "visible_package",
 ]

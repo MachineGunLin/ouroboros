@@ -388,3 +388,96 @@ async def test_after_a_crash_a_root_only_the_gate_failed_is_decided_by_the_packa
         ACExecutionOutcome.SUCCEEDED,  # the finished workspace passes criterion 2
         ACExecutionOutcome.SUCCEEDED,
     ]
+
+
+# R4-S1: the store must agree with the journal before any of it is used.
+
+
+def _record_path(tmp_path: Path) -> Path:
+    (path,) = list((tmp_path / "store" / "packages").glob("*.json"))
+    return path
+
+
+def _delete_held_out(record: dict[str, Any]) -> None:
+    for spec in record["package"]["oracles"]:
+        spec["cases"] = [case for case in spec["cases"] if not case.get("held_out")]
+    record["held_out"] = []
+
+
+def _swap_held_out(record: dict[str, Any]) -> None:
+    """Counts and ids unchanged: the stated case becomes held out, the held-out one visible."""
+    stated, held = record["package"]["oracles"][0]["cases"]
+    record["package"]["oracles"][0]["cases"] = [
+        {"case_id": "stated", "held_out": True, "hmac_sha256": held["hmac_sha256"]},
+        {**stated, "case_id": "held"},
+    ]
+    record["held_out"] = [{**record["held_out"][0], "case_id": "stated"}]
+
+
+def _add_case(record: dict[str, Any]) -> None:
+    spec = record["package"]["oracles"][0]
+    spec["cases"].append({**spec["cases"][0], "case_id": "extra"})
+
+
+def _edit_file(record: dict[str, Any]) -> None:
+    item = record["package"]["files"][0]
+    item["content"] += "\n# edited\n"
+
+
+@pytest.mark.parametrize(
+    "tamper", [_delete_held_out, _swap_held_out, _add_case, _edit_file], ids=lambda f: f.__name__
+)
+async def test_a_store_that_disagrees_with_the_journal_decides_nothing(
+    store: EventStore,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: Any,
+) -> None:
+    """The reviewer's probe: the target edits the stored record, then kills the controller.
+
+    The workspace still fails the held-out case. Without the check the record
+    with its held-out case deleted made criterion 1 a PASS.
+    """
+    import json
+
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    (repo / "mathutils.py").write_text(CLAMP_FIXED.replace("min(high", "min(high + 1") + DOUBLE)
+    path = _record_path(tmp_path)
+    record = json.loads(path.read_text())
+    tamper(record)
+    path.write_text(json.dumps(record))
+    forget_live_state(state)
+    _run, authority = await _resume(store, seed, repo)
+    assert authority.boundary.package is None
+    assert authority.boundary.reason == "package_record_tampered"
+    decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=_restored())
+    verdicts = authority.outcome.verdict.verdicts
+    keys = seed_criterion_keys(seed)
+    assert [(verdicts[key].status, verdicts[key].reason) for key in keys[:2]] == [
+        (PackageCriterionStatus.INDETERMINATE, "package_record_tampered")
+    ] * 2
+    assert [result.outcome for result in decided.results] == [
+        ACExecutionOutcome.FAILED,
+        ACExecutionOutcome.FAILED,
+        ACExecutionOutcome.SUCCEEDED,  # uncovered: unverified, as in the live run
+    ]
+    assert not decided.all_succeeded
+
+
+async def test_an_untouched_store_agrees_with_the_journal(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from ouroboros.boundary.resume import record_mismatch
+
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    events = await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
+    frozen, admission = events[0], events[1]
+    record = json.loads(_record_path(tmp_path).read_text())
+    assert record_mismatch(record, frozen.data["manifest"], admission.data) is None
+    forget_live_state(state)
+    _run, authority = await _resume(store, seed, repo)
+    assert authority.boundary.package is not None
+    assert authority.boundary.held_out_checks == frozenset({"oracle_clamp"})
