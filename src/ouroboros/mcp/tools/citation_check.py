@@ -91,6 +91,8 @@ def _eligible_http_citation(url: str) -> bool:
             if closing < 0:
                 return False
             literal = authority[1:closing]
+            if not _uri_component_is_syntactic(literal, _REG_NAME_CHARS | frozenset(":")):
+                return False
             if literal[:1].lower() == "v":
                 version, separator, address = literal[1:].partition(".")
                 if (
@@ -134,7 +136,8 @@ def extract_cited_urls(text: str) -> tuple[str, ...]:
     ``build_lateral_multi_subagent``: ``external_sources`` (list of URLs) and
     ``claims[].source``. Order-preserving, deduplicated. Any malformed block
     is skipped rather than raised — a persona that broke the format simply
-    contributes no checkable citations.
+    contributes no checkable citations. Preserve nonblank URL strings exactly so
+    the prefetch validator can detect padding and other malformed characters.
     """
     if not text:
         return ()
@@ -157,8 +160,8 @@ def extract_cited_urls(text: str) -> tuple[str, ...]:
         for candidate in candidates:
             if not isinstance(candidate, str):
                 continue
-            url = candidate.strip()
-            if url and url not in seen:
+            url = candidate
+            if url.strip() and url not in seen:
                 seen.add(url)
                 urls.append(url)
     return tuple(urls)

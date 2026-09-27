@@ -47,6 +47,7 @@ def test_no_citations_means_no_audit_and_no_network() -> None:
         return True
 
     assert audit_citations(["plain opinion output"], fetch=fetch) is None
+    assert audit_citations(['```json\n{"external_sources": ["   "]}\n```'], fetch=fetch) is None
     assert calls == []
 
 
@@ -155,8 +156,12 @@ def test_malformed_urls_do_not_consume_the_valid_url_limit() -> None:
     assert calls == [valid]
 
 
-def test_internationalized_and_ipvfuture_urls_remain_auditable() -> None:
-    urls = ("https://bücher.example/über", "https://[v1.fe80]/doc")
+def test_internationalized_ipvfuture_and_encoded_zone_urls_remain_auditable() -> None:
+    urls = (
+        "https://bücher.example/über",
+        "https://[v1.fe80]/doc",
+        "https://[fe80::1%25eth0]/doc",
+    )
     calls: list[str] = []
 
     def fetch(candidate: str, _timeout: float) -> bool:
@@ -169,3 +174,22 @@ def test_internationalized_and_ipvfuture_urls_remain_auditable() -> None:
     assert audit is not None
     assert all(audit["urls"][url] == VERIFIED for url in urls)
     assert calls == list(urls)
+
+
+def test_raw_malformed_citations_are_rejected_before_the_valid_url_budget() -> None:
+    malformed = (" https://bad.example/doc ", "https://[fe80::1%eth0]/doc")
+    valid = "https://ok.example/doc"
+    calls: list[str] = []
+
+    def fetch(url: str, _timeout: float) -> bool:
+        calls.append(url)
+        return True
+
+    text = "```json\n" + json.dumps({"external_sources": [*malformed, valid]}) + "\n```"
+    audit = audit_citations([text], fetch=fetch, max_urls=1)
+
+    assert audit is not None
+    assert all(audit["urls"][url] == INVALID for url in malformed)
+    assert audit["urls"][valid] == VERIFIED
+    assert audit["checked"] == 1
+    assert calls == [valid]
