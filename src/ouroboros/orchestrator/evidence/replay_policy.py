@@ -977,6 +977,46 @@ def _python_runner(
     return None
 
 
+def python_inline_program(argv: Sequence[str]) -> str | None:
+    """Return the program text ``argv`` runs with ``python -c``, or None.
+
+    The program is the last one ``program_chain`` resolves (``timeout 5 uv
+    run python3 -c ...`` counts), and it must be a Python interpreter whose
+    options, read with the same tables as ``_python_runner``, end in ``-c``
+    (alone, as the last letter of a flag cluster such as ``-Bc``, or with the
+    program attached as in ``-cCODE``). A script, ``-m`` or an unknown option
+    before any ``-c`` means no inline program.
+    """
+    programs = program_chain(argv)
+    if not programs or not _is_python_executable(_program_name(programs[-1][0])):
+        return None
+    parts = programs[-1]
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in _PYTHON_FLAGS:
+            index += 1
+            continue
+        if token in _PYTHON_VALUE_OPTIONS:
+            index += 2
+            continue
+        if not token.startswith("-") or token.startswith("--") or token == "-":
+            return None
+        cluster = token[1:]
+        for position, letter in enumerate(cluster):
+            if letter == "c":
+                rest = cluster[position + 1 :]
+                if rest:
+                    return rest
+                return parts[index + 1] if index + 1 < len(parts) else None
+            if f"-{letter}" in _PYTHON_VALUE_OPTIONS:
+                break
+            if f"-{letter}" not in _PYTHON_FLAGS:
+                return None
+        index += 1
+    return None
+
+
 def _make_runner(arguments: Sequence[str]) -> ResolvedRunner | None:
     for token in arguments:
         name = token.partition("=")[0]
@@ -1463,6 +1503,7 @@ __all__ = [
     "outside_known_roots",
     "peel_wrappers",
     "program_chain",
+    "python_inline_program",
     "replay_allowed",
     "resolve_replay_program",
     "run_may_back_test_claim",

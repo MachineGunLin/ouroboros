@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 import re
@@ -29,6 +30,7 @@ from ouroboros.orchestrator.evidence.replay_policy import (
     claim_target_operands,
     excludes_tests,
     narrowing_assignments,
+    python_inline_program,
     run_may_back_test_claim,
 )
 from ouroboros.orchestrator.evidence.shell_parsing import (
@@ -575,11 +577,30 @@ _FUNCTIONAL_POWERSHELL_NAMES = frozenset({"powershell", "powershell.exe", "pwsh"
 
 
 _FILE_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9_]+")
-_PYTHON_MODULE_NAME = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
-_PYTHON_FROM_IMPORT_RE = re.compile(rf"\bfrom\s+({_PYTHON_MODULE_NAME})\s+import\b")
-_PYTHON_IMPORT_RE = re.compile(
-    rf"(?:^|[\s;\"'(])import\s+({_PYTHON_MODULE_NAME}(?:\s*,\s*{_PYTHON_MODULE_NAME})*)"
-)
+# Shell control operators that end one simple command in a compound line.
+_SHELL_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", ";;", "|&"})
+
+
+def _simple_commands(command: str) -> list[list[str]]:
+    """Split a shell line into the argv of each simple command, or [] if unparsable.
+
+    Operators inside quotes stay in their token; anything that is not a
+    separator but consists only of shell punctuation (redirections, subshell
+    parentheses) ends the current command as well, so no argv spans it.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    commands: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _SHELL_COMMAND_SEPARATORS or (token and set(token) <= set("();<>|&")):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [argv for argv in commands if argv]
 
 
 def _python_imported_module_files(command: str) -> list[str]:
@@ -587,13 +608,32 @@ def _python_imported_module_files(command: str) -> list[str]:
 
     ``python3 -c "from mathutils import clamp; assert ..."`` exercises
     ``mathutils.py`` as directly as ``python3 mathutils.py`` does, but names it
-    only as a module. Each absolute import ``a.b`` maps to ``a/b.py`` and
-    ``a/b/__init__.py``; the caller still requires one candidate to be a real
-    workspace file, so a stdlib import (``import os``) anchors nothing.
+    only as a module. The program is the ``-c`` text of a simple command whose
+    resolved program is a Python interpreter (``python_inline_program``); it
+    is parsed, and only its top-level ``import`` and absolute ``from ...
+    import`` statements count, so text that merely mentions an import
+    (``print('import app')``) or an import that may not run (inside a
+    function or a branch) anchors nothing. Each module ``a.b`` maps to
+    ``a/b.py`` and ``a/b/__init__.py``; the caller still requires one
+    candidate to be a real workspace file, so a stdlib import (``import os``)
+    anchors nothing either.
     """
-    modules: list[str] = [match.group(1) for match in _PYTHON_FROM_IMPORT_RE.finditer(command)]
-    for match in _PYTHON_IMPORT_RE.finditer(command):
-        modules.extend(name.strip() for name in match.group(1).split(","))
+    modules: list[str] = []
+    for argv in _simple_commands(command):
+        program = python_inline_program(argv)
+        if program is None:
+            continue
+        try:
+            tree = ast.parse(program)
+        except (SyntaxError, ValueError):
+            continue
+        for statement in tree.body:
+            if isinstance(statement, ast.Import):
+                modules.extend(alias.name for alias in statement.names)
+            elif (
+                isinstance(statement, ast.ImportFrom) and statement.level == 0 and statement.module
+            ):
+                modules.append(statement.module)
     candidates: list[str] = []
     for module in modules:
         base = module.replace(".", "/")

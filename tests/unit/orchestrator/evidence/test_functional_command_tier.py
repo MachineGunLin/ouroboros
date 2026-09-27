@@ -663,3 +663,40 @@ def test_inline_python_import_stays_fail_closed(tmp_path) -> None:
     )
     # Non-Python interpreters do not gain module anchors.
     assert _functional_command_invoked_files('node -e "import x from y"') == ()
+
+
+def test_inline_python_text_that_only_mentions_an_import_anchors_nothing(tmp_path) -> None:
+    """Bot review round 5, finding 2: ``python -c "print('import app')"`` never
+    imports ``app``. Only parsed top-level import statements of the ``-c``
+    program anchor a module, so a touched ``app.py`` and a correlated zero exit
+    do not make the printed text a ``tests_passed`` check."""
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    inert = "python -c \"print('import app')\""
+    assert "app.py" not in _functional_command_invoked_files(inert)
+    verdict = _inline_import_verdict(tmp_path, inert, edited="app.py")
+    assert verdict.passed is False
+    assert any("tests_passed" in reason for reason in verdict.reasons)
+    for command in (
+        "python3 -c \"exec('import app')\"",
+        'python3 -c "if 0: import app"',
+        'python3 -c "def f():\n    import app"',
+        'python3 -c "import app(("',
+        'python3 -m json.tool -c "import app"',
+        'echo "python3 -c import app"',
+    ):
+        assert "app.py" not in _functional_command_invoked_files(command), command
+
+
+def test_inline_python_real_imports_still_anchor(tmp_path) -> None:
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    for command in (
+        'python3 -c "import app; assert app.run() == 1"',
+        'python3 -B -c "from app import run; assert run() == 1"',
+        'python3 -c"import app"',
+        'timeout 5 uv run python3 -X dev -c "import app, os"',
+        'cd . && python3 -c "import app; assert app.run() == 1" 2>&1 | tail -3',
+    ):
+        assert "app.py" in _functional_command_invoked_files(command), command
+    claim = 'python3 -c "import app; assert app.run() == 1"'
+    verdict = _inline_import_verdict(tmp_path, claim, edited="app.py")
+    assert verdict.passed is True, verdict.reasons
