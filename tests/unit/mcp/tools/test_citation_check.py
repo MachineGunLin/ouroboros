@@ -5,6 +5,8 @@ All tests inject a fake fetcher — the unit suite never touches the network.
 
 from __future__ import annotations
 
+import json
+
 from ouroboros.mcp.tools.citation_check import (
     INVALID,
     UNCHECKED,
@@ -102,3 +104,27 @@ def test_malformed_url_is_invalid_and_does_not_raise() -> None:
     )
     assert audit is not None
     assert audit["urls"]["https://[invalid"] == INVALID
+
+
+def test_malformed_authorities_are_invalid_without_stopping_later_urls() -> None:
+    malformed = (
+        "https://example.com:not-a-port",
+        "https://example.com:65536",
+        "https://example.com:",
+        "https://bad host.example/doc",
+    )
+    valid = "https://ok.example/doc"
+    calls: list[str] = []
+
+    def fetch(url: str, _timeout: float) -> bool:
+        calls.append(url)
+        return True
+
+    text = "```json\n" + json.dumps({"external_sources": [*malformed, valid]}) + "\n```"
+    audit = audit_citations([text], fetch=fetch)
+
+    assert audit is not None
+    assert all(audit["urls"][url] == INVALID for url in malformed)
+    assert audit["urls"][valid] == VERIFIED
+    assert audit["checked"] == 1
+    assert calls == [valid]

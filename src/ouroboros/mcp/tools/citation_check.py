@@ -132,7 +132,17 @@ def audit_citations(
     for url in urls:
         try:
             parsed = urllib.parse.urlparse(url)
-            valid_url = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+            hostname = parsed.hostname
+            # urlparse defers malformed-port errors until this property is read.
+            _ = parsed.port
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            valid_url = (
+                parsed.scheme in ("http", "https")
+                and hostname is not None
+                and hostname != ""
+                and not any(char.isspace() for char in hostname)
+                and not authority.endswith(":")
+            )
         except (TypeError, ValueError):
             valid_url = False
         if not valid_url or len(url) > _MAX_URL_LEN:
