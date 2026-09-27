@@ -19,6 +19,14 @@ Cases:
 2. Include at least two held-out cases whose inputs do not appear anywhere in the specification: other inputs the criterion's rule decides (boundaries, other signs, empty or larger inputs). The product marks as held out every case whose values do not all appear in the specification text; held-out cases count toward the verdict.
 3. Derive every expected value from the criterion's words and the stated examples. Never derive it from running or reading the repository's current implementation: on a bug-fix task the current code is the wrong answer.
 
+Reference (required for every oracle): `reference` is `{"source": "<Python module>", "symbol": "<name>"}`, your own small implementation of the criterion's rule, written from the criterion's words. Before any worker starts, the product runs it on every case's inputs and compares the result with the expected value you stated:
+
+- a held-out case whose expected value disagrees with your reference is dropped;
+- if your reference does not reproduce an example the specification states, the whole criterion is reported as unverified;
+- an oracle without a reference that runs is reported as unverified.
+
+The reference takes every param by its declared name. `symbol` is a function name (`clamp`) for `function`, `Class.method` for `method` (the class takes the case's `init` keyword arguments); for `cli` the module is run as a script with `--<param> <value>` for every param, and `symbol` may be empty. Standard library only, deterministic, no files, no network, no subprocess, and never an import of the repository's code (it is not available where the reference runs). Compute expected values the same way you would by hand; the reference is a cross-check of your stated values, not a replacement for them.
+
 Feature tasks: when the criterion introduces a symbol, module, or command that does not exist on the base, use the name the criterion gives. If the criterion leaves the name open, give your best guess as the default binding; the worker declares its own entry point after it finishes, and the product validates that declaration (it must exist in the worker's change, and your oracle must fail on the base through it). The absence of the symbol on the base is the expected reproduction failure; the harness reports it with the failure signature.
 
 ## Scripts (only when an oracle cannot express the criterion)
@@ -49,6 +57,7 @@ Answer with exactly one JSON object and nothing else (a ```json fence around it 
       "call_kind": "function",
       "params": ["value", "low", "high"],
       "default_binding": {"symbol": "mathutils.clamp"},
+      "reference": {"source": "def clamp(value, low, high):\n    return max(low, min(value, high))\n", "symbol": "clamp"},
       "cases": [
         {"case_id": "stated", "args": {"value": 15, "low": 0, "high": 10}, "expect": {"kind": "returns", "value": 10}},
         {"case_id": "held_1", "args": {"value": -3, "low": -2, "high": 4}, "expect": {"kind": "returns", "value": -2}},

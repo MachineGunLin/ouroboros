@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import inspect
 import json
@@ -54,6 +54,7 @@ from ouroboros.boundary.package import (
     seed_digest,
     sha256_bytes,
 )
+from ouroboros.boundary.reference_check import OracleReference, references_from_reply
 from ouroboros.boundary.tree import copy_checkout, tree_digest
 from ouroboros.core.seed import AcceptanceCriterionSpec, Seed
 
@@ -78,6 +79,14 @@ class ConstructionOutcome:
     input_digest: str
     generator: str
     reply_sha256: str | None = None
+    references: Mapping[str, OracleReference | None] | None = field(default=None, repr=False)
+    """Each oracle's reference implementation (memory only; ``reference_check.py``).
+
+    ``None`` means this constructor wrote no references (a caller that
+    assembles packages itself): no reference check runs. The product
+    constructor always sets it, and an oracle without a usable reference is
+    then uncovered (``reference_unavailable``).
+    """
 
 
 def load_constructor_system_prompt() -> str:
@@ -475,8 +484,9 @@ class CheckConstructor:
         if len(reply) > self._max_output_chars:
             return failed("constructor_reply_too_large", reply_sha)
         try:
+            parsed = extract_json_object(reply)
             package = package_from_reply(
-                extract_json_object(reply),
+                parsed,
                 seed,
                 input_digest=input_digest,
                 generator=generator,
@@ -492,7 +502,14 @@ class CheckConstructor:
                 # package to decide, and regenerating would not change that.
                 return failed(ALL_CRITERIA_UNCOVERED, reply_sha)
             return failed("constructor_produced_no_checks", reply_sha)
-        return ConstructionOutcome(package, None, input_digest, generator, reply_sha)
+        return ConstructionOutcome(
+            package,
+            None,
+            input_digest,
+            generator,
+            reply_sha,
+            references=references_from_reply(parsed),
+        )
 
     async def _construct_incremental(
         self,
@@ -579,4 +596,11 @@ class CheckConstructor:
             ):
                 return failed(ALL_CRITERIA_UNCOVERED)
             return failed("constructor_produced_no_checks")
-        return ConstructionOutcome(package, None, input_digest, generator, reply_sha)
+        return ConstructionOutcome(
+            package,
+            None,
+            input_digest,
+            generator,
+            reply_sha,
+            references=references_from_reply(merged),
+        )

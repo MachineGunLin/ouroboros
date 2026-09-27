@@ -144,3 +144,31 @@ async def test_nothing_produced_in_time_is_a_construction_failure(tmp_path: Path
     runtime = _Runtime({1: 30.0, 2: 30.0, 3: 30.0})
     outcome = await _constructor(runtime, 0.3).construct(_seed(), _base(tmp_path))
     assert outcome.package is None and outcome.failure_reason == "constructor_timeout"
+
+
+async def test_the_reference_reaches_the_outcome_but_never_the_partials(tmp_path: Path) -> None:
+    """The reference computes every expected value: memory only (reference_check.py)."""
+    marker = "reference_marker_71c2"
+    source = f"# {marker}\ndef clamp(value, low, high):\n    return max(low, min(value, high))\n"
+    with_reference = {
+        **FULL,
+        "oracles": [
+            {**item, "reference": {"source": source, "symbol": "clamp"}} for item in FULL["oracles"]
+        ],
+    }
+
+    class _ReferenceRuntime(_Runtime):
+        async def execute_task_to_result(self, prompt: str, tools=None, system_prompt=None):
+            reply = "```json\n" + json.dumps(with_reference) + "\n```"
+            return Result.ok(TaskResult(success=True, final_message=reply, messages=()))
+
+    constructor = _constructor(_ReferenceRuntime({}), 5)
+    partial = tmp_path / "partial"
+    constructor.persist_partials_to(partial)
+    outcome = await constructor.construct(_seed(), _base(tmp_path))
+    assert outcome.references is not None
+    assert sorted(outcome.references) == ["c1_oracle", "c2_oracle"]
+    assert all(item is not None and marker in item.source for item in outcome.references.values())
+    assert marker not in repr(outcome)
+    for path in partial.iterdir():
+        assert marker not in path.read_text()

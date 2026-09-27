@@ -58,6 +58,7 @@ from ouroboros.boundary.events import (
     construction_failed_event,
     legacy_fallback_event,
     package_frozen_event,
+    reference_checked_event,
     selection_decided_event,
     superseded_event,
 )
@@ -460,6 +461,30 @@ class BoundaryLedger:
             package_sha256=package_sha256,
             reconciliation=reconciliation,
             committed=_committed(_first(events, PACKAGE_FROZEN)),
+        )
+        await self._store.append(event)
+        return event
+
+    async def record_reference_checked(
+        self, boundary_id: str, *, package_sha256: str, payload: dict[str, Any]
+    ) -> BaseEvent:
+        """Record what the reference check excluded, after the seal and before admission."""
+        events = await self.events(boundary_id)
+        frozen = _first(events, PACKAGE_FROZEN)
+        if frozen is None or _ref(frozen) != package_sha256:
+            raise BoundaryOrderError(
+                "a reference check must cite the boundary's frozen package",
+                details={"boundary_id": boundary_id},
+            )
+        if _first(events, ADMISSION_COMPLETED) is not None:
+            raise BoundaryOrderError(
+                "the reference check precedes admission", details={"boundary_id": boundary_id}
+            )
+        event = reference_checked_event(
+            boundary_id,
+            package_sha256=package_sha256,
+            committed=_committed(frozen),
+            payload=payload,
         )
         await self._store.append(event)
         return event

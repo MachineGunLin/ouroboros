@@ -48,7 +48,7 @@ recomputes the package decision from the visible cases (``boundary/resume.py``).
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import json
 import os
@@ -101,6 +101,11 @@ from ouroboros.boundary.package import (
     sha256_bytes,
     write_commitment_salt,
     write_package_record,
+)
+from ouroboros.boundary.reference_check import (
+    REFERENCE_LEFT_NO_CHECKS,
+    ReferenceCheck,
+    check_references,
 )
 from ouroboros.boundary.rollout import (
     AssignmentSource,
@@ -249,6 +254,8 @@ class BoundaryRunState:
     base_snapshot: Path | None = None
     base_manifest_path: Path | None = None
     commitments: tuple[FrozenCommitment, ...] = field(default=(), repr=False)
+    reference_check: ReferenceCheck | None = None
+    """What the reference check excluded from the bound version (``None``: not run)."""
 
     @property
     def admitted(self) -> bool:
@@ -358,6 +365,7 @@ async def prepare_check_package(
     # Keys the held-out case hashes of the stored package record; never stored.
     record_key = secrets.token_bytes(32)
     commitments: list[FrozenCommitment] = []
+    reference_check: ReferenceCheck | None = None
 
     for attempt in range(1, settings.attempts + 1):
         boundary_id = f"{execution_id}/check_package/v{attempt}"
@@ -367,6 +375,23 @@ async def prepare_check_package(
             persist(store / "partial" / f"v{attempt}")
         outcome = await constructor.construct(seed, base, feedback=feedback)
         package, admission, package_path = outcome.package, None, None
+        reference_check = None
+        references = getattr(outcome, "references", None)
+        if package is not None and references is not None and package.oracles:
+            # Derived-expectation admission (``boundary/reference_check.py``):
+            # before the package is frozen, cases that disagree with the
+            # constructor's reference are excluded.
+            package, reference_check = await check_references(
+                package,
+                references,
+                seed=seed,
+                env=scrubbed_check_environment(),
+                interpreter=interpreter.path,
+                timeout_seconds=settings.check_timeout_seconds,
+            )
+            if not package.checks:
+                package = None
+                outcome = replace(outcome, package=None, failure_reason=REFERENCE_LEFT_NO_CHECKS)
         if package is None:
             failure_reason = outcome.failure_reason or "constructor_failed"
             await ledger.record_construction_failed(
@@ -393,6 +418,10 @@ async def prepare_check_package(
                 seed=seed,
                 record_sha256=sha256_bytes(package_path.read_bytes()),
             )
+            if reference_check is not None:
+                await ledger.record_reference_checked(
+                    boundary_id, package_sha256=package.reference, payload=reference_check.payload()
+                )
             admission = await admit_check_package(
                 package,
                 base,
@@ -473,6 +502,7 @@ async def prepare_check_package(
         criterion_keys=seed_criterion_keys(seed),
         base_snapshot=snapshot[0] if snapshot else None,
         base_manifest_path=snapshot[1] if snapshot else None,
+        reference_check=reference_check,
         commitments=tuple(commitments),
     )
     if state.admitted:

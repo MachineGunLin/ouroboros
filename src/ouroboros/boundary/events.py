@@ -50,6 +50,7 @@ BINDING_RECORDED = "boundary.binding.recorded"
 CASE_REVEALED = "boundary.oracle.case_revealed"
 LEGACY_FALLBACK = "boundary.acceptance.legacy_fallback"
 ACCEPTANCE_RESUMED = "boundary.acceptance.resumed"
+REFERENCE_CHECKED = "boundary.oracle.reference_checked"
 
 
 def _event(boundary_id: str, event_type: str, data: dict[str, Any]) -> BaseEvent:
@@ -220,6 +221,15 @@ def case_revealed_event(
 def legacy_fallback_event(boundary_id: str, *, reason: str) -> BaseEvent:
     """The legacy verifier decided this run because the package could not."""
     return _event(boundary_id, LEGACY_FALLBACK, {"reason": reason})
+
+
+def reference_checked_event(
+    boundary_id: str, *, package_sha256: str, committed: bool, payload: dict[str, Any]
+) -> BaseEvent:
+    """Cases excluded and criteria uncovered by the reference check (ids, never values)."""
+    return _event(
+        boundary_id, REFERENCE_CHECKED, {**cite(package_sha256, committed=committed), **payload}
+    )
 
 
 def acceptance_resumed_event(

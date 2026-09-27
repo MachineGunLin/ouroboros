@@ -107,12 +107,16 @@ def merge_pieces(pieces: Sequence[CriterionPiece]) -> tuple[dict[str, Any], dict
 
 
 def _without_case_values(reply: Mapping[str, Any] | None) -> Any:
-    """``reply`` with every oracle case reduced to its id (held-out values never reach disk)."""
+    """``reply`` with every oracle case reduced to its id (held-out values never reach disk).
+
+    The oracle's reference implementation is dropped too: it computes every
+    expected value, and it is the criterion's solution.
+    """
     if not isinstance(reply, Mapping) or not isinstance(reply.get("oracles"), list):
         return reply
     oracles = [
         {
-            **item,
+            **{key: value for key, value in item.items() if key != "reference"},
             "cases": [
                 {"case_id": case.get("case_id") if isinstance(case, Mapping) else None}
                 for case in item.get("cases") or ()
