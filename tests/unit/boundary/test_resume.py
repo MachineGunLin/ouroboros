@@ -489,27 +489,27 @@ async def test_an_untouched_store_agrees_with_the_journal(
     assert authority.boundary.held_out_checks == frozenset({"oracle_clamp"})
 
 
-# R4-A2: telemetry of a resumed run is the original run's, from the journal.
+# R4-A2: the outcome summary of a resumed run is the original run's, from the journal.
 
 
-async def test_resumed_telemetry_reports_the_original_arm_and_the_package_decision(
+async def test_resumed_summary_reports_the_original_switch_and_the_package_decision(
     store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The reviewer's probe: arm on (randomized), the resumed package fails the run.
+    """The reviewer's probe: on by default, the resumed package fails the run.
 
     Before the fix the row read arm ``off``, ``not_run``, ``package_verdict=none``,
     ``reconciliation=none`` and ``legacy_verdict=reject``.
     """
-    randomized = CheckPackageAssignment(Arm.ON, AssignmentSource.RANDOMIZED)
+    by_default = CheckPackageAssignment(Arm.ON, AssignmentSource.DEFAULT)
     seed, state = await _run_until_the_worker_stops(
-        store, repo, tmp_path, monkeypatch, assignment=randomized
+        store, repo, tmp_path, monkeypatch, assignment=by_default
     )
     started = [
         event
         for event in await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
         if event.type == "boundary.actor.started"
     ]
-    assert [event.data["check_package_assignment"] for event in started] == ["randomized"]
+    assert [event.data["check_package_assignment"] for event in started] == ["default"]
     forget_live_state(state)  # clamp still broken: package FAIL; legacy accepted all
     run, authority = await _resume(store, seed, repo)  # the arm resolves off now
     decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=_restored())
@@ -519,7 +519,7 @@ async def test_resumed_telemetry_reports_the_original_arm_and_the_package_decisi
     )
     assert {key: meta[key] for key in list(meta)[:6]} == {
         "check_package_arm": "on",
-        "check_package_assignment": "randomized",
+        "check_package_assignment": "default",
         "check_package_status": "admitted",
         "package_verdict": "fail",
         "legacy_verdict": "accept",
@@ -529,7 +529,7 @@ async def test_resumed_telemetry_reports_the_original_arm_and_the_package_decisi
     assert meta["unverified_count"] == "1"
 
 
-async def test_resumed_telemetry_of_an_undecided_run_is_indeterminate(
+async def test_resumed_summary_of_an_undecided_run_is_indeterminate(
     store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)

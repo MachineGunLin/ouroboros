@@ -1,59 +1,50 @@
-"""Randomized default for the check package boundary of ``ooo run``.
+"""The on/off switch for the check package boundary of ``ooo run``.
 
-The check package is a product default under evaluation. Each installation is
-assigned an arm, ``on`` or ``off``, and every explicit user setting overrides
-that assignment. Precedence, first match wins:
+The check package is on by default for every eligible run. An explicit user
+setting turns it off (or on). Precedence, first match wins:
 
 1. the CLI flag ``--check-package`` / ``--no-check-package``;
 2. the environment variable ``OUROBOROS_CHECK_PACKAGE=on|off``;
 3. ``boundary.check_package: on|off`` in ``~/.ouroboros/config.yaml``;
-4. the randomized arm, a deterministic function of the anonymous telemetry ID
-   (see ``randomized_arm``), used only when telemetry is enabled, the ID
-   already exists, and the installation was shown the current telemetry
-   notice (which discloses randomized defaults);
-5. otherwise ``off``, recorded as ``fallback``.
+4. otherwise ``on``, recorded as ``default``.
 
-Installs that send no telemetry therefore always keep the previous behavior
-unless they opt in; nobody is randomized without the disclosure. The arm and
-its source are recorded on the run's ``workflow_outcome`` (TELEMETRY.md,
-"Randomized defaults").
+The switch depends on nothing else: not on telemetry, not on the anonymous
+ID, not on any notice. The switch and its source are recorded in the local
+journal when the worker starts (``boundary.actor.started``), so a resumed run
+reports them.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-import hashlib
 import os
 
 CHECK_PACKAGE_ENV = "OUROBOROS_CHECK_PACKAGE"
-# Changing the key starts a new, independent randomization; bump it (and the
-# TELEMETRY.md changelog) when the evaluated default changes materially.
-CHECK_PACKAGE_EXPERIMENT_KEY = "ouroboros.check_package_default.v1"
-# Share of randomized installations assigned ``on``, in percent.
-CHECK_PACKAGE_ON_PERCENT = 50
 
 
 class Arm(StrEnum):
-    """Whether the check package boundary runs for this installation."""
+    """Whether the check package boundary runs for this run."""
 
     ON = "on"
     OFF = "off"
 
 
 class AssignmentSource(StrEnum):
-    """Why the arm has its value."""
+    """Why the switch has its value."""
 
-    RANDOMIZED = "randomized"
+    DEFAULT = "default"
     USER_FORCED_ON = "user_forced_on"
     USER_FORCED_OFF = "user_forced_off"
+    # The settings could not be resolved (an unexpected error): off, so a
+    # fault in the switch never fails a run (``run_control.CheckPackageRun``).
     FALLBACK = "fallback"
 
 
 @dataclass(frozen=True, slots=True)
 class CheckPackageAssignment:
-    """The resolved arm for one run and where it came from."""
+    """The resolved switch for one run and where it came from."""
 
     arm: Arm
     source: AssignmentSource
@@ -73,33 +64,10 @@ def parse_switch(value: str) -> bool | None:
     return None
 
 
-def randomized_arm(
-    installation_id: str,
-    *,
-    experiment_key: str = CHECK_PACKAGE_EXPERIMENT_KEY,
-    on_percent: int = CHECK_PACKAGE_ON_PERCENT,
-) -> Arm:
-    """Map an anonymous installation ID to an arm, deterministically.
-
-    SHA-256 of ``experiment_key``, a NUL separator, and the ID; the first eight
-    bytes modulo 100 give a bucket in ``[0, 100)``, and buckets below
-    ``on_percent`` are ``on``. The same ID always gets the same arm.
-    """
-    digest = hashlib.sha256(f"{experiment_key}\0{installation_id}".encode()).digest()
-    bucket = int.from_bytes(digest[:8], "big") % 100
-    return Arm.ON if bucket < on_percent else Arm.OFF
-
-
 def _forced(enabled: bool) -> CheckPackageAssignment:
     if enabled:
         return CheckPackageAssignment(Arm.ON, AssignmentSource.USER_FORCED_ON)
     return CheckPackageAssignment(Arm.OFF, AssignmentSource.USER_FORCED_OFF)
-
-
-def _telemetry_rollout_identity() -> str | None:
-    from ouroboros import telemetry
-
-    return telemetry.rollout_identity()
 
 
 def resolve_check_package_assignment(
@@ -107,13 +75,11 @@ def resolve_check_package_assignment(
     *,
     configured: str | None,
     environ: Mapping[str, str] | None = None,
-    identity_reader: Callable[[], str | None] = _telemetry_rollout_identity,
 ) -> CheckPackageAssignment:
-    """Resolve the arm with the precedence in the module docstring.
+    """Resolve the switch with the precedence in the module docstring.
 
     ``configured`` is ``boundary.check_package`` from config (``"on"``,
-    ``"off"``, or ``None`` when unset). ``identity_reader`` returns the
-    anonymous ID eligible for randomization, or ``None``; it never creates one.
+    ``"off"``, or ``None`` when unset).
     """
     if cli_value is not None:
         return _forced(cli_value)
@@ -124,7 +90,7 @@ def resolve_check_package_assignment(
         return _forced(from_env)
     if raw.strip():
         # A set but unreadable value (a typo such as "disable") is an attempt
-        # to choose: treat it as off, never as a randomized assignment.
+        # to opt out: treat it as off, never as the default.
         import structlog
 
         structlog.get_logger(__name__).warning(
@@ -133,23 +99,14 @@ def resolve_check_package_assignment(
         return _forced(False)
     if configured in {"on", "off"}:
         return _forced(configured == "on")
-    try:
-        installation_id = identity_reader()
-    except Exception:  # noqa: BLE001 - the assignment must never fail a run
-        installation_id = None
-    if installation_id:
-        return CheckPackageAssignment(randomized_arm(installation_id), AssignmentSource.RANDOMIZED)
-    return CheckPackageAssignment(Arm.OFF, AssignmentSource.FALLBACK)
+    return CheckPackageAssignment(Arm.ON, AssignmentSource.DEFAULT)
 
 
 __all__ = [
     "CHECK_PACKAGE_ENV",
-    "CHECK_PACKAGE_EXPERIMENT_KEY",
-    "CHECK_PACKAGE_ON_PERCENT",
     "Arm",
     "AssignmentSource",
     "CheckPackageAssignment",
     "parse_switch",
-    "randomized_arm",
     "resolve_check_package_assignment",
 ]

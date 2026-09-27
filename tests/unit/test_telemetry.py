@@ -828,115 +828,6 @@ class TestCapture:
         assert "failure_cause" not in sent[0]["properties"]
         assert "failure_reason_code" not in sent[0]["properties"]
 
-    def test_cli_run_job_type_counts_as_run(self, sent: list[dict[str, Any]]) -> None:
-        telemetry.capture_job_outcome("exec:1", "run", terminal_status="completed", cli_run=True)
-        telemetry.flush(timeout=2.0)
-
-        assert sent[0]["properties"]["command"] == "run"
-
-    def test_a_job_merely_named_run_is_not_a_run(self, sent: list[dict[str, Any]]) -> None:
-        # T6: job_type is caller-controlled; only the CLI marks its outcome.
-        telemetry.capture_job_outcome(
-            "job:1",
-            "run",
-            terminal_status="completed",
-            result_meta={"check_package_arm": "on", "package_verdict": "pass"},
-        )
-        telemetry.flush(timeout=2.0)
-
-        props = sent[0]["properties"]
-        assert props["command"] == "extension_job"
-        assert "check_package_arm" not in props and "package_verdict" not in props
-
-    def test_run_outcome_forwards_closed_check_package_dimensions(
-        self, sent: list[dict[str, Any]]
-    ) -> None:
-        dimensions = {
-            "check_package_arm": "on",
-            "check_package_assignment": "randomized",
-            "check_package_status": "admitted",
-            "package_verdict": "pass",
-            "legacy_verdict": "reject",
-            "reconciliation": "package_accepted_over_legacy_reject",
-            "legacy_failure_class": "evidence_form_mismatch",
-            "legacy_failure_class_count": "1",
-            "oracle_inconsistent_count": "1",
-            "reference_contradiction_count": "0",
-            "reference_unavailable_count": "3+",
-            "binding_request_count": "1",
-            "excluded_check_count": "3+",
-            "replacement_call_count": "1",
-            "verification_coverage": "low",
-        }
-        # Criterion kind labels were removed from routing; their counts are not sent.
-        removed = {"non_behavioral_count": "2", "label_parse_failure_count": "1"}
-        telemetry.capture_job_outcome(
-            "job-private-id",
-            "execute_seed",
-            terminal_status="completed",
-            result_meta={"success": True, **dimensions, **removed},
-        )
-        telemetry.flush(timeout=2.0)
-
-        props = sent[0]["properties"]
-        assert {key: props[key] for key in dimensions} == dimensions
-        assert not set(removed) & set(props)
-        assert set(props) <= telemetry._WORKFLOW_OUTCOME_KEYS
-
-    def test_unaudited_check_package_values_are_dropped_or_folded(
-        self, sent: list[dict[str, Any]]
-    ) -> None:
-        telemetry.capture_job_outcome(
-            "job-private-id",
-            "run",
-            terminal_status="failed",
-            cli_run=True,
-            result_meta={
-                "check_package_arm": "maybe",
-                "check_package_status": "/Users/private/project",
-                "package_verdict": 1,
-                "reconciliation": "agree",
-                "legacy_failure_class": "EVIDENCE_FORM_MISMATCH: pytest /Users/private",
-                "legacy_failure_class_count": 7,
-                "oracle_inconsistent_count": "12",
-            },
-        )
-        telemetry.flush(timeout=2.0)
-
-        props = sent[0]["properties"]
-        for key in (
-            "check_package_arm",
-            "check_package_status",
-            "package_verdict",
-            "legacy_failure_class_count",
-            "oracle_inconsistent_count",
-        ):
-            assert key not in props
-        assert props["reconciliation"] == "agree"
-        assert props["legacy_failure_class"] == "other"
-        assert "private" not in json.dumps(sent[0])
-
-    def test_check_package_dimensions_only_on_run_outcomes(
-        self, sent: list[dict[str, Any]]
-    ) -> None:
-        telemetry.capture_job_outcome(
-            "job-private-id",
-            "evaluate",
-            terminal_status="completed",
-            result_meta={"final_approved": True, "check_package_arm": "on"},
-        )
-        telemetry.flush(timeout=2.0)
-
-        assert "check_package_arm" not in sent[0]["properties"]
-
-    def test_legacy_failure_classes_mirror_the_failure_taxonomy(self) -> None:
-        from ouroboros.orchestrator.failure_taxonomy import FailureClass
-
-        assert {item.value.lower() for item in FailureClass} == telemetry._LEGACY_FAILURE_CLASSES
-        assert telemetry._CHECK_PACKAGE_PROPERTY_VALUES["legacy_failure_class"] == (
-            telemetry._LEGACY_FAILURE_CLASSES | {"none", "accepted", "other"}
-        )
-
     def test_runtime_drift_keeps_closed_kind_only(
         self, monkeypatch: pytest.MonkeyPatch, sent: list[dict[str, Any]]
     ) -> None:
@@ -1179,11 +1070,6 @@ class TestCliCapture:
 
 
 class TestNotice:
-    @pytest.fixture(autouse=True)
-    def _on_a_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # These tests cover what is recorded once the notice reached a person.
-        monkeypatch.setattr(telemetry, "_notice_reaches_a_person", lambda: True)
-
     def test_notice_shown_once(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1342,89 +1228,13 @@ class TestNotice:
         state_dir.mkdir(parents=True)
         state_path = state_dir / "telemetry.json"
         valid_id = str(uuid.uuid4())
-        original = json.dumps(
-            {
-                "distinct_id": valid_id,
-                "notice_shown": True,
-                "notice_version": telemetry._NOTICE_VERSION,
-            }
-        )
+        original = json.dumps({"distinct_id": valid_id, "notice_shown": True})
         state_path.write_text(original, encoding="utf-8")
 
         telemetry.show_first_run_notice()
 
         assert capsys.readouterr().err == ""
         assert state_path.read_text(encoding="utf-8") == original  # untouched, no repair write
-
-    def test_state_without_notice_version_redisplays_the_notice_once(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        tmp_path: Path,
-    ) -> None:
-        """Every telemetry.json written before notice versioning carries only
-        ``notice_shown: true``. Those installs must see the updated notice
-        exactly once, even though the old notice marker is still on disk."""
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        state_dir = tmp_path / ".ouroboros"
-        state_dir.mkdir(parents=True)
-        state_path = state_dir / "telemetry.json"
-        valid_id = str(uuid.uuid4())
-        state_path.write_text(
-            json.dumps({"distinct_id": valid_id, "notice_shown": True}), encoding="utf-8"
-        )
-        marker = state_dir / "telemetry.notice"
-        marker.write_text("", encoding="utf-8")
-        stale = time.time() - telemetry._NOTICE_MARKER_STALE_SECONDS - 5
-        os.utime(marker, (stale, stale))
-
-        telemetry.show_first_run_notice()
-        printed = capsys.readouterr().err.lower()
-        assert "randomized product defaults" in printed
-        assert "research" in printed
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        assert state["notice_shown"] is True
-        assert state["notice_version"] == telemetry._NOTICE_VERSION
-        assert state["distinct_id"] == valid_id
-
-        telemetry._reset_for_tests()
-        telemetry.show_first_run_notice()
-        assert capsys.readouterr().err == ""
-
-    @pytest.mark.parametrize("recorded", [0, 3, "4", True, 4.0, None])
-    def test_older_or_invalid_notice_version_fails_toward_disclosure(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        tmp_path: Path,
-        recorded: object,
-    ) -> None:
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        state_dir = tmp_path / ".ouroboros"
-        state_dir.mkdir(parents=True)
-        state_path = state_dir / "telemetry.json"
-        state_path.write_text(
-            json.dumps(
-                {"distinct_id": str(uuid.uuid4()), "notice_shown": True, "notice_version": recorded}
-            ),
-            encoding="utf-8",
-        )
-
-        telemetry.show_first_run_notice()
-
-        assert "anonymous" in capsys.readouterr().err.lower()
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        assert state["notice_version"] == telemetry._NOTICE_VERSION
-
-    def test_notice_version_matches_the_installer(self) -> None:
-        install_sh = Path(__file__).resolve().parents[2] / "scripts" / "install.sh"
-        match = re.search(
-            r"^TELEMETRY_NOTICE_VERSION=(\d+)$",
-            install_sh.read_text(encoding="utf-8"),
-            re.MULTILINE,
-        )
-        assert match is not None
-        assert int(match.group(1)) == telemetry._NOTICE_VERSION
 
 
 class TestExitDoesNotBlock:
@@ -1684,79 +1494,6 @@ class TestStateRepair:
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert state["distinct_id"] == outputs[0]
-
-
-class TestNoticeDisplay:
-    """T1: the notice counts as shown only when a person saw it on a terminal."""
-
-    def _state(self, tmp_path: Path) -> dict[str, Any]:
-        return json.loads((tmp_path / ".ouroboros" / "telemetry.json").read_text(encoding="utf-8"))
-
-    def test_without_a_terminal_the_notice_prints_but_is_not_recorded(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        tmp_path: Path,
-    ) -> None:
-        # mcp serve: stdin from /dev/null, stderr captured into a log.
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        monkeypatch.delenv("CI", raising=False)
-        monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
-        telemetry.show_first_run_notice()
-        assert "anonymous" in capsys.readouterr().err.lower()
-        state = self._state(tmp_path)
-        assert state["notice_shown"] is False and "notice_version" not in state
-        # The install stays outside randomized defaults (fallback arm).
-        assert telemetry.rollout_identity() is None
-
-    def test_ci_is_not_a_person_even_on_a_terminal(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        monkeypatch.setenv("CI", "true")
-        monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
-        telemetry.show_first_run_notice()
-        assert self._state(tmp_path)["notice_shown"] is False
-        assert telemetry.rollout_identity() is None
-
-    def test_an_upgraded_plugin_install_is_not_disclosed_by_a_headless_start(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        # notice_shown true from an earlier version, no notice_version.
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        monkeypatch.delenv("CI", raising=False)
-        state_path = tmp_path / ".ouroboros" / "telemetry.json"
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(
-            json.dumps(
-                {
-                    "distinct_id": "5eed0000-0000-4000-8000-000000000000",
-                    "created_at": "2026-01-01T00:00:00+00:00",
-                    "notice_shown": True,
-                }
-            ),
-            encoding="utf-8",
-        )
-        telemetry._reset_for_tests()
-        monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
-        telemetry.show_first_run_notice()
-        assert "notice_version" not in self._state(tmp_path)
-        assert telemetry.rollout_identity() is None
-
-    def test_on_a_terminal_the_notice_is_recorded(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        tmp_path: Path,
-    ) -> None:
-        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
-        monkeypatch.delenv("CI", raising=False)
-        monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
-        telemetry.show_first_run_notice()
-        assert "anonymous" in capsys.readouterr().err.lower()
-        state = self._state(tmp_path)
-        assert state["notice_shown"] is True and state["notice_version"] == 4
-        assert telemetry.rollout_identity() == state["distinct_id"]
 
 
 class TestNoticeRace:

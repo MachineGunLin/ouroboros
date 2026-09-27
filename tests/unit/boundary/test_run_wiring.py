@@ -473,19 +473,33 @@ def test_switch_precedence_cli_then_env_then_config(monkeypatch: pytest.MonkeyPa
         assert resolve_check_package_settings(True).enabled is True
 
 
-def test_unset_switch_without_telemetry_falls_back_to_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unset_switch_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     from ouroboros.config.models import BoundaryConfig
 
     monkeypatch.delenv("OUROBOROS_CHECK_PACKAGE", raising=False)
+    monkeypatch.setenv("OUROBOROS_TELEMETRY", "0")
     with patch(
         "ouroboros.boundary.run_wiring._load_boundary_config", return_value=BoundaryConfig()
     ):
         settings = resolve_check_package_settings(None)
-    assert settings.enabled is False
+    assert settings.enabled is True
     assert settings.assignment is not None
-    assert settings.assignment.source.value == "fallback"
+    assert settings.assignment.source.value == "default"
+
+
+def test_unreadable_config_never_turns_the_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable config may hold an explicit off: without a flag or variable, off."""
+    monkeypatch.delenv("OUROBOROS_CHECK_PACKAGE", raising=False)
+    with patch(
+        "ouroboros.boundary.run_wiring._load_boundary_config", side_effect=ValueError("bad yaml")
+    ):
+        settings = resolve_check_package_settings(None)
+        assert settings.enabled is False
+        assert settings.assignment is not None
+        assert settings.assignment.source.value == "fallback"
+        assert resolve_check_package_settings(True).enabled is True
+        monkeypatch.setenv("OUROBOROS_CHECK_PACKAGE", "on")
+        assert resolve_check_package_settings(None).enabled is True
 
 
 def test_config_accepts_yaml_boolean_spelling() -> None:
@@ -494,7 +508,7 @@ def test_config_accepts_yaml_boolean_spelling() -> None:
     assert BoundaryConfig.model_validate({"check_package": True}).check_package == "on"
     assert BoundaryConfig.model_validate({"check_package": False}).check_package == "off"
     assert BoundaryConfig.model_validate({"check_package": "off"}).check_package == "off"
-    # Unset means "use the randomized default", which differs from an explicit off.
+    # Unset means "use the default (on)", which differs from an explicit on or off.
     assert OuroborosConfig().boundary.check_package is None
 
 
@@ -595,6 +609,14 @@ async def _run_cli(
     def capture(_job_id: str, job_type: str, **kwargs: Any) -> None:
         seen["telemetry"] = {"job_type": job_type, **kwargs}
 
+    from ouroboros.boundary.run_control import CheckPackageRun
+
+    real_resolve = CheckPackageRun.resolve
+
+    def resolve(cli_value: bool | None = None) -> CheckPackageRun:
+        seen["check_package_run"] = real_resolve(cli_value)
+        return seen["check_package_run"]
+
     with (
         patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=SEED_DATA),
         patch("ouroboros.orchestrator.create_agent_runtime"),
@@ -606,6 +628,7 @@ async def _run_cli(
             side_effect=lambda execution_id: tmp_path / "store" / execution_id,
         ),
         patch("ouroboros.telemetry.capture_job_outcome", side_effect=capture),
+        patch("ouroboros.boundary.run_control.CheckPackageRun.resolve", side_effect=resolve),
     ):
         await _run_orchestrator(
             seed_file, no_qa=True, project_dir=project, check_package=check_package
@@ -626,9 +649,17 @@ def _constructor_factory(script: str, calls: list[dict[str, Any]]) -> Any:
     return factory
 
 
-def _check_package_meta(seen: dict[str, Any]) -> dict[str, Any]:
-    meta = seen["telemetry"]["result_meta"]
-    return {key: value for key, value in meta.items() if key not in {"success"}}
+async def _check_package_meta(seen: dict[str, Any]) -> dict[str, Any]:
+    """The run's local outcome summary; telemetry carries none of it."""
+    sent = seen["telemetry"]["result_meta"]
+    assert not {"check_package_arm", "package_verdict", "reconciliation"} & set(sent)
+    kwargs = seen.get("kwargs", {})
+    return await seen["check_package_run"].outcome_meta(
+        seen["store"],
+        execution_id=kwargs.get("execution_id"),
+        session_id=kwargs.get("session_id"),
+        terminal_status=seen["telemetry"]["terminal_status"],
+    )
 
 
 async def test_cli_flag_off_adds_no_model_call_and_no_event(
@@ -643,7 +674,7 @@ async def test_cli_flag_off_adds_no_model_call_and_no_event(
         store, runner, seen = await _run_cli(
             tmp_path,
             repo,
-            check_package=None,
+            check_package=False,
             constructor_cls=_constructor_factory(BUGFIX_SCRIPT, calls),
             worker_edit=None,
             monkeypatch=monkeypatch,
@@ -662,10 +693,9 @@ async def test_cli_flag_off_adds_no_model_call_and_no_event(
             {"t": BOUNDARY_AGGREGATE_TYPE},
         )
         assert rows.scalar() == 0
-    # Without telemetry the unset switch is the fallback arm, recorded as such.
-    assert _check_package_meta(seen) == {
+    assert (await _check_package_meta(seen)) == {
         "check_package_arm": "off",
-        "check_package_assignment": "fallback",
+        "check_package_assignment": "user_forced_off",
         "check_package_status": "not_run",
         "package_verdict": "none",
         "legacy_verdict": "accept",
@@ -711,7 +741,7 @@ async def test_cli_flag_on_admits_before_dispatch_and_verifies_after(
     ]
     verified = (await store.replay(BOUNDARY_AGGREGATE_TYPE, f"{execution_id}/check_package/v1"))[4]
     assert verified.data["verdict"] == "pass"
-    assert _check_package_meta(seen) == {
+    assert (await _check_package_meta(seen)) == {
         "check_package_arm": "on",
         "check_package_assignment": "user_forced_on",
         "check_package_status": "admitted",
@@ -728,6 +758,33 @@ async def test_cli_flag_on_admits_before_dispatch_and_verifies_after(
         "replacement_call_count": "0",
         "verification_coverage": "low",
     }
+    await store.close()
+
+
+async def test_cli_without_any_setting_runs_the_check_package(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On by default: no flag, no variable, no config, telemetry off."""
+    from ouroboros.config.models import BoundaryConfig
+
+    monkeypatch.setenv("OUROBOROS_TELEMETRY", "0")
+    calls: list[dict[str, Any]] = []
+    with patch(
+        "ouroboros.boundary.run_wiring._load_boundary_config", return_value=BoundaryConfig()
+    ):
+        store, runner, seen = await _run_cli(
+            tmp_path,
+            repo,
+            check_package=None,
+            constructor_cls=_constructor_factory(BUGFIX_SCRIPT, calls),
+            worker_edit=FIXED,
+            monkeypatch=monkeypatch,
+        )
+    assert len(calls) == 1
+    assert seen["events_at_dispatch"] == [PACKAGE_FROZEN, ADMISSION_COMPLETED, ACTOR_STARTED]
+    assert runner.acceptance_authority is not None
+    meta = await _check_package_meta(seen)
+    assert (meta["check_package_arm"], meta["check_package_assignment"]) == ("on", "default")
     await store.close()
 
 
@@ -751,7 +808,7 @@ async def test_cli_flag_on_exits_non_zero_when_the_candidate_fails(
     (result,) = seen["parallel_result"].results
     assert result.success is False and result.outcome.value == "failed"
     assert seen["telemetry"]["terminal_status"] == "failed"
-    meta = _check_package_meta(seen)
+    meta = await _check_package_meta(seen)
     assert meta["package_verdict"] == "fail"
     assert meta["legacy_verdict"] == "accept"
     assert meta["reconciliation"] == "package_rejected_over_legacy_accept"
@@ -814,7 +871,7 @@ async def test_cli_unverified_criterion_with_a_legacy_rejection_exits_non_zero(
     (result,) = seen["parallel_result"].results
     assert result.success is False and result.outcome.value == "failed"
     assert seen["telemetry"]["terminal_status"] == "failed"
-    meta = _check_package_meta(seen)
+    meta = await _check_package_meta(seen)
     assert meta["legacy_verdict"] == "reject"
     assert meta["reconciliation"] == "legacy_decided_unverified"
     assert meta["verification_coverage"] == "low"
@@ -838,7 +895,7 @@ async def test_cli_package_fail_keeps_a_rejected_run_failed(
             seen=seen,
         )
     assert exit_info.value.exit_code == 1
-    assert _check_package_meta(seen)["reconciliation"] == "agree"
+    assert (await _check_package_meta(seen))["reconciliation"] == "agree"
 
 
 async def test_cli_flag_off_keeps_a_rejected_run_failed(
@@ -867,7 +924,7 @@ async def test_cli_flag_off_keeps_a_rejected_run_failed(
         )
     assert exit_info.value.exit_code == 1
     assert calls == []
-    meta = _check_package_meta(seen)
+    meta = await _check_package_meta(seen)
     assert meta["check_package_assignment"] == "user_forced_off"
     assert meta["legacy_verdict"] == "reject"
     assert meta["reconciliation"] == "none"

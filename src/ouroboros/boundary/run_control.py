@@ -1,16 +1,16 @@
 """One run's check package boundary, shared by ``ooo run`` and ``ouroboros_execute_seed``.
 
-``CheckPackageRun`` resolves the arm (``boundary/rollout.py``), prepares the
-package before the worker starts, installs ``CheckPackageAuthority`` on the
-runner so the package decides the criteria it covers before the terminal
-status is persisted, and afterwards renders the outcome and the enumerated
-``workflow_outcome`` dimensions (TELEMETRY.md, "Randomized defaults").
+``CheckPackageRun`` resolves the switch (``boundary/rollout.py``, on by
+default), prepares the package before the worker starts, installs
+``CheckPackageAuthority`` on the runner so the package decides the criteria it
+covers before the terminal status is persisted, and afterwards renders the
+outcome and a closed-value summary of it (``outcome_meta``) that the MCP
+``execute_seed`` result carries. Nothing here is sent as telemetry.
 
-With the arm ``off`` nothing here calls a model, writes an event, or touches
-the runner: the run is the legacy run. The legacy failure-class dimensions are
-still derived (read-only) so the ``off`` arm is a baseline.
+With the switch ``off`` nothing here calls a model, writes an event, or
+touches the runner: the run is the legacy run.
 
-On resume the arm is read from the journal, not resolved again: when the
+On resume the switch is read from the journal, not resolved again: when the
 original run bound its worker to an admitted package, the resumed run
 recomputes the package decision (``boundary/resume.py``) instead of letting
 the legacy verifier decide the covered criteria.
@@ -57,8 +57,7 @@ log = structlog.get_logger(__name__)
 
 RECOVERY_EXHAUSTED_EVENT_TYPE = "execution.ac.recovery_exhausted"
 _EVIDENCE_LIMIT = 5000
-# orchestrator/failure_taxonomy.FailureClass values, lower-cased; the telemetry
-# serializer holds the same closed set (telemetry._LEGACY_FAILURE_CLASSES).
+# orchestrator/failure_taxonomy.FailureClass values, lower-cased.
 _FAILURE_CLASS_VALUES = frozenset(
     {
         "evidence_missing",
@@ -71,6 +70,15 @@ _FAILURE_CLASS_VALUES = frozenset(
     }
 )
 _FALLBACK_ASSIGNMENT = CheckPackageAssignment(Arm.OFF, AssignmentSource.FALLBACK)
+
+
+def _switch_text(source: AssignmentSource) -> str:
+    if source is AssignmentSource.DEFAULT:
+        return (
+            "on by default; opt out with --no-check-package, OUROBOROS_CHECK_PACKAGE=off, "
+            "or boundary.check_package: off"
+        )
+    return f"on, {source.value}"
 
 
 def _count_bucket(count: int) -> str:
@@ -198,7 +206,7 @@ ConstructorFactory = Callable[..., Any]
 
 @dataclass
 class CheckPackageRun:
-    """The check package boundary of one run, from arm to telemetry."""
+    """The check package boundary of one run, from the switch to the outcome summary."""
 
     settings: CheckPackageSettings
     state: BoundaryRunState | None = None
@@ -211,7 +219,7 @@ class CheckPackageRun:
 
     @classmethod
     def resolve(cls, cli_value: bool | None = None) -> CheckPackageRun:
-        """Resolve the arm and budgets; never raises (an error means ``off``)."""
+        """Resolve the switch and budgets; never raises (an error means ``off``)."""
         try:
             return cls(resolve_check_package_settings(cli_value))
         except Exception:  # noqa: BLE001 - resolving the default must not fail a run
@@ -221,8 +229,8 @@ class CheckPackageRun:
     @property
     def assignment(self) -> CheckPackageAssignment:
         if self.resumed is not None:
-            # The original run's arm, from the journal (R4-A2): a bound
-            # package means arm on. Journals written before the source was
+            # The original run's switch, from the journal (R4-A2): a bound
+            # package means on. Journals written before the source was
             # recorded report ``user_forced_on``.
             try:
                 source = AssignmentSource(self.resumed.boundary.assignment or "")
@@ -274,7 +282,7 @@ class CheckPackageRun:
             constructor_factory = CheckConstructor
         lines = [
             "Check package: constructing checks from the acceptance criteria "
-            f"(read-only; arm on, {self.assignment.source.value})..."
+            f"(read-only; {_switch_text(self.assignment.source)})..."
         ]
         try:
             constructor = constructor_factory(
@@ -310,8 +318,8 @@ class CheckPackageRun:
         if not state.admitted:
             # No admitted package: this run is the legacy run, exactly as with
             # the check package off (user decision, 2026-09-27). Nothing is
-            # installed on the runner; telemetry keeps the failure status and
-            # reports reconciliation=fallback_to_legacy.
+            # installed on the runner; the outcome summary keeps the failure
+            # status and reports reconciliation=fallback_to_legacy.
             return [*lines, *render_preparation(state)]
         self.authority = CheckPackageAuthority(
             state, self.settings, event_store=event_store, candidate_checkout=worker_dir
@@ -418,7 +426,7 @@ class CheckPackageRun:
 
     @property
     def status(self) -> str:
-        """``check_package_status`` (TELEMETRY.md)."""
+        """``check_package_status`` of the outcome summary (``outcome_meta``)."""
         if self.resumed is not None:
             # Only a run whose worker was bound to an admitted package resumes
             # with a package decision.
@@ -484,7 +492,7 @@ class CheckPackageRun:
         return lines
 
     def _coverage(self) -> str | None:
-        """``verification_coverage``: ``low`` when the package decided nothing (arm on)."""
+        """``verification_coverage``: ``low`` when the package decided nothing (switch on)."""
         if self.status == "not_run" and self.resumed is None:
             return None
         outcome = self._outcome()
@@ -539,6 +547,18 @@ class CheckPackageRun:
             return "package_accepted_over_legacy_reject"
         return "package_rejected_over_legacy_accept"
 
+    def finish(self, terminal_status: str | None) -> None:
+        """Close the run's check package record once the final verdict exists.
+
+        On a terminal status (``completed``, ``failed``, ``cancelled``; never
+        ``paused``) after the authority decided, reveal the commitment salts
+        of every frozen version (the authority already did for its own).
+        """
+        if terminal_status in ("completed", "failed", "cancelled") and (
+            self.authority is None or self.authority.outcome is not None
+        ):
+            reveal_commitment_salts(self.state)
+
     async def outcome_meta(
         self,
         event_store: EventStore,
@@ -548,13 +568,8 @@ class CheckPackageRun:
         terminal_status: str | None,
         verdict_available: bool = True,
     ) -> dict[str, str]:
-        """The enumerated ``workflow_outcome`` dimensions for this run."""
-        if terminal_status in ("completed", "failed", "cancelled") and (
-            self.authority is None or self.authority.outcome is not None
-        ):
-            # The run's final verdict exists: reveal the commitment salts of
-            # every frozen version (the authority already did for its own).
-            reveal_commitment_salts(self.state)
+        """The closed-value summary of this run's check package outcome (local only)."""
+        self.finish(terminal_status)
         legacy_verdict = self._legacy_verdict(terminal_status, verdict_available=verdict_available)
         meta = {
             "check_package_arm": self.assignment.arm.value,
@@ -581,7 +596,7 @@ class CheckPackageRun:
             )
         reconciliation = outcome.reconciliation if outcome is not None else None
         if reconciliation is not None and outcome is not None and outcome.package_decided:
-            # Only when the package decided the run (TELEMETRY.md).
+            # Only when the package decided the run.
             meta["unverified_count"] = _count_bucket(len(reconciliation.unverified))
             meta["check_tier_summary"] = tier_summary_value(reconciliation.tiers)
         meta.update(reference_check_meta(self.state))

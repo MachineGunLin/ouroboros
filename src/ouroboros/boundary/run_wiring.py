@@ -114,6 +114,7 @@ from ouroboros.boundary.reference_check import (
     check_references,
 )
 from ouroboros.boundary.rollout import (
+    Arm,
     AssignmentSource,
     CheckPackageAssignment,
     resolve_check_package_assignment,
@@ -171,14 +172,16 @@ def _load_boundary_config() -> Any:
 
 
 def resolve_check_package_settings(cli_value: bool | None = None) -> CheckPackageSettings:
-    """Resolve the arm (``boundary/rollout.py``) and the budgets for one run.
+    """Resolve the switch (``boundary/rollout.py``) and the budgets for one run.
 
     Precedence: CLI flag, then ``OUROBOROS_CHECK_PACKAGE``, then
-    ``boundary.check_package`` in config, then the installation's randomized
-    arm; ``off`` when none applies. Budgets always come from ``boundary`` in
-    config. An unreadable config contributes no setting (and disables
-    telemetry, so no randomized arm either).
+    ``boundary.check_package`` in config; ``on`` when none applies. Budgets
+    always come from ``boundary`` in config. An unreadable config may hold an
+    explicit ``off`` this process cannot see, so it never yields the default:
+    without a CLI or environment setting the switch is then ``off``
+    (``fallback``).
     """
+    config_unreadable = False
     try:
         config = _load_boundary_config()
         configured = config.check_package
@@ -190,7 +193,13 @@ def resolve_check_package_settings(cli_value: bool | None = None) -> CheckPackag
     except Exception:
         configured = None
         budgets = {}
+        config_unreadable = True
     assignment = resolve_check_package_assignment(cli_value, configured=configured)
+    if config_unreadable and assignment.source is AssignmentSource.DEFAULT:
+        import structlog
+
+        structlog.get_logger(__name__).warning("boundary.run_wiring.config_unreadable")
+        assignment = CheckPackageAssignment(Arm.OFF, AssignmentSource.FALLBACK)
     return CheckPackageSettings(enabled=assignment.enabled, assignment=assignment, **budgets)
 
 

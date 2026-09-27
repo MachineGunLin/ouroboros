@@ -804,15 +804,14 @@ class SeedConfig(BaseModel, frozen=True):
 
 
 class BoundaryConfig(BaseModel, frozen=True):
-    """Pre-dispatch check package for ``ooo run`` (a randomized default).
+    """Pre-dispatch check package for ``ooo run`` (on by default).
 
     Attributes:
         check_package: ``on`` makes a new ``ooo run`` construct a check package
             from the Seed's acceptance criteria before the worker starts, admit
             it on the base checkout, and verify the finished workspace against
-            it. ``off`` leaves the run path unchanged. Unset (default) uses the
-            installation's randomized arm, which is ``off`` without telemetry
-            (``ouroboros.boundary.rollout``).
+            it. ``off`` leaves the run path unchanged. Unset (default) means
+            ``on`` (``ouroboros.boundary.rollout``).
         constructor_timeout_seconds: Wall-clock budget of one read-only
             constructor model call.
         check_timeout_seconds: Per-check command timeout during admission and
@@ -857,7 +856,7 @@ class OuroborosConfig(BaseModel, frozen=True):
         runtime_controls: Long-running workflow timeout/progress controls
         logging: Logging configuration
         seed: Seed-authoring gates applied before execution
-        boundary: Pre-dispatch check package for ``ooo run`` (randomized default)
+        boundary: Pre-dispatch check package for ``ooo run`` (on by default)
     """
 
     economics: EconomicsConfig = Field(default_factory=EconomicsConfig)

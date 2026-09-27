@@ -613,8 +613,8 @@ async def _record_cli_run_outcome(
     ``failure_cause`` derived from durable executor evidence, never prose. The
     outcome id is fresh per invocation because ``--resume`` reuses the
     execution id and each attempt is its own outcome. ``check_package_run``
-    (``boundary/run_control.py``) adds the enumerated check-package
-    dimensions. Never raises.
+    (``boundary/run_control.py``) closes its record at the same terminal
+    status; nothing from it is sent. Never raises.
     """
     from ouroboros.mcp.tools.run_failure_meta import derive_run_failure_meta
     from ouroboros.orchestrator.session import SessionStatus
@@ -660,15 +660,8 @@ async def _record_cli_run_outcome(
                 pass
         if check_package_run is not None:
             try:
-                result_meta.update(
-                    await check_package_run.outcome_meta(
-                        event_store,
-                        execution_id=execution_id,
-                        session_id=session_id,
-                        terminal_status=terminal_status,
-                        verdict_available=result.is_ok,
-                    )
-                )
+                # A paused run returned above: the final verdict exists.
+                check_package_run.finish(terminal_status)
             except Exception:
                 pass
         usage_telemetry.capture_job_outcome(
@@ -676,7 +669,6 @@ async def _record_cli_run_outcome(
             "run",
             terminal_status=terminal_status,
             result_meta=result_meta,
-            cli_run=True,
         )
     except Exception:
         pass
@@ -714,8 +706,8 @@ async def _run_orchestrator(
         project_fallback_dir: Directory to stand in for the Seed file's folder
             when the Seed itself does not say where it belongs.
         check_package: ``--check-package`` / ``--no-check-package``; ``None``
-            defers to ``OUROBOROS_CHECK_PACKAGE``, ``boundary.check_package``, and
-            the randomized default (``ouroboros.boundary.rollout``).
+            defers to ``OUROBOROS_CHECK_PACKAGE``, then ``boundary.check_package``,
+            then the default, which is on (``ouroboros.boundary.rollout``).
     """
     from ouroboros.core.seed import Seed
     from ouroboros.orchestrator import (
@@ -1008,9 +1000,9 @@ async def _prepare_check_package_boundary(
     runtime_backend: str,
     execution_model: str | None,
 ) -> Any:
-    """Resolve the check-package arm and, when on, prepare the package before dispatch.
+    """Resolve the check-package switch and, when on, prepare the package before dispatch.
 
-    Returns the run's ``CheckPackageRun``. With the arm ``off`` nothing here
+    Returns the run's ``CheckPackageRun``. With the switch ``off`` nothing here
     calls a model, writes an event, or changes the runner. With it ``on`` the
     package is frozen and admitted before the worker starts, and the runner
     gets the acceptance authority that decides covered criteria before the
@@ -1157,13 +1149,14 @@ def workflow(
             help=(
                 "Before the worker starts, build executable checks from the acceptance "
                 "criteria, admit them on the current tree, and let them decide the "
-                "criteria they cover. Default: OUROBOROS_CHECK_PACKAGE, then "
-                "boundary.check_package in config, then this installation's randomized "
-                "arm (off when telemetry is off). --no-check-package opts out. The checks "
-                "are model-written Python scripts. They run on throwaway copies of the "
-                "project with the project's interpreter, a per-check timeout, and "
-                "credential-like environment variables removed, but without an OS "
-                "sandbox: they can read files you can read and use the network."
+                "criteria they cover. On by default; --no-check-package opts out (or "
+                "OUROBOROS_CHECK_PACKAGE=off, or boundary.check_package: off in config). "
+                "The checks are model-written Python scripts. They run on throwaway "
+                "copies of the project with the project's interpreter, a per-check "
+                "timeout, and a minimal environment (an allowlist of variables such as "
+                "PATH and the locale, HOME and TMPDIR set to a scratch directory, no "
+                "other inherited variable), but without an OS sandbox: they run as you, "
+                "so they can read files you can read and use the network."
             ),
         ),
     ] = None,

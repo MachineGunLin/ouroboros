@@ -87,7 +87,6 @@ async def test_failed_run_records_failed_outcome_with_failure_cause() -> None:
         "run",
         terminal_status="failed",
         result_meta={"success": False, **_FAILURE_META},
-        cli_run=True,
     )
     assert capture.call_args.args[0].startswith("exec-test:")
 
@@ -139,7 +138,7 @@ async def test_successful_run_records_completed_without_failure_meta() -> None:
 
     derive.assert_not_awaited()
     capture.assert_called_once_with(
-        ANY, "run", terminal_status="completed", result_meta={"success": True}, cli_run=True
+        ANY, "run", terminal_status="completed", result_meta={"success": True}
     )
 
 
@@ -244,7 +243,7 @@ async def test_failure_meta_errors_still_count_the_failed_run() -> None:
         )
 
     capture.assert_called_once_with(
-        ANY, "run", terminal_status="failed", result_meta={"success": False}, cli_run=True
+        ANY, "run", terminal_status="failed", result_meta={"success": False}
     )
 
 

@@ -38,7 +38,6 @@ from ouroboros.orchestrator.parallel_executor_models import (
 )
 from ouroboros.orchestrator.verifier import VerifierVerdict
 from ouroboros.persistence.event_store import EventStore
-from ouroboros.telemetry import _check_package_properties
 
 BUGGY = "def clamp(value, low, high):\n    if value > high:\n        return value\n    return max(low, value)\n"
 FIXED = "def clamp(value, low, high):\n    return max(low, min(high, value))\n"
@@ -380,9 +379,6 @@ async def test_authority_matrix_and_exit_semantics(
     assert not {"non_behavioral_count", "label_parse_failure_count"} & set(meta)
     assert meta["legacy_failure_class"] == "evidence_form_mismatch"
     assert meta["legacy_failure_class_count"] == "3+"
-    sent = _check_package_properties(meta)
-    assert sent["reconciliation"] == "legacy_decided_unverified"
-    assert sent["verification_coverage"] == "partial" and "non_behavioral_count" not in sent
 
 
 async def test_a_legacy_accepted_unverified_criterion_exits_zero(
@@ -540,10 +536,6 @@ def test_an_unavailable_transcript_is_no_legacy_rejection(gated: bool) -> None:
 
 def test_tier_summary_value_is_a_closed_bucketed_enum() -> None:
     assert tier_summary_value({"A": 5, "A_prime": 2, "U": 0, "C": 4}) == "A:3+,A_prime:2,U:0"
-    dropped = _check_package_properties(
-        {"check_tier_summary": "A:9,A_prime:0,U:0", "unverified_count": "7"}
-    )
-    assert dropped == {}
 
 
 async def test_the_gate_decides_each_attempt_once(
@@ -638,7 +630,7 @@ async def test_outage_falls_back_to_the_legacy_path(
         CheckPackageSettings(
             enabled=True,
             max_construction_attempts=2,
-            assignment=CheckPackageAssignment(Arm.ON, AssignmentSource.RANDOMIZED),
+            assignment=CheckPackageAssignment(Arm.ON, AssignmentSource.DEFAULT),
         )
     )
     lines = await run.prepare(
@@ -1190,7 +1182,7 @@ async def test_held_out_values_never_reach_the_boundary_store(
     assert verify_commitment(state.package, salt, record["package_commitment"])
 
 
-async def test_telemetry_never_reads_an_unavailable_transcript_as_a_rejection(
+async def test_the_outcome_summary_never_reads_an_unavailable_transcript_as_a_rejection(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
     # R3-A2: the package passes and the legacy verifier had no transcript:

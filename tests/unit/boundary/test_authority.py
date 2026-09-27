@@ -283,10 +283,10 @@ async def _meta(run: CheckPackageRun, terminal_status: str, **kwargs: Any) -> di
 
 
 async def test_outcome_meta_for_an_arm_that_never_ran() -> None:
-    off = await _meta(_run(False, AssignmentSource.RANDOMIZED), "failed")
+    off = await _meta(_run(False, AssignmentSource.DEFAULT), "failed")
     assert off == {
         "check_package_arm": "off",
-        "check_package_assignment": "randomized",
+        "check_package_assignment": "default",
         "check_package_status": "not_run",
         "package_verdict": "none",
         "legacy_verdict": "reject",
@@ -304,7 +304,7 @@ async def test_outcome_meta_for_an_arm_that_never_ran() -> None:
 async def test_outcome_meta_when_preparation_failed_or_the_hook_never_ran(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
-    run = _run(True, AssignmentSource.RANDOMIZED)
+    run = _run(True, AssignmentSource.DEFAULT)
     run.attempted = True
     run.preparation_error = "OSError"
     meta = await _meta(run, "completed")
