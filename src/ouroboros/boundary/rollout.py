@@ -118,9 +118,19 @@ def resolve_check_package_assignment(
     if cli_value is not None:
         return _forced(cli_value)
     env = os.environ if environ is None else environ
-    from_env = parse_switch(env.get(CHECK_PACKAGE_ENV, ""))
+    raw = env.get(CHECK_PACKAGE_ENV, "")
+    from_env = parse_switch(raw)
     if from_env is not None:
         return _forced(from_env)
+    if raw.strip():
+        # A set but unreadable value (a typo such as "disable") is an attempt
+        # to choose: treat it as off, never as a randomized assignment.
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "boundary.rollout.unparsable_switch", variable=CHECK_PACKAGE_ENV
+        )
+        return _forced(False)
     if configured in {"on", "off"}:
         return _forced(configured == "on")
     try:

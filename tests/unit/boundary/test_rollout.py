@@ -69,7 +69,9 @@ def test_randomized_arm_respects_the_fraction_and_the_experiment_key() -> None:
         ),
         ({"env": "on", "configured": "off"}, "on", "user_forced_on"),
         ({"env": "off", "configured": "on", "identity": INSTALL_ID}, "off", "user_forced_off"),
-        ({"env": "garbage", "configured": "on"}, "on", "user_forced_on"),
+        # T2: a set but unreadable value is off (with a warning), never randomized.
+        ({"env": "garbage", "configured": "on"}, "off", "user_forced_off"),
+        ({"env": "disable", "identity": INSTALL_ID}, "off", "user_forced_off"),
         ({"configured": "off", "identity": INSTALL_ID}, "off", "user_forced_off"),
         ({"configured": "on"}, "on", "user_forced_on"),
         ({}, "off", "fallback"),
