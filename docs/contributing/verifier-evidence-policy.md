@@ -99,8 +99,8 @@ the default) and the leaf held Bash authority. The rules:
   `file`, `diff`, `git`, ...), package managers, `xargs`, an absolute-path
   program or argument outside the workspace, an environment assignment in
   the command naming an absolute path outside the workspace (`PATH=/tmp/x`),
-  and a runner in a mode that runs no tests (`--help`, `--collect-only`,
-  `make -n`, ...). One exception: an absolute-path program whose name is an
+  `uv run --env-file`, and a runner in a mode that runs no tests
+  (`--help`, `--collect-only`, `make -n`, ...). One exception: an absolute-path program whose name is an
   allowlisted interpreter or runner (`python3.9`, `pytest`, `make`, ...) is
   admitted when its real path, symlinks resolved, lies inside a known
   environment root: `sys.prefix` or `sys.base_prefix` of the verifying
@@ -110,6 +110,10 @@ the default) and the leaf held Bash authority. The rules:
 - **Isolation.** Each command runs as a direct argv (no shell) in a fresh copy
   of the workspace, with the verify gate's scrubbed environment plus
   `PYTHONDONTWRITEBYTECODE=1`, and `execution.verify_command_timeout_seconds`.
+  `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` and `PYTEST_DISABLE_PLUGIN_AUTOLOAD` are
+  removed from the inherited environment, and each replayed run records them
+  in `scrubbed_environment`. Assignments the command itself makes are kept
+  (recorded in `env_delta`); they disable target linkage instead (below).
   `.git` and caches are not copied; `.venv`, `venv`, `node_modules`, `.tox`
   and `.nox` are linked, not copied. A workspace over 50,000 files or 1 GiB is
   not replayed. Absolute workspace paths in the command point at the copy.
@@ -139,17 +143,41 @@ the default) and the leaf held Bash authority. The rules:
   - minus a trailing `(N tests)` count, is one test target that is a
     positional operand (not an option value) of a test runner that executes
     it (pytest, unittest, Django-style runners, `bin/test`, jest, vitest,
-    mocha, rspec, `go test`, phpunit), with no option that excludes or
-    narrows the tests (`--ignore`, `--deselect`, `-k`, `-m`, `--exclude*`,
-    `--tag`, `--start-after`, ...). For example `migrations (578 tests)` is
-    linked to `python tests/runtests.py migrations`, and `tests/test_x.py` is
-    not linked to `sed -n 1,40p tests/test_x.py` or to
-    `pytest --ignore tests/test_x.py`.
+    mocha, rspec, `go test`, phpunit), and nothing in the command narrows
+    what the runner collects or selects (see "Narrowing" below). For example
+    `migrations (578 tests)` is linked to `python tests/runtests.py
+    migrations`, and `tests/test_x.py` is not linked to `sed -n 1,40p
+    tests/test_x.py` or to `pytest --ignore tests/test_x.py`.
 
   A claim that merely contains a command (`make` inside `make test`) is not
   linked to it. The runner-output rules apply to a replayed run only under the
-  same conditions: no excluding option, and a claimed file named in the
+  same conditions: nothing narrows it, and a claimed file named in the
   command must be one of its executed operands.
+- **Narrowing.** Any of these in a command disables the target rule and the
+  runner-output rules for it, on replay and on the transcript-only path:
+  - an option that excludes or selects tests, in any spelling (`--opt value`,
+    `--opt=value`, `-kvalue`): pytest `--deselect`, `--ignore`,
+    `--ignore-glob`, `-k`, `-m`; unittest `-k`; Django and project runner
+    scripts `-k`, `--tag`, `--exclude-tag`, `--start-at`, `--start-after`;
+    and `--exclude*`, `--skip`, `--filter`, `--grep`, `-t`, `-g`, `-e`,
+    `-run`, `-skip` for the other runners;
+  - pytest `-o`/`--override-ini` setting `addopts`, `python_files`,
+    `python_classes`, `python_functions`, `testpaths` or `norecursedirs`
+    (`addopts` covers a `--deselect`, `-k` or `-m` inside it); other keys,
+    such as `cache_dir`, do not narrow;
+  - pytest `-c`/`--config-file`, `--rootdir` and `--confcutdir`, whatever
+    they name: whether it is the file or directory pytest would pick by
+    default cannot be decided from the command;
+  - pytest `-p` loading or disabling a plugin, except the no-op
+    `no:cacheprovider`; `-p`/`--pattern` for unittest, Django and project
+    runner scripts (a discovery pattern);
+  - an assignment of `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` or
+    `PYTEST_DISABLE_PLUGIN_AUTOLOAD` on the command line: a leading
+    assignment, one consumed by an `env` wrapper, or, on the transcript-only
+    path, anywhere in the command text (`export PYTEST_ADDOPTS=... && ...`).
+
+  An option the tables do not know never takes an option-like token as its
+  value, so `pytest --x --ignore tests/t.py tests/t.py` is still narrowed.
 - **Output filters.** `CMD | tail ...`, `CMD 2>&1 | grep ...` and chains of
   output filters (`tail`, `head`, `grep`, `egrep`, `fgrep`, `sed`, `cat`,
   `cut`, `sort`, `uniq`, `wc`, `tr`) replay `CMD` alone and use `CMD`'s own
@@ -166,7 +194,7 @@ the default) and the leaf held Bash authority. The rules:
 A claim that no successful replay backs falls through to the transcript-only
 rules and failure classes below. Two of those rules follow the same
 principle: a claimed test file backed by a transcript run links only as an
-executed operand of a runner with no excluding option (not
+executed operand of a runner that nothing narrows (not
 `pytest --ignore tests/x.py`), and the functional tier does not accept a
 recorded exit that belongs to a pipeline without `pipefail`
 (`./run_tests.sh | tail -5`), since it is the last stage's status.

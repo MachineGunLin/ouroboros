@@ -51,8 +51,33 @@ denylist in ``command_replay`` stays as a second layer.
 The same resolution decides the test-target linkage rule
 (``claim_target_operands``): a claim naming a test file or label is linked to
 a command only when it is a positional operand (not an option value) of a
-test runner that executes it, and the command has no option that excludes or
-narrows the tests it runs.
+test runner that executes it, and the command neither excludes or narrows the
+tests it runs nor changes what the runner collects or selects through
+configuration. Each of these disables the target rule and the runner-output
+rules (``run_may_back_test_claim``):
+
+- an option that excludes or selects tests: ``--deselect``, ``--ignore``,
+  ``-k`` and ``-m`` (pytest), ``-k`` (unittest, Django, project runner
+  scripts), ``--tag``, ``--exclude-tag`` and ``--start-at``/``--start-after``
+  (Django), and the entries of ``_TARGET_EXCLUDING_OPTIONS`` and
+  ``_SHORT_EXCLUDING_OPTIONS``;
+- pytest ``-o``/``--override-ini`` setting ``addopts``, ``python_files``,
+  ``python_classes``, ``python_functions``, ``testpaths`` or
+  ``norecursedirs`` (``addopts`` covers ``--deselect``, ``-k`` and ``-m``
+  inside it);
+- pytest ``-c``/``--config-file``, ``--rootdir`` and ``--confcutdir``, in any
+  form: whether a named file or directory is the one pytest would use by
+  default cannot be decided from the command, so any use counts;
+- pytest ``-p`` unless the plugin is in ``NO_OP_PYTEST_PLUGINS``
+  (``no:cacheprovider``); ``-p``/``--pattern`` for unittest, Django and
+  project runner scripts, where it is a discovery pattern;
+- an assignment on the command line (leading, or consumed by an ``env``
+  wrapper) of a variable in ``NARROWING_ENVIRONMENT`` (``PYTEST_ADDOPTS``,
+  ``PYTEST_PLUGINS``, ``PYTEST_DISABLE_PLUGIN_AUTOLOAD``), whatever the runner.
+
+Replay also removes ``NARROWING_ENVIRONMENT`` from the environment the replay
+inherits (``command_replay``). ``uv run --env-file`` is refused, since the
+file may set those variables.
 """
 
 from __future__ import annotations
@@ -239,7 +264,8 @@ _UV_RUN_SPEC = _spec(
     (_UV_VALUE_OPTIONS - {"--directory", "--project"})
     | {f"-{option}" for option in _UV_SHORT_VALUE_OPTIONS},
     _UV_FLAG_OPTIONS | {f"-{option}" for option in _UV_SHORT_FLAG_OPTIONS},
-    {"--directory", "--project", "--script", "-s", "--gui-script", "-m", "--module"},
+    {"--directory", "--project", "--script", "-s", "--gui-script", "-m", "--module"}
+    | {"--env-file"},
 )
 # Launchers: they run another program by name. The launched program must pass
 # the allowlist itself.
@@ -387,6 +413,9 @@ _TARGET_VALUE_OPTIONS = frozenset(
         "--settings",
         "--parallel",
         "--timeout",
+        "--config-file",
+        "--override-ini",
+        "--pattern",
     }
 )
 # Options of the target runners that take no value.
@@ -442,6 +471,27 @@ _TARGET_FLAG_OPTIONS = frozenset(
 )
 # Django-style runners read ``-v`` as a verbosity level with a value.
 _LABEL_RUNNER_VALUE_OPTIONS = frozenset({"-v", "--verbosity"})
+# Runners whose ``-p``/``--pattern`` is a test discovery pattern.
+_PATTERN_RUNNER_KINDS = frozenset({"unittest", "django", "test-script"})
+
+# Environment variables that change what pytest collects, selects or loads.
+# Assigned on the command line they disable test-target linkage; replay also
+# removes them from the environment it inherits.
+NARROWING_ENVIRONMENT = frozenset(
+    {"PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD"}
+)
+# pytest ini keys that decide which tests are collected or selected; setting
+# one through ``-o``/``--override-ini`` disables test-target linkage.
+_PYTEST_SELECTION_INI_KEYS = frozenset(
+    {"addopts", "python_files", "python_classes", "python_functions", "testpaths"}
+    | {"norecursedirs"}
+)
+# pytest options that replace the configuration or where it is looked up.
+_PYTEST_CONFIG_OPTIONS = frozenset({"-c", "--config-file", "--rootdir", "--confcutdir"})
+_PYTEST_OVERRIDE_OPTIONS = frozenset({"-o", "--override-ini"})
+# ``-p`` plugins that cannot change which tests run or pass: disabling the
+# cache provider only removes ``--lf``/``--ff`` and the ``cache`` fixture.
+NO_OP_PYTEST_PLUGINS = frozenset({"no:cacheprovider"})
 
 
 # Programs admitted by absolute path when they resolve inside an environment
@@ -872,76 +922,184 @@ def _excluding_option(token: str, kind: str) -> bool:
     )
 
 
-def excludes_tests(argv: Sequence[str]) -> bool:
-    """Return True when ``argv`` resolves to a runner with an option that
-    excludes or narrows the tests it runs (``--ignore``, ``-k``, ...)."""
-    runner = resolve_replay_program(argv, workspace=None)
-    return runner is not None and any(
-        _excluding_option(token, runner.kind) for token in runner.arguments
-    )
+def _narrowing_option(name: str, value: str | None, kind: str) -> bool:
+    """Return True when option ``name`` (with ``value``, if it took one) changes
+    what the runner collects or selects through configuration."""
+    if kind == "pytest":
+        if name in _PYTEST_CONFIG_OPTIONS:
+            return True
+        if name in _PYTEST_OVERRIDE_OPTIONS:
+            if value is None or "=" not in value:
+                return True
+            key = value.partition("=")[0].strip().lower()
+            return not key or key in _PYTEST_SELECTION_INI_KEYS
+        if name == "-p":
+            return value not in NO_OP_PYTEST_PLUGINS
+    elif kind in _PATTERN_RUNNER_KINDS:
+        return name in {"-p", "--pattern"}
+    return False
 
 
-def run_may_back_test_claim(argv: Sequence[str], claim_file: str | None) -> bool:
-    """Gate the runner-output rules for a replayed test run.
+def command_line_assignments(argv: Sequence[str]) -> tuple[str, ...]:
+    """Return the ``NAME=value`` tokens ``argv`` sets for the program it runs.
 
-    False when the program cannot be resolved, when an option excludes or
-    narrows the tests it runs, or when ``claim_file`` (the claimed test file,
-    if any) appears in the command without being an executed operand, as in
-    ``pytest --rootdir tests/test_x.py``.
+    Leading assignments, and those consumed by an ``env`` wrapper anywhere in
+    the chain of wrappers and launchers (``timeout 60 env X=1 pytest``,
+    ``uv run env X=1 pytest``).
+    """
+    parts = tuple(argv)
+    found: list[str] = []
+    index = 0
+    while index < len(parts) and _is_env_assignment(parts[index]):
+        found.append(parts[index])
+        index += 1
+    parts = parts[index:]
+    for _ in range(_MAX_RESOLVE_DEPTH):
+        if not parts:
+            break
+        name = _program_name(parts[0])
+        spec = _WRAPPERS.get(name)
+        launcher = next(
+            (
+                (key, option_spec)
+                for key, option_spec in _LAUNCHERS.items()
+                if tuple(token.lower() for token in parts[: len(key)]) == key
+            ),
+            None,
+        )
+        if spec is not None:
+            program_index = _skip_options(parts, 1, spec)
+        elif launcher is not None:
+            program_index = _skip_options(parts, len(launcher[0]), launcher[1])
+        else:
+            break
+        if program_index is None:
+            break
+        if spec is not None and spec.assignments:
+            found.extend(token for token in parts[1:program_index] if _is_env_assignment(token))
+        parts = parts[program_index:]
+    return tuple(found)
+
+
+def _narrowing_environment(argv: Sequence[str], environment: Sequence[str]) -> bool:
+    names = {name.upper() for name in environment}
+    names.update(token.partition("=")[0].upper() for token in command_line_assignments(argv))
+    return not names.isdisjoint(NARROWING_ENVIRONMENT)
+
+
+def _selection(
+    argv: Sequence[str], environment: Sequence[str]
+) -> tuple[ResolvedRunner | None, bool, frozenset[str]]:
+    """Return ``(runner, narrowed, operands)`` for ``argv``.
+
+    ``narrowed`` is True when an option excludes or narrows the tests the
+    runner executes, or configuration changes what it collects or selects
+    (see the module docstring); ``operands`` are then empty. ``environment``
+    names the variables the command line assigns outside ``argv`` (a replay
+    candidate's ``env_delta``). Option values are never operands; a token after
+    an option the tables do not know is not an operand either, since it may be
+    that option's value. Tokens after ``--`` are checked for narrowing but are
+    never operands.
     """
     runner = resolve_replay_program(argv, workspace=None)
-    if runner is None or any(_excluding_option(token, runner.kind) for token in runner.arguments):
+    if runner is None:
+        return None, False, frozenset()
+    if _narrowing_environment(argv, environment):
+        return runner, True, frozenset()
+    value_options = set(_TARGET_VALUE_OPTIONS)
+    flag_options = set(_TARGET_FLAG_OPTIONS)
+    if runner.kind in _PATTERN_RUNNER_KINDS:
+        value_options |= _LABEL_RUNNER_VALUE_OPTIONS
+        flag_options -= _LABEL_RUNNER_VALUE_OPTIONS
+    operands: set[str] = set()
+    after_separator = False
+    arguments = runner.arguments
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        index += 1
+        if token == "--":
+            after_separator = True
+            continue
+        if not token.startswith("-") or token == "-":
+            if not after_separator:
+                operands.add(token)
+            continue
+        if _excluding_option(token, runner.kind):
+            return runner, True, frozenset()
+        name, separator, inline = token.partition("=")
+        value: str | None = None
+        consumes_next = False
+        if token.startswith("--"):
+            if separator:
+                value = inline
+            elif name not in flag_options:
+                # A known value option, or an unknown one whose value may follow.
+                consumes_next = True
+        elif token[:2] in value_options and len(token) > 2:
+            name, value = token[:2], token[2:]
+        elif separator:
+            value = inline
+        elif name not in flag_options:
+            consumes_next = True
+        if consumes_next and index < len(arguments):
+            following = arguments[index]
+            if not following.startswith("-") or following == "-":
+                # An option-like token is never taken as a value: it is
+                # examined as an option of its own (``--x --ignore t.py``).
+                value = following
+                index += 1
+        if _narrowing_option(name, value, runner.kind):
+            return runner, True, frozenset()
+    return runner, False, frozenset(operands)
+
+
+def excludes_tests(argv: Sequence[str], environment: Sequence[str] = ()) -> bool:
+    """Return True when ``argv`` resolves to a runner that an option or the
+    command-line configuration narrows (``--ignore``, ``-k``, ``-o addopts=``,
+    ``PYTEST_ADDOPTS=``, ...). ``environment`` names variables assigned
+    outside ``argv``."""
+    runner, narrowed, _ = _selection(argv, environment)
+    return runner is not None and narrowed
+
+
+def run_may_back_test_claim(
+    argv: Sequence[str], claim_file: str | None, environment: Sequence[str] = ()
+) -> bool:
+    """Gate the runner-output rules for a replayed test run.
+
+    False when the program cannot be resolved, when an option or the
+    command-line configuration excludes or narrows the tests it runs, or when
+    ``claim_file`` (the claimed test file, if any) appears in the command
+    without being an executed operand, as in ``pytest --rootdir
+    tests/test_x.py``. ``environment`` names variables assigned outside
+    ``argv`` (a replayed run's ``env_delta``).
+    """
+    runner, narrowed, operands = _selection(argv, environment)
+    if runner is None or narrowed:
         return False
     if claim_file is None:
         return True
     needle = claim_file.lower()
     if not any(needle in token.lower() for token in argv):
         return True
-    return any(
-        operand.split("::", 1)[0].lower() == needle for operand in claim_target_operands(argv)
+    return runner.kind in TARGET_RUNNER_KINDS and any(
+        operand.split("::", 1)[0].lower() == needle for operand in operands
     )
 
 
-def claim_target_operands(argv: Sequence[str]) -> frozenset[str]:
+def claim_target_operands(argv: Sequence[str], environment: Sequence[str] = ()) -> frozenset[str]:
     """Return the tests ``argv`` names as positional operands of a test runner.
 
     Empty unless the program is a test runner whose operands select tests
-    (``TARGET_RUNNER_KINDS``) and no option excludes or narrows them. Option
-    values are never operands; a token after an option the tables do not know
-    is not an operand either, since it may be that option's value.
+    (``TARGET_RUNNER_KINDS``) and neither an option nor the command-line
+    configuration narrows them (see the module docstring). ``environment``
+    names variables assigned outside ``argv``.
     """
-    runner = resolve_replay_program(argv, workspace=None)
-    if runner is None or runner.kind not in TARGET_RUNNER_KINDS:
+    runner, narrowed, operands = _selection(argv, environment)
+    if runner is None or narrowed or runner.kind not in TARGET_RUNNER_KINDS:
         return frozenset()
-    value_options = set(_TARGET_VALUE_OPTIONS)
-    flag_options = set(_TARGET_FLAG_OPTIONS)
-    if runner.kind in {"django", "test-script", "unittest"}:
-        value_options |= _LABEL_RUNNER_VALUE_OPTIONS
-        flag_options -= _LABEL_RUNNER_VALUE_OPTIONS
-    operands: set[str] = set()
-    skip_next = False
-    for token in runner.arguments:
-        if token == "--":
-            break
-        if skip_next:
-            skip_next = False
-            continue
-        if token.startswith("-") and token != "-":
-            name = token.partition("=")[0]
-            if _excluding_option(token, runner.kind):
-                return frozenset()
-            if "=" in token or name in flag_options:
-                continue
-            if name in value_options:
-                skip_next = True
-                continue
-            if token[:2] in value_options and len(token) > 2:
-                continue
-            # Unknown option: the next token may be its value.
-            skip_next = True
-            continue
-        operands.add(token)
-    return frozenset(operands)
+    return operands
 
 
 __all__ = [
@@ -949,7 +1107,10 @@ __all__ = [
     "TARGET_RUNNER_KINDS",
     "VIEWER_PROGRAMS",
     "ResolvedRunner",
+    "NARROWING_ENVIRONMENT",
+    "NO_OP_PYTEST_PLUGINS",
     "claim_target_operands",
+    "command_line_assignments",
     "environment_roots",
     "excludes_tests",
     "outside_known_roots",

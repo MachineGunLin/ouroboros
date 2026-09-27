@@ -646,6 +646,7 @@ class TestClaimLinkage:
             transcript_command=candidate.transcript_command,
             core_command=candidate.core_command,
             argv=candidate.argv,
+            environment=tuple(candidate.env_delta),
         )
 
     @pytest.mark.parametrize(
@@ -663,6 +664,14 @@ class TestClaimLinkage:
             ("`tests/test_calc.py`", "pytest -q tests/test_calc.py"),
             ("tests/test_calc.py", "python -m pytest -q -p no:cacheprovider tests/test_calc.py"),
             ("tests/test_calc.py (4 tests)", "timeout 60 python -m pytest tests/test_calc.py"),
+            # Review R2-R1: configuration that does not change what is
+            # collected or selected keeps the link.
+            ("tests/test_calc.py", "pytest tests/test_calc.py"),
+            ("tests/test_calc.py", "pytest -pno:cacheprovider tests/test_calc.py"),
+            ("tests/test_calc.py", "pytest -o cache_dir=.x tests/test_calc.py"),
+            ("tests/test_calc.py", "pytest --override-ini=cache_dir=.x tests/test_calc.py"),
+            ("tests/test_calc.py", "FOO=1 pytest tests/test_calc.py"),
+            ("tests/test_calc.py", "timeout 60 env FOO=1 pytest tests/test_calc.py"),
         ],
     )
     def test_linked(self, claim: str, command: str) -> None:
@@ -705,6 +714,49 @@ class TestClaimLinkage:
             ("pytest", "python -m pytest -q tests/test_calc.py"),
             ("migrations", "python tests/runtests.py --exclude-tag slow migrations"),
             ("migrations", "python tests/runtests.py --start-after migrations.a migrations"),
+            # Review R2-R1: collection or selection changed through
+            # configuration rather than argv exclusion.
+            (
+                "tests/test_bad.py",
+                'pytest -o "addopts=--deselect tests/test_bad.py::t" tests/test_bad.py',
+            ),
+            ("tests/test_bad.py", "pytest -oaddopts=-q tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --override-ini=addopts=-q tests/test_bad.py"),
+            (
+                "tests/test_bad.py",
+                "pytest --override-ini python_functions=check_* tests/test_bad.py",
+            ),
+            ("tests/test_bad.py", "pytest -o python_files=x.py tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -o python_classes=X tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -o testpaths=x tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -o norecursedirs=x tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -o noequals tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -c alt.ini tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -calt.ini tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --config-file=alt.ini tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --config-file alt.ini tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --rootdir=. tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --confcutdir tests tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -p myplugin tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -pmyplugin tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -p no:randomly tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest -kslow tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest --deselect=tests/test_bad.py::t tests/test_bad.py"),
+            ("tests/test_bad.py", "PYTEST_ADDOPTS=-x pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "PYTEST_PLUGINS=myplugin pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "env PYTEST_ADDOPTS=-x pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "timeout 60 env PYTEST_ADDOPTS=-x pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "nice -n 5 env PYTEST_PLUGINS=p pytest tests/test_bad.py"),
+            ("tests/test_bad.py", "pytest tests/test_bad.py -- -k slow"),
+            # An unknown option never swallows an excluding option as its value.
+            ("tests/test_bad.py", "pytest --unknown --ignore tests/test_bad.py tests/test_bad.py"),
+            # The same principle for unittest and Django-style runners.
+            ("tests.test_x", "python -m unittest -k slow tests.test_x"),
+            ("tests", "python -m unittest discover -p test_a*.py tests"),
+            ("migrations", "python tests/runtests.py --tag slow migrations"),
+            ("migrations", "python tests/runtests.py -k writer migrations"),
+            ("migrations", "python tests/runtests.py --exclude-tag=slow migrations"),
         ],
     )
     def test_not_linked(self, claim: str, command: str) -> None:
@@ -1326,3 +1378,155 @@ class TestTranscriptOnlyHoles:
         )
 
         assert verdict.passed is True, verdict.reasons
+
+
+# ``test_add`` fails and ``test_other`` passes; ``alt.ini`` deselects the failure.
+NARROWING_TESTS = (
+    "from calc import add\n\n"
+    "def test_add():\n    assert add(2, 3) == 5\n\n"
+    "def test_other():\n    assert True\n"
+)
+DESELECT_ADD = "tests/test_bad.py::test_add"
+
+
+class TestConfigurationNarrowing:
+    """Review R2-R1: a file claim is not backed by a run whose collection or
+    selection was changed through configuration instead of argv."""
+
+    @pytest.fixture(autouse=True)
+    def _path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PATH", os.pathsep.join([PYTHON_BIN, "/usr/bin", "/bin"]))
+
+    def _narrowing_workspace(self, root: Path) -> Path:
+        workspace = _workspace(root, correct=False)
+        (workspace / "tests" / "test_bad.py").write_text(NARROWING_TESTS, encoding="utf-8")
+        (workspace / "tests" / "test_good.py").write_text(
+            PYTEST_WORKSPACE_TESTS["test_good.py"], encoding="utf-8"
+        )
+        (workspace / "conftest.py").write_text(
+            "import os, sys\nsys.path.insert(0, os.path.dirname(__file__))\n", encoding="utf-8"
+        )
+        (workspace / "alt.ini").write_text(
+            f"[pytest]\naddopts = --deselect {DESELECT_ADD}\n", encoding="utf-8"
+        )
+        return workspace
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The three round-2 probes.
+            f'python -m pytest -q -p no:cacheprovider -o "addopts=--deselect {DESELECT_ADD}" '
+            "tests/test_bad.py",
+            f"PYTEST_ADDOPTS=--deselect={DESELECT_ADD} python -m pytest -q -p no:cacheprovider "
+            "tests/test_bad.py",
+            "python -m pytest -q -p no:cacheprovider -c alt.ini tests/test_bad.py",
+            # The assignment consumed by an ``env`` wrapper, not by the parser.
+            f"nice -n 5 env PYTEST_ADDOPTS=--deselect={DESELECT_ADD} python -m pytest -q "
+            "-p no:cacheprovider tests/test_bad.py",
+        ],
+    )
+    async def test_narrowed_run_does_not_back_the_file(self, tmp_path: Path, command: str) -> None:
+        workspace = self._narrowing_workspace(tmp_path / "ws")
+        transcript = (
+            *_edit(workspace / "tests" / "test_bad.py", "e2"),
+            *_ran(command, "c1", exit_code=0),
+        )
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, transcript, _evidence(command, ["tests/test_bad.py"])
+        )
+
+        # A narrowed run that was replayed passed; it only backs nothing.
+        assert all(run.succeeded for run in observation.command_runs)
+        assert verdict.passed is False
+
+    async def test_plain_pytest_run_still_backs_its_file(self, tmp_path: Path) -> None:
+        workspace = self._narrowing_workspace(tmp_path / "ws")
+        command = "python -m pytest -q tests/test_good.py"
+        transcript = (
+            *_edit(workspace / "tests" / "test_good.py", "e2"),
+            *_ran(command, "c1", exit_code=0),
+        )
+
+        verdict, observation = await _dispatch_and_verify(
+            workspace, transcript, _evidence(command, ["tests/test_good.py"])
+        )
+
+        assert observation.command_runs[0].succeeded
+        assert verdict.passed is True, verdict.reasons
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            f"PYTEST_ADDOPTS=--deselect={DESELECT_ADD} python -m pytest -q tests/test_bad.py",
+            f'python -m pytest -q -o "addopts=--deselect {DESELECT_ADD}" tests/test_bad.py',
+            f"export PYTEST_ADDOPTS=--deselect={DESELECT_ADD} && python -m pytest -q "
+            "tests/test_bad.py",
+        ],
+    )
+    def test_transcript_only_narrowed_run_does_not_back_the_file(
+        self, tmp_path: Path, command: str
+    ) -> None:
+        workspace = self._narrowing_workspace(tmp_path / "ws")
+        transcript = (
+            *_edit(workspace / "tests" / "test_bad.py", "e2"),
+            *_ran(command, "c1", exit_code=0)[:1],
+            _bash_result("c1", exit_code=0, output="1 passed, 1 deselected in 0.01s"),
+        )
+
+        verdict = _transcript_only_verdict(
+            workspace, transcript, _evidence(command, ["tests/test_bad.py"])
+        )
+
+        assert verdict.passed is False
+
+    async def test_replay_scrubs_inherited_pytest_configuration(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        _executable(
+            workspace / "check_env.sh",
+            "#!/bin/sh\n"
+            'test -z "${PYTEST_ADDOPTS+x}${PYTEST_PLUGINS+x}'
+            '${PYTEST_DISABLE_PLUGIN_AUTOLOAD+x}" || exit 7\n',
+        )
+        candidate = replay_candidate("./check_env.sh", str(workspace))
+        assert candidate is not None
+        inherited = {
+            "PATH": "/usr/bin:/bin",
+            "PYTEST_ADDOPTS": f"--deselect={DESELECT_ADD}",
+            "PYTEST_PLUGINS": "evil",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        }
+
+        runs = await replay_commands(
+            (candidate,), workspace=str(workspace), env=inherited, timeout_seconds=30
+        )
+
+        assert runs[0].returncode == 0, runs[0].output_tail
+        assert runs[0].scrubbed_environment == (
+            "PYTEST_ADDOPTS",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+            "PYTEST_PLUGINS",
+        )
+
+    async def test_command_line_assignment_is_kept_and_recorded(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        _executable(workspace / "check_env.sh", '#!/bin/sh\ntest "$PYTEST_PLUGINS" = mine\n')
+        candidate = replay_candidate("PYTEST_PLUGINS=mine ./check_env.sh", str(workspace))
+        assert candidate is not None
+
+        runs = await replay_commands(
+            (candidate,),
+            workspace=str(workspace),
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=30,
+        )
+
+        # Replayed as written; the assignment disables target linkage instead.
+        assert runs[0].succeeded
+        assert runs[0].env_delta == (("PYTEST_PLUGINS", "mine"),)
+
+    def test_uv_env_file_is_refused(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        assert not replay_allowed(
+            ("uv", "run", "--env-file", ".env", "pytest"), workspace=str(workspace)
+        )

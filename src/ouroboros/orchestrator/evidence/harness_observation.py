@@ -92,7 +92,11 @@ class CommandObservation:
     which is never success. ``network_isolated`` records whether network
     access was denied. ``transcript_returncode`` is the exit status the
     transcript recorded for the original run, when it recorded one; a replay
-    whose exit differs from it is never success.
+    whose exit differs from it is never success. ``env_delta`` holds the
+    environment assignments the command itself made (``NAME=value`` before
+    the program), and ``scrubbed_environment`` the variables the replay
+    removed from the environment it inherited
+    (``replay_policy.NARROWING_ENVIRONMENT``).
     """
 
     command: str
@@ -104,6 +108,8 @@ class CommandObservation:
     mutated: bool = False
     network_isolated: bool = False
     transcript_returncode: int | None = None
+    env_delta: tuple[tuple[str, str], ...] = ()
+    scrubbed_environment: tuple[str, ...] = ()
 
     @property
     def succeeded(self) -> bool:

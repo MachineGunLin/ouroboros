@@ -25,6 +25,7 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
+    NARROWING_ENVIRONMENT,
     claim_target_operands,
     excludes_tests,
     run_may_back_test_claim,
@@ -415,9 +416,11 @@ def _test_command_targets_claim(
     normalized_file = file_part.lower()
     normalized_command = command.lower()
     argv = _command_invocation_argv(command)
-    if excludes_tests(argv):
-        # ``pytest --ignore tests/x.py`` or ``pytest -k "not x"``: the named
-        # test file may not have run, whatever the output says.
+    environment = _command_invocation_environment(command)
+    if excludes_tests(argv, environment):
+        # ``pytest --ignore tests/x.py``, ``pytest -k "not x"`` or
+        # ``PYTEST_ADDOPTS=--deselect=... pytest``: the named test file may
+        # not have run, whatever the output says.
         return False
     if normalized_file in normalized_proof_text:
         return True
@@ -435,7 +438,7 @@ def _test_command_targets_claim(
         # tests/x.py``, not ``cat tests/x.py``).
         return any(
             operand.split("::", 1)[0].lower() == normalized_file
-            for operand in claim_target_operands(argv)
+            for operand in claim_target_operands(argv, environment)
         )
     if _claim_summary_matches_runtime_chunk(
         command=command,
@@ -781,6 +784,31 @@ def _command_invocation_argv(command: str) -> tuple[str, ...]:
     return tuple(_strip_env_prefix(parts))
 
 
+# An assignment to a variable in ``NARROWING_ENVIRONMENT`` anywhere in the
+# command text: a prefix, an ``env`` or ``export`` form, a preamble segment,
+# or inside a shell wrapper's quoted body.
+_NARROWING_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + "|".join(sorted(NARROWING_ENVIRONMENT)) + r")="
+)
+
+
+def _command_invocation_environment(command: str) -> tuple[str, ...]:
+    """Return the ``NARROWING_ENVIRONMENT`` variables ``command`` assigns.
+
+    ``_command_invocation_argv`` drops environment assignments, and a preamble
+    (``export PYTEST_ADDOPTS=... &&``) is not part of the invocation at all,
+    so the whole command text is searched.
+    """
+    return tuple(sorted(set(_NARROWING_ASSIGNMENT_RE.findall(command))))
+
+
+def _replayed_environment(run: CommandObservation) -> tuple[str, ...]:
+    """Return the names of the environment assignments a replayed run's command made."""
+    names = {name for name, _ in run.env_delta}
+    names.update(_command_invocation_environment(run.transcript_command or run.command))
+    return tuple(sorted(names))
+
+
 def _replayed_argv(run: CommandObservation) -> tuple[str, ...]:
     """Return the argv a replayed run executed (parsed from its command if unset)."""
     if run.argv:
@@ -837,7 +865,9 @@ def _harness_reexecution_supports_test_claim(
                 continue
             if not _text_proves_test_execution_success(run.output_tail):
                 continue
-            if not run_may_back_test_claim(_replayed_argv(run), claimed_file):
+            if not run_may_back_test_claim(
+                _replayed_argv(run), claimed_file, _replayed_environment(run)
+            ):
                 # An excluding option, or the claimed file named in the command
                 # without being executed (``--ignore tests/test_x.py``).
                 continue
@@ -1002,7 +1032,7 @@ def _reexecuted_runner_label_covers(label: str, messages: tuple[AgentMessage, ..
                 continue
             if not _text_proves_test_execution_success(run.output_tail):
                 continue
-            if not run_may_back_test_claim(_replayed_argv(run), None):
+            if not run_may_back_test_claim(_replayed_argv(run), None, _replayed_environment(run)):
                 continue
             if any(
                 label == run_label or label.startswith(run_label + ".")

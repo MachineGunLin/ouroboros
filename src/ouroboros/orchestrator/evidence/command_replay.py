@@ -27,7 +27,12 @@ Execution rules (each one fails closed):
 - The command runs as a direct argv, never through a shell, in a fresh copy of
   the workspace, under the verify gate's sanitized environment and timeout,
   with ``PYTHONDONTWRITEBYTECODE=1``. At most ``MAX_REPLAYED_COMMANDS``
-  commands per criterion.
+  commands per criterion. The variables in
+  ``replay_policy.NARROWING_ENVIRONMENT`` (``PYTEST_ADDOPTS``,
+  ``PYTEST_PLUGINS``, ``PYTEST_DISABLE_PLUGIN_AUTOLOAD``) are removed from
+  the inherited environment, and each run records that in
+  ``scrubbed_environment``; the command's own assignments are kept, and they
+  disable target linkage instead.
 - Network access must be denied: ``sandbox-exec`` on macOS, an unprivileged
   network namespace on Linux, or a Linux process that already has no network
   interface but loopback (a container run with ``--network none``). Where none
@@ -49,7 +54,8 @@ claim, whitespace-normalized, must equal the transcript command or its replayed
 core, or equal one of them followed by a single trailing parenthetical
 annotation (``make test (12 passed)``); or the claim, minus a trailing
 ``(N tests)`` count, is a single test target that is a positional operand of a
-test runner that executes it (``replay_policy.claim_target_operands``).
+test runner that executes it, with no option or command-line configuration
+that narrows what it runs (``replay_policy.claim_target_operands``).
 """
 
 from __future__ import annotations
@@ -84,6 +90,7 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
+    NARROWING_ENVIRONMENT,
     claim_target_operands,
     outside_known_roots,
     peel_wrappers,
@@ -464,15 +471,18 @@ def claim_links_to_command(
     transcript_command: str,
     core_command: str,
     argv: Sequence[str],
+    environment: Sequence[str] = (),
 ) -> bool:
     """Return True when ``claim`` refers to this replayed command.
 
     Linked only when the whitespace-normalized claim (a) equals the transcript
     command or its replayed core, (b) equals one of them followed by one
     trailing parenthetical annotation, or (c) names a single test target that
-    is a positional operand of a test runner executing it, with no option that
-    excludes or narrows the tests (``replay_policy.claim_target_operands``).
-    A claim that merely contains a command is not linked to it.
+    is a positional operand of a test runner executing it, with no option or
+    command-line configuration that excludes or narrows the tests
+    (``replay_policy.claim_target_operands``; ``environment`` names the
+    variables the command assigns before ``argv``). A claim that merely
+    contains a command is not linked to it.
     """
     text = _normalize(claim)
     if not text:
@@ -484,7 +494,7 @@ def claim_links_to_command(
     if annotated is not None and annotated.group(1) in commands:
         return True
     target = _claim_test_target(claim)
-    return target is not None and target in claim_target_operands(argv)
+    return target is not None and target in claim_target_operands(argv, environment)
 
 
 def replayed_command_supports_claim(value: str, messages: tuple[AgentMessage, ...]) -> bool:
@@ -501,6 +511,7 @@ def replayed_command_supports_claim(value: str, messages: tuple[AgentMessage, ..
                 transcript_command=run.transcript_command or run.command,
                 core_command=run.command,
                 argv=run.argv,
+                environment=tuple(name for name, _ in run.env_delta),
             ):
                 return True
     return False
@@ -632,6 +643,7 @@ def select_replay_candidates(
                     transcript_command=candidate.transcript_command,
                     core_command=candidate.core_command,
                     argv=candidate.argv,
+                    environment=tuple(candidate.env_delta),
                 )
                 for claim in unproven
             ):
@@ -885,11 +897,16 @@ async def _replay_one(
             key: _remap_workspace_path(value, workspaces, str(copy_root))
             for key, value in candidate.env_delta.items()
         }
+        # Configuration the replay would inherit from the worker's environment
+        # must not narrow what a test runner collects or selects.
+        inherited = {
+            key: value for key, value in env.items() if key.upper() not in NARROWING_ENVIRONMENT
+        }
         run = await run_with_shell(
             [*prefix, *argv],
             cwd=str((copy_root / candidate.cwd_relative).resolve()),
             # No bytecode caches: they would be writes into linked live trees.
-            env={**env, **env_delta, "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**inherited, **env_delta, "PYTHONDONTWRITEBYTECODE": "1"},
             timeout_seconds=timeout_seconds,
         )
         if run.start_error is not None:
@@ -909,6 +926,8 @@ async def _replay_one(
             mutated=mutated,
             network_isolated=True,
             transcript_returncode=candidate.transcript_returncode,
+            env_delta=tuple(sorted(candidate.env_delta.items())),
+            scrubbed_environment=tuple(sorted(NARROWING_ENVIRONMENT)),
         )
     except OSError:
         return None
