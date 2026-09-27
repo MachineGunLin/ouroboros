@@ -2391,9 +2391,10 @@ def _serialize_composite_completion_result(
         )
         for child in result.sub_results
     ]
+    annotations = check_package_record(result)  # schema 2 exactly when arm-on fields exist
     return (
         {
-            "schema_version": 1,
+            "schema_version": 2 if annotations else 1,
             "success": result.success,
             "outcome": outcome.value,
             "error": result.error,
@@ -2404,6 +2405,7 @@ def _serialize_composite_completion_result(
             "context_summary": _serialize_context_summary(summary),
             "conflict_files": list(_collect_result_conflict_files(result)),
             "sub_results": sub_results,
+            **annotations,
         },
         decision_data,
         fingerprint,
@@ -2434,13 +2436,15 @@ def _deserialize_composite_completion_result(
             "sub_results",
         }
     )
+    schema = value.get("schema_version") if isinstance(value, Mapping) else None
     if (
-        not _mapping_has_exact_keys(value, expected)
+        not _mapping_has_exact_keys(value, expected | ({"check_package"} if schema == 2 else set()))
         or not isinstance(value, Mapping)
-        or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 1
+        or type(schema) is not int
+        or schema not in (1, 2)
     ):
         raise RuntimeError("composite completion has an invalid result schema")
+    annotations = restore_check_package_record(value["check_package"]) if schema == 2 else {}
     success = value.get("success")
     raw_outcome = value.get("outcome")
     error = value.get("error")
@@ -2509,6 +2513,7 @@ def _deserialize_composite_completion_result(
         decomposition_decision=decomposition_decision,
         context_summary=summary,
         conflict_files=conflict_files,
+        **annotations,
     )
 
 

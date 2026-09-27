@@ -420,7 +420,9 @@ def check_package_record(result: ACExecutionResult) -> dict[str, object]:
     fields: dict[str, str] = {}
     for name in _CHECK_PACKAGE_FIELDS:
         value = getattr(result, name)
-        if value is None:
+        if value is None or value == "":
+            # An empty annotation carries nothing (``legacy_verdict_in_tree``
+            # reads it as no rejection); never fail a live persist on it.
             continue
         if not isinstance(value, str) or not value:
             raise RuntimeError("check package annotation is malformed")

@@ -5111,3 +5111,84 @@ def test_composite_tree_keeps_check_package_annotations_across_resume() -> None:
             _deserialize_composite_result_tree({**bad, "check_package": block}, node_budget=[10])
     with pytest.raises(RuntimeError):
         _deserialize_composite_result_tree({**bad, "schema_version": 2}, node_budget=[10])
+
+
+def test_composite_root_keeps_its_check_package_annotations_across_resume() -> None:
+    """R4-A4: the composite root's own envelope carries the gate's annotations."""
+    from ouroboros.orchestrator.parallel_executor import (
+        _deserialize_composite_completion_result,
+        _serialize_composite_completion_result,
+    )
+
+    decision = _split_decision()
+    children = tuple(
+        ACExecutionResult(
+            ac_index=index,
+            ac_content=child.description,
+            success=True,
+            outcome=ACExecutionOutcome.SUCCEEDED,
+            depth=1,
+        )
+        for index, child in enumerate(decision.children)
+    )
+    gated = ACExecutionResult(
+        ac_index=0,
+        ac_content="ship it",
+        success=False,
+        error="check_package: the finished workspace fails the frozen check package",
+        outcome=ACExecutionOutcome.FAILED,
+        is_decomposed=True,
+        sub_results=children,
+        decomposition_decision=decision,
+        check_package_repair="clamp(15, 0, 10): expected 10, observed 15",
+        check_package_failure_class="CHECK_PACKAGE_FAIL:abc",
+    )
+    plain = replace(
+        gated,
+        success=True,
+        error=None,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        check_package_repair=None,
+        check_package_failure_class=None,
+    )
+
+    def round_trip(result: ACExecutionResult) -> tuple[dict[str, Any], ACExecutionResult]:
+        data, _decision, _fingerprint = _serialize_composite_completion_result(
+            result, workspace_root="/w"
+        )
+        return data, _deserialize_composite_completion_result(
+            data, ac_index=0, ac_content="ship it", decomposition_decision=decision
+        )
+
+    data, back = round_trip(gated)
+    assert data["schema_version"] == 2 and "check_package" in data
+    assert back.check_package_repair == gated.check_package_repair
+    assert back.check_package_failure_class == gated.check_package_failure_class
+    # Arm off keeps schema 1 bytes; a schema 1 record still loads; fail closed otherwise.
+    data, back = round_trip(plain)
+    assert data["schema_version"] == 1 and "check_package" not in data
+    assert back.check_package_failure_class is None
+    with pytest.raises(RuntimeError):
+        _deserialize_composite_completion_result(
+            {**data, "check_package": {"legacy_rejection": "x"}},
+            ac_index=0,
+            ac_content="ship it",
+            decomposition_decision=decision,
+        )
+
+
+def test_an_empty_check_package_annotation_is_absent() -> None:
+    """R4-A5: an empty annotation neither raises in a live persist nor reaches the record."""
+    from ouroboros.orchestrator.parallel_executor_models import check_package_record
+
+    result = ACExecutionResult(
+        ac_index=0,
+        ac_content="x",
+        success=True,
+        outcome=ACExecutionOutcome.SUCCEEDED,
+        legacy_rejection="",
+    )
+    assert check_package_record(result) == {}
+    assert check_package_record(replace(result, check_package_repair="fix")) == {
+        "check_package": {"check_package_repair": "fix"}
+    }
