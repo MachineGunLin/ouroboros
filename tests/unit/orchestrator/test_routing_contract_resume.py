@@ -86,22 +86,13 @@ def _init_git_repo(root: Path) -> None:
     )
 
 
-@pytest.fixture(autouse=True)
-def _default_project_directory() -> None:
-    """Create the default ``/tmp/project`` working directory these tests assume.
-
-    Project identity requires the working directory to exist. Without this,
-    the tests passed only when a ``test_runner.py`` test that creates the
-    directory had already run on the same worker.
-    """
-    Path("/tmp/project").mkdir(parents=True, exist_ok=True)
-
-
 def _adapter(
     cwd: str = "/tmp/project",
     *,
     constructor_model: str | None = "constructor-sonnet",
 ) -> MagicMock:
+    if cwd == "/tmp/project":
+        Path(cwd).mkdir(parents=True, exist_ok=True)
     adapter = MagicMock()
     adapter.runtime_backend = "claude"
     adapter.llm_backend = "anthropic"
