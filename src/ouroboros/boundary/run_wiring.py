@@ -98,6 +98,7 @@ from ouroboros.boundary.package import (
     private_directory,
     seed_criterion_keys,
     seed_digest,
+    sha256_bytes,
     write_commitment_salt,
     write_package_record,
 )
@@ -383,7 +384,15 @@ async def prepare_check_package(
             assert package.commitment is not None
             commitments.append(FrozenCommitment(boundary_id, package.commitment, salt))
             package_path = write_package_record(package, store / "packages", record_key)
-            await ledger.record_package_frozen(boundary_id, package, seed=seed)
+            # The digest of the bytes on disk goes into the journal before the
+            # worker starts: a resume in another process detects any edit of
+            # the record, visible case values included (R5 follow-up).
+            await ledger.record_package_frozen(
+                boundary_id,
+                package,
+                seed=seed,
+                record_sha256=sha256_bytes(package_path.read_bytes()),
+            )
             admission = await admit_check_package(
                 package,
                 base,

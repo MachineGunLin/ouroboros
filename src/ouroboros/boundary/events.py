@@ -66,14 +66,22 @@ def cite(reference: str | None, *, committed: bool, prefix: str = "") -> dict[st
     return {f"{prefix}package_{'commitment' if committed else 'sha256'}": reference}
 
 
-def package_frozen_event(boundary_id: str, package: CheckPackage) -> BaseEvent:
+def package_frozen_event(
+    boundary_id: str, package: CheckPackage, *, record_sha256: str | None = None
+) -> BaseEvent:
     """The package reference (I2) plus the event-safe manifest summary.
 
     For a committed package the reference is the commitment
     SHA-256(salt || canonical bytes); the unkeyed digest is not recorded.
+    ``record_sha256`` is the SHA-256 of the stored package record's bytes
+    (visible cases in full, held-out cases as keyed HMACs only), so a resume
+    in another process can tell whether the record was edited; omitted when
+    not given, so other callers keep their bytes.
     """
     summary = package.manifest_summary()
     extra = {"commitment_scheme": summary["commitment_scheme"]} if package.commitment else {}
+    if record_sha256 is not None:
+        extra["record_sha256"] = record_sha256
     return _event(
         boundary_id,
         PACKAGE_FROZEN,

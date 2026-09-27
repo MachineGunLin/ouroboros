@@ -124,6 +124,7 @@ class BoundaryLedger:
         package: CheckPackage,
         *,
         seed: Seed | None = None,
+        record_sha256: str | None = None,
     ) -> BaseEvent:
         """Persist the package reference and manifest; the boundary's only seal.
 
@@ -134,7 +135,7 @@ class BoundaryLedger:
         if seed is not None:
             validate_package_for_seed(package, seed)
         await self._require_unsealed(boundary_id)
-        event = package_frozen_event(boundary_id, package)
+        event = package_frozen_event(boundary_id, package, record_sha256=record_sha256)
         await self._store.append(event)
         return event
 

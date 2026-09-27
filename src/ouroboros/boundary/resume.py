@@ -19,10 +19,12 @@ current workspace, with no model call:
   controller would buy. A criterion whose cases were all visible is decided
   normally. The store is as writable as the workspace, so the record is used
   only when it agrees with what the journal recorded before the worker
-  started (``record_mismatch``): the manifest recomputed from the record
-  (case ids, case and held-out counts, file digests) and the held-out flag
-  of every case the admission run saw. Otherwise every covered criterion is
-  indeterminate (``package_record_tampered``).
+  started: the SHA-256 of the record's bytes (``record_sha256`` on the frozen
+  event, which covers the visible case values), then the manifest recomputed
+  from the record (case ids, case and held-out counts, file digests) and the
+  held-out flag of every case the admission run saw (``record_mismatch``).
+  Otherwise every covered criterion is indeterminate
+  (``package_record_tampered``).
 
 A covered criterion without a package decision (the record or the journal is
 unreadable, or the record disagrees with the journal) is indeterminate: not
@@ -242,7 +244,8 @@ async def load_resumed_boundary(
         # still in memory and is the one the journal committed to.
         return ResumedBoundary(package=live.package, source="memory", **base)
     try:
-        record = json.loads((store / "packages" / f"{reference}.json").read_text("utf-8"))
+        raw = (store / "packages" / f"{reference}.json").read_bytes()
+        record = json.loads(raw.decode("utf-8"))
         if cited_reference(record) != reference:
             raise ValueError("record names another package")
         package, held = visible_package(record)
@@ -252,7 +255,13 @@ async def load_resumed_boundary(
     # The store is as writable as the workspace; the journal recorded the
     # manifest and the admission before the worker started (R4-S1).
     manifest = frozen.data.get("manifest") or {}
-    mismatch = record_mismatch(record, manifest, admission.data)
+    recorded = frozen.data.get("record_sha256")
+    # Journals written before the record digest was recorded skip this check.
+    mismatch = (
+        "record_digest"
+        if recorded is not None and sha256_bytes(raw) != recorded
+        else record_mismatch(record, manifest, admission.data)
+    )
     if mismatch is not None:
         log.warning("boundary.resume.record_tampered", mismatch=mismatch)
         return ResumedBoundary(package=None, reason=PACKAGE_RECORD_TAMPERED, **base)

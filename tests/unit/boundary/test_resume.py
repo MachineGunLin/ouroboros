@@ -581,3 +581,44 @@ async def test_an_unreadable_journal_refuses_the_resume(repo: Path, enabled: boo
             resume=True,
         )
     assert runner.acceptance_authority is None and run.resumed is None
+
+
+# R5 follow-up: the record's digest is in the journal, so a visible value edit shows.
+
+
+def _edit_visible_value(record: dict[str, Any]) -> None:
+    """Ids, flags and counts unchanged: only the stated case's expected value moves."""
+    stated = record["package"]["oracles"][0]["cases"][0]
+    stated["expect"]["value"] = 15
+
+
+async def test_an_edited_visible_value_is_detected_on_resume(
+    store: EventStore, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from ouroboros.boundary.package import sha256_bytes
+    from ouroboros.boundary.resume import record_mismatch
+
+    seed, state = await _run_until_the_worker_stops(store, repo, tmp_path, monkeypatch)
+    events = await store.replay(BOUNDARY_AGGREGATE_TYPE, state.boundary_id)
+    frozen, admission = events[0], events[1]
+    path = _record_path(tmp_path)
+    assert frozen.data["record_sha256"] == sha256_bytes(path.read_bytes())
+    record = json.loads(path.read_text())
+    _edit_visible_value(record)
+    # The manifest and admission checks alone cannot see this edit.
+    assert record_mismatch(record, frozen.data["manifest"], admission.data) is None
+    path.write_text(json.dumps(record))
+    forget_live_state(state)  # the buggy clamp returns 15 for the stated case
+    _run, authority = await _resume(store, seed, repo)
+    assert authority.boundary.package is None
+    assert authority.boundary.reason == "package_record_tampered"
+    decided = await authority(seed=seed, execution_id=EXECUTION, parallel_result=_restored())
+    verdicts = authority.outcome.verdict.verdicts
+    key = seed_criterion_keys(seed)[0]
+    assert (verdicts[key].status, verdicts[key].reason) == (
+        PackageCriterionStatus.INDETERMINATE,
+        "package_record_tampered",
+    )
+    assert not decided.all_succeeded
