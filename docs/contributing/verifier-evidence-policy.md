@@ -97,9 +97,16 @@ the default) and the leaf held Bash authority. The rules:
   Everything else is refused: file viewers and text utilities (`cat`, `sed`,
   `head`, `tail`, `less`, `grep`, `rg`, `awk`, `wc`, `ls`, `find`, `stat`,
   `file`, `diff`, `git`, ...), package managers, `xargs`, an absolute-path
-  program or argument outside the workspace, and a runner in a mode that runs
-  no tests (`--help`, `--collect-only`, `make -n`, ...). The denylist below is
-  a second layer.
+  program or argument outside the workspace, an environment assignment in
+  the command naming an absolute path outside the workspace (`PATH=/tmp/x`),
+  and a runner in a mode that runs no tests (`--help`, `--collect-only`,
+  `make -n`, ...). One exception: an absolute-path program whose name is an
+  allowlisted interpreter or runner (`python3.9`, `pytest`, `make`, ...) is
+  admitted when its real path, symlinks resolved, lies inside a known
+  environment root: `sys.prefix` or `sys.base_prefix` of the verifying
+  process, `VIRTUAL_ENV`, `CONDA_PREFIX`, or a directory on the replay
+  environment's `PATH` (for example `/opt/miniconda3/envs/testbed/bin/python`
+  in a SWE-bench image). The denylist below is a second layer.
 - **Isolation.** Each command runs as a direct argv (no shell) in a fresh copy
   of the workspace, with the verify gate's scrubbed environment plus
   `PYTHONDONTWRITEBYTECODE=1`, and `execution.verify_command_timeout_seconds`.
@@ -157,7 +164,12 @@ the default) and the leaf held Bash authority. The rules:
   replayed, whatever the allowlist says.
 
 A claim that no successful replay backs falls through to the transcript-only
-rules and failure classes below, unchanged.
+rules and failure classes below. Two of those rules follow the same
+principle: a claimed test file backed by a transcript run links only as an
+executed operand of a runner with no excluding option (not
+`pytest --ignore tests/x.py`), and the functional tier does not accept a
+recorded exit that belongs to a pipeline without `pipefail`
+(`./run_tests.sh | tail -5`), since it is the last stage's status.
 
 ## Failure class semantics
 
