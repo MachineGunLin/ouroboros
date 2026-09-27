@@ -429,6 +429,26 @@ runs, is reported as unverified (`reference_contradicts_seed_example`,
 `reference_unavailable`). This catches a slip in a stated value; it does not
 catch a misreading of the criterion that the cases and the reference share.
 
+Admission is per check: a reproduction check that already passes on the
+current tree, or a preservation check that already fails on it, is excluded on
+its own (`repro_passes_on_base`, `preservation_fails_on_base`) and the rest of
+the package is admitted. A criterion keeps the package's authority only while
+an admitted check covers it (for a bug-fix criterion, an admitted reproduction
+check). For the criteria left without an admitted check, one more constructor
+call, before the worker starts, asks for replacement checks and says why the
+earlier ones were excluded; the replacements go through the same admission.
+A criterion that names no observable behavior (no code span, call, path, error
+name, or verb such as return, raise, write or print) gets no check; it is
+reported as `non_behavioral`.
+
+Every criterion the package cannot verify (no admitted check, no binding, or
+non-behavioral) is decided by the existing verifier: its rejection fails the
+run (exit 1) and is shown as legacy-decided. Only a criterion neither verifier
+had evidence for (for example the existing verifier's transcript was
+unavailable) is accepted as unverified; the run then prints an
+insufficient-verification warning, as it does when half or more of the
+criteria were not decided by the package.
+
 ```yaml
 boundary:
   check_package: off              # on | off; unset = randomized default

@@ -112,7 +112,7 @@ the finished workspace).
 | `check_package_status` | `admitted`, `rejected`, `construction_failed`, `not_run` |
 | `package_verdict` | `pass`, `fail`, `indeterminate`, `unverified`, `none` |
 | `legacy_verdict` | `accept`, `reject`, `none` |
-| `reconciliation` | `agree`, `package_accepted_over_legacy_reject`, `package_rejected_over_legacy_accept`, `fallback_to_legacy`, `none` |
+| `reconciliation` | `agree`, `package_accepted_over_legacy_reject`, `package_rejected_over_legacy_accept`, `legacy_decided_unverified`, `fallback_to_legacy`, `none` |
 | `legacy_failure_class` | `evidence_missing`, `evidence_form_mismatch`, `fabrication_suspected`, `scope_creep`, `stall`, `blocked`, `transcript_missing_infrastructure`, `accepted`, `other`, `none` |
 | `legacy_failure_class_count` | `0`, `1`, `2`, `3+` |
 | `unverified_count` | `0`, `1`, `2`, `3+` |
@@ -121,6 +121,10 @@ the finished workspace).
 | `reference_contradiction_count` | `0`, `1`, `2`, `3+` |
 | `reference_unavailable_count` | `0`, `1`, `2`, `3+` |
 | `binding_request_count` | `0`, `1`, `2`, `3+` |
+| `non_behavioral_count` | `0`, `1`, `2`, `3+` |
+| `excluded_check_count` | `0`, `1`, `2`, `3+` |
+| `replacement_call_count` | `0`, `1`, `2`, `3+` |
+| `verification_coverage` | `full`, `partial`, `low` |
 
 - `check_package_status` describes the package the worker was bound to:
   `admitted` (a package passed admission on the starting tree, possibly after
@@ -146,7 +150,9 @@ the finished workspace).
 - `reconciliation` compares the two for the run: `agree` (the package decided
   at least one criterion and the run verdict equals the legacy verdict),
   `package_accepted_over_legacy_reject`, `package_rejected_over_legacy_accept`,
-  `fallback_to_legacy` (arm `on`, but the package decided no criterion: none
+  `legacy_decided_unverified` (the run was rejected, and every rejected
+  criterion was one the package could not verify, decided by the legacy
+  verifier), `fallback_to_legacy` (arm `on`, but the package decided no criterion: none
   was admitted, the worker attempted no criterion, or the package could not
   run its decision, so the legacy verifier decided the run exactly as in arm
   `off`; `check_package_status` then says why), `none` (arm `off` or package
@@ -160,9 +166,13 @@ the finished workspace).
   rejected. Both are recorded in both arms, so the `off` arm is the baseline.
   With the arm `on` the legacy verifier only annotates; these two properties
   are its annotation.
-- `unverified_count` buckets how many criteria the package could not verify
-  (no executable check, or no binding reaching the implementation); an
-  unverified criterion never counts as a pass. `check_tier_summary` buckets
+- `unverified_count` buckets how many criteria neither verifier had evidence
+  for: the package could not verify them (no admitted check, or no binding
+  reaching the implementation) and the legacy verifier accepted them without
+  evidence (for example the transcript was unavailable). An unverified
+  criterion never counts as a pass. A criterion the package could not verify
+  but the legacy verifier judged on evidence is legacy-decided, not
+  unverified: its rejection fails the run. `check_tier_summary` buckets
   how many criteria were checked through the constructor's default entry
   point (`A`), through the entry point the worker declared (`A_prime`), or
   not at all (`U`). Both are recorded only when the package decided the run
@@ -180,6 +190,19 @@ the finished workspace).
   worker's entry point (the constructor's default name did not resolve) and
   for which the worker, having declared none, was asked once to declare it.
   Recorded when the package governed the run's attempts (arm `on`).
+- Before the worker starts: `non_behavioral_count` buckets the criteria a
+  fixed rule found to name no observable behavior (they get no check and the
+  legacy verifier decides them); `excluded_check_count` buckets the checks
+  excluded at admission because a reproduction check passed, or a
+  preservation check failed, on the starting tree (the rest of the package is
+  admitted); `replacement_call_count` buckets the one constructor call that
+  asks for replacement checks for criteria left without an admitted check.
+  Recorded when this process built the package (arm `on`).
+- `verification_coverage` says how much of the run the package decided:
+  `full` (every criterion), `partial` (less than half not decided by the
+  package, none unverified), `low` (half or more not decided by the package,
+  a criterion unverified, or no package decision at all). `low` is also
+  printed as an insufficient-verification warning. Recorded with the arm `on`.
 
 ### Changelog
 
@@ -196,8 +219,9 @@ the finished workspace).
   `legacy_verdict`, `reconciliation`, `legacy_failure_class`,
   `legacy_failure_class_count`, `unverified_count`, `check_tier_summary`,
   `oracle_inconsistent_count`, `reference_contradiction_count`,
-  `reference_unavailable_count`, and `binding_request_count`
-  (closed values only). The first-run notice now
+  `reference_unavailable_count`, `binding_request_count`,
+  `non_behavioral_count`, `excluded_check_count`, `replacement_call_count`,
+  and `verification_coverage` (closed values only). The first-run notice now
   names randomized defaults and research use, and `notice_version` in
   `telemetry.json` re-displays it once to installs that saw an earlier notice.
   CLI `ooo run` outcomes, which were recorded as `command=extension_job`, are
@@ -249,7 +273,7 @@ use. Each row below is the exact property set accepted by the serializer.
 | `subagent_dispatch` | A session used subagent fan-out — at most one row per user/day/phase/fanout_kind | phase (`emitted`/`submitted`/`unknown`), fanout_kind, runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=mcp) | A retained lifecycle MCP command succeeds/is accepted, or any MCP command fails/is blocked | command, service, status (`succeeded`, `accepted`, `failed`, `rejected`, `blocked`), error_type (exception failures only), origin (`command=seed` only; closed enum, see below), runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=cli) | A direct non-internal `ooo <command>` is invoked | command, service (`cli`), status (`invoked`), app_version, os, ci, `$insert_id` |
-| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary, oracle_inconsistent_count, reference_contradiction_count, reference_unavailable_count, binding_request_count (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
+| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary, oracle_inconsistent_count, reference_contradiction_count, reference_unavailable_count, binding_request_count, non_behavioral_count, excluded_check_count, replacement_call_count, verification_coverage (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
 | `runtime_drift` | A frozen runtime authority input (Codex config, CLI executable, dispatch registry, profile routing) is observed to have changed after the runtime initialized; the run continues on the re-baselined input | kind (closed enum: `codex_config`/`cli_executable`/`skill_dispatcher`/`mcp_handler_registry`/`skill_dispatch_registry`/`profile_routing`/`baseline_unavailable`/`attestation_timeout`/`unknown`), runtime_backend, app_version, os, ci |
 | `ac_verify_failed` | The orchestrator's deterministic AC verify gate rejects an attempt (`run_verify_commands` enabled) | cause (closed enum: `invalid_contract`/`artifacts_missing`/`artifacts_missing_found_elsewhere`/`environment_unverifiable`/`timeout`/`exit_nonzero`/`output_assertion_unmatched`/`workspace_mutated`/`unknown`), runtime_backend, app_version, os, ci |
 
