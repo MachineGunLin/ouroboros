@@ -245,3 +245,92 @@ def test_retry_prompt_carries_the_package_counterexample_and_class() -> None:
     assert "### Check package counterexample" in prompt
     assert "function m.lerp" in prompt and "expected 5, observed 0" in prompt
     assert "Last error" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_resume_never_restores_legacy_rejected_work_as_succeeded(tmp_path: Any) -> None:
+    # R2-A2: in an arm-on run the gate keeps the legacy rejection as an
+    # annotation (on the root, or on a sub-AC of a decomposed root) and the
+    # package decides after the worker stops. A resumed process has no
+    # package, so the checkpoint records that work as failed and the resumed
+    # run restores it as failed (the legacy verdict decides).
+    from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
+    from ouroboros.orchestrator.parallel_executor_models import (
+        ACExecutionOutcome,
+        checkpoint_outcome,
+    )
+    from tests.unit.orchestrator.test_parallel_executor_verify_by_default import (
+        _make_executor,
+        _seed_with_specs,
+    )
+
+    seed = _seed_with_specs("rejected root", "rejected sub-AC", "clean")
+    plan = DependencyGraph(
+        nodes=tuple(ACNode(index=i, content=f"ac {i}", depends_on=()) for i in range(3)),
+        execution_levels=((0, 1, 2),),
+    ).to_execution_plan()
+    rejected_sub = ACExecutionResult(
+        ac_index=1, ac_content="sub", success=True, legacy_rejection="evidence form mismatch"
+    )
+    results = [
+        ACExecutionResult(
+            ac_index=0, ac_content="ac 0", success=True, legacy_rejection="form mismatch"
+        ),
+        ACExecutionResult(
+            ac_index=1,
+            ac_content="ac 1",
+            success=True,
+            is_decomposed=True,
+            sub_results=(
+                ACExecutionResult(ac_index=1, ac_content="sub ok", success=True),
+                rejected_sub,
+            ),
+        ),
+        ACExecutionResult(ac_index=2, ac_content="ac 2", success=True),
+    ]
+    assert [checkpoint_outcome(result) for result in results] == [
+        "failed",
+        "failed",
+        "succeeded",
+    ]
+    checkpoint_store = MagicMock()
+    checkpoint_store.load.return_value = type("LoadResult", (), {"is_ok": False})()
+    checkpoint_store.save.return_value = type("SaveResult", (), {"is_ok": True})()
+    executor = _make_executor(working_directory=str(tmp_path), run_verify_commands=False)
+    executor._checkpoint_store = checkpoint_store
+    executor._execute_ac_batch = AsyncMock(return_value=results)
+    await executor.execute_parallel(
+        seed=seed,
+        execution_plan=plan,
+        session_id="session-arm-on",
+        execution_id="execution-arm-on",
+        tools=["Read"],
+        tool_catalog=None,
+        system_prompt="system",
+    )
+    checkpoint = checkpoint_store.save.call_args.args[0]
+    assert checkpoint.state["ac_outcomes"] == {"0": "failed", "1": "failed", "2": "succeeded"}
+
+    restore_store = MagicMock()
+    restore_store.load.return_value = type("LoadResult", (), {"is_ok": True, "value": checkpoint})()
+    restore_store.save.return_value = type("SaveResult", (), {"is_ok": True})()
+    resumed = _make_executor(working_directory=str(tmp_path), run_verify_commands=False)
+    resumed._checkpoint_store = restore_store
+    resumed._execute_ac_batch = AsyncMock()
+    recovered = await resumed.execute_parallel(
+        seed=seed,
+        execution_plan=plan,
+        session_id="session-arm-on",
+        execution_id="execution-arm-on",
+        tools=["Read"],
+        tool_catalog=None,
+        system_prompt="system",
+    )
+    outcomes = {result.ac_index: result.outcome for result in recovered.results}
+    assert outcomes == {
+        0: ACExecutionOutcome.FAILED,
+        1: ACExecutionOutcome.FAILED,
+        2: ACExecutionOutcome.SUCCEEDED,
+    }
+    assert not recovered.all_succeeded
+    resumed._execute_ac_batch.assert_not_awaited()

@@ -357,6 +357,7 @@ from ouroboros.orchestrator.parallel_executor_models import (
     ParallelExecutionResult,
     ParallelExecutionStageResult,
     StageExecutionOutcome,
+    checkpoint_outcome,
     collect_decomposition_depth_warning_paths,
 )
 from ouroboros.orchestrator.profile_loader import ExecutionProfile, SuggestedModelTier
@@ -4766,11 +4767,7 @@ class ParallelACExecutor:
                                     all_results
                                 ),
                                 "ac_outcomes": {
-                                    str(result.ac_index): (
-                                        result.outcome.value
-                                        if result.outcome is not None
-                                        else ("succeeded" if result.success else "failed")
-                                    )
+                                    str(result.ac_index): checkpoint_outcome(result)
                                     for result in all_results
                                 },
                                 "failed_indices": sorted(failed_indices),
@@ -4909,19 +4906,11 @@ class ParallelACExecutor:
                             "result_retry_attempts": _checkpoint_result_retry_attempts(all_results),
                             "verify_gate_outcomes": _checkpoint_verify_gate_outcomes(all_results),
                             "ac_outcomes": {
-                                str(result.ac_index): (
-                                    result.outcome.value
-                                    if result.outcome is not None
-                                    else ("succeeded" if result.success else "failed")
-                                )
+                                str(result.ac_index): checkpoint_outcome(result)
                                 for result in all_results
                             },
                             "revalidated_ac_outcomes": {
-                                str(result.ac_index): (
-                                    result.outcome.value
-                                    if result.outcome is not None
-                                    else ("succeeded" if result.success else "failed")
-                                )
+                                str(result.ac_index): checkpoint_outcome(result)
                                 for result in all_results
                             },
                             "failed_indices": sorted(failed_indices),

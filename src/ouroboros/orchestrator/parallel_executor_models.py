@@ -381,6 +381,29 @@ def collect_decomposition_depth_warning_paths(
     return paths
 
 
+def checkpoint_outcome(result: ACExecutionResult) -> str:
+    """The outcome a checkpoint records for ``result``.
+
+    With the check package on, the legacy verifier's rejection is advisory
+    (``legacy_rejection``, on the result or on a sub-AC of a decomposed root)
+    and the package decides after the worker stops. A run resumed in another
+    process has no package (held-out cases are never persisted), so there
+    the legacy verdict decides: work the legacy verifier rejected is
+    checkpointed as failed and is never restored as succeeded.
+    """
+    if result.outcome is not None:
+        outcome = result.outcome.value
+    else:
+        outcome = "succeeded" if result.success else "failed"
+    if outcome in ("succeeded", "satisfied_externally") and _legacy_rejected(result):
+        return "failed"
+    return outcome
+
+
+def _legacy_rejected(result: ACExecutionResult) -> bool:
+    return bool(result.legacy_rejection) or any(_legacy_rejected(sub) for sub in result.sub_results)
+
+
 __all__ = [
     "ACExecutionOutcome",
     "ACExecutionResult",
@@ -388,5 +411,6 @@ __all__ = [
     "ParallelExecutionResult",
     "ParallelExecutionStageResult",
     "StageExecutionOutcome",
+    "checkpoint_outcome",
     "collect_decomposition_depth_warning_paths",
 ]
