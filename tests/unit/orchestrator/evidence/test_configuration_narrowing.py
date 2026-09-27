@@ -1,4 +1,4 @@
-"""Review round 3 (R3-R1): configuration that changes what a run
+"""Review round 3 (R3-R1, R3-R4): configuration that changes what a run
 imports or selects never lets that run back a test-target claim.
 
 A command that assigns ``PYTHONPATH``, ``DJANGO_SETTINGS_MODULE``,
@@ -383,6 +383,27 @@ class TestEndToEnd:
         )
 
         assert verdict.passed is True, verdict.reasons
+
+    @pytest.mark.parametrize(("exported", "passed"), [(True, False), (False, True)])
+    def test_an_export_in_an_earlier_call_disables_transcript_only_proof(
+        self, tmp_path: Path, exported: bool, passed: bool
+    ) -> None:
+        # R3-R4: a runtime's shell may keep the export for the later call.
+        workspace = _stub_workspace(tmp_path / "ws", correct=True)
+        command = "python -m pytest -q tests/test_bad.py"
+        setup = "export PYTHONPATH=stubs" if exported else "export FOO=1"
+        transcript = (
+            *_edit(workspace / "tests" / "test_bad.py", "e2"),
+            *_ran(setup, "c0", exit_code=0),
+            *_ran(command, "c1", exit_code=0)[:1],
+            _bash_result("c1", exit_code=0, output="2 passed in 0.01s"),
+        )
+
+        verdict = _transcript_only_verdict(
+            workspace, transcript, _evidence(command, ["tests/test_bad.py"])
+        )
+
+        assert verdict.passed is passed, verdict.reasons
 
     async def test_replay_scrubs_and_records_inherited_narrowing_variables(
         self, tmp_path: Path

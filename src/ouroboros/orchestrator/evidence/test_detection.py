@@ -398,8 +398,13 @@ def _test_command_targets_claim(
     chunk_test_proof_text: str,
     messages: tuple[AgentMessage, ...],
     task_cwd: str | None,
+    inherited_environment: tuple[str, ...] = (),
 ) -> bool:
-    """Return True when a successful test command can cover a test claim."""
+    """Return True when a successful test command can cover a test claim.
+
+    ``inherited_environment`` names narrowing variables an earlier call of the
+    same leaf exported (``_exported_narrowing_variables``).
+    """
     needle = claim.strip().lower()
     if _claim_contains_command_success_summary(command=command, claim=claim):
         return _claim_summary_matches_runtime_chunk(
@@ -408,7 +413,7 @@ def _test_command_targets_claim(
             chunk_text=chunk_test_proof_text,
         )
     argv = _command_invocation_argv(command)
-    environment = _command_invocation_environment(command)
+    environment = (*_command_invocation_environment(command), *inherited_environment)
     if alters_configuration(argv, environment):
         # ``PYTHONPATH=stubs pytest -v``, ``pytest -c alt.ini`` or ``manage.py
         # test --settings=alt``: output naming the test does not show that it
@@ -486,9 +491,15 @@ def _runtime_messages_support_test_claim(
         return False
     if _harness_reexecution_supports_test_claim(value=value, messages=messages, task_cwd=task_cwd):
         return True
+    # A runtime's shell may keep exports across calls, so a narrowing variable
+    # an earlier call exported may still apply to a later test run.
+    exported: set[str] = set()
     for index, message in enumerate(messages):
         if message.tool_name != "Bash":
             continue
+        inherited = tuple(sorted(exported))
+        for recorded in _runtime_message_command_values(message):
+            exported.update(_exported_narrowing_variables(recorded))
         if _runtime_message_has_conflicting_tool_call_ids(message):
             continue
         # Candidate test commands are drawn from two transcript-grounded
@@ -542,6 +553,7 @@ def _runtime_messages_support_test_claim(
                 chunk_test_proof_text=chunk_test_proof_text,
                 messages=messages,
                 task_cwd=task_cwd,
+                inherited_environment=inherited,
             )
             for command in matching_commands
         ):
@@ -803,6 +815,22 @@ def _command_invocation_environment(command: str) -> tuple[str, ...]:
     (``export PYTEST_ADDOPTS=... &&``) is not part of the invocation at all,
     so the whole command text is searched.
     """
+    return narrowing_assignments(command)
+
+
+# Shell forms that export a variable to later commands of the same shell.
+_EXPORT_FORM_RE = re.compile(r"(?<![\w-])(?:export|declare|typeset|set\s+-a|allexport)(?![\w-])")
+
+
+def _exported_narrowing_variables(command: str) -> tuple[str, ...]:
+    """Return the narrowing variables ``command`` may export to later calls.
+
+    Conservative: any narrowing assignment in a command that also uses an
+    export form (``export PYTHONPATH=stubs``, ``PYTHONPATH=x; export
+    PYTHONPATH``, ``set -a``) counts.
+    """
+    if _EXPORT_FORM_RE.search(command) is None:
+        return ()
     return narrowing_assignments(command)
 
 
