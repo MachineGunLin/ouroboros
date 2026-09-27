@@ -65,7 +65,7 @@ from ouroboros.boundary.acceptance import (
     criterion_verdicts,
     reconcile_acceptance,
 )
-from ouroboros.boundary.binding import declared_entry_points
+from ouroboros.boundary.binding import declared_entry_points, entry_points_request
 from ouroboros.boundary.binding_flow import (
     assign_tiers,
     bindings_payload,
@@ -100,6 +100,9 @@ PACKAGE_INDETERMINATE_ERROR = (
 )
 PACKAGE_FAILURE_CLASS_PREFIX = "CHECK_PACKAGE_FAIL"
 LEGACY_REJECTION_ERROR = "legacy verifier rejected this criterion"
+NO_BINDING = "no_binding"
+NO_BINDING_AFTER_REQUEST = "no_binding_after_request"
+NO_BINDING_BUDGET_EXHAUSTED = "no_binding_budget_exhausted"
 BINDING_REJECTED_PREFIX = "binding_invalid:"
 
 
@@ -424,6 +427,20 @@ class CheckPackageGate:
         self.log.append(
             {"ac_index": ac_index, "status": item.status.value, "tier": item.tier.value}
         )
+        retry_attempt = int(getattr(result, "retry_attempt", 0) or 0)
+        if item.status.is_unverified and item.reason == NO_BINDING and not entries:
+            # The criterion needs a late binding and the worker declared none.
+            # Ask once, declaration only, within the retry budget.
+            if key in authority.binding_requested:
+                return result
+            if not authority.repair_follows(retry_attempt):
+                authority.binding_budget_exhausted.add(key)
+                return result
+            authority.binding_requested.add(key)
+            self.log[-1]["binding_requested"] = True
+            return self._repair(
+                result, _declaration_request_message(key, authority.interfaces().get(ac_index))
+            )
         if item.status is PackageCriterionStatus.INDETERMINATE and item.reason.startswith(
             BINDING_REJECTED_PREFIX
         ):
@@ -445,7 +462,6 @@ class CheckPackageGate:
                 if check.oracle_result
             },
         )
-        retry_attempt = int(getattr(result, "retry_attempt", 0) or 0)
         # One reveal per criterion per run, and only when a repair attempt
         # follows (otherwise the worker never sees the case).
         plan = plan_repair(
@@ -485,6 +501,17 @@ class CheckPackageGate:
             check_package_repair=message,
             check_package_failure_class=f"{PACKAGE_FAILURE_CLASS_PREFIX}:{digest}",
         )
+
+
+def _declaration_request_message(key: str, interface: Mapping[str, Any] | None) -> str:
+    """Declaration-only repair: name the criterion and the grammar, nothing about the oracle."""
+    return (
+        f"The check package could not find the entry point of this criterion ({key}): the "
+        "default name it looks for does not exist, and your evidence declared no "
+        "entry_points. Keep your implementation unless it is incomplete, and emit the "
+        "evidence JSON again with entry_points declared for this criterion."
+        + entry_points_request(interface)
+    )
 
 
 def _binding_rejected_message(item: Any, package: Any) -> str:
@@ -539,6 +566,10 @@ class CheckPackageAuthority:
         self.revealed_criteria: set[str] = set()
         # The executor's same-runtime retry budget (set by ``install``).
         self.max_retry_attempts: int | None = None
+        # Criteria that needed a late binding and had no declaration: asked
+        # once for a declaration, or not asked because no retry was left.
+        self.binding_requested: set[str] = set()
+        self.binding_budget_exhausted: set[str] = set()
 
     def repair_follows(self, retry_attempt: int) -> bool:
         """Whether a repair attempt follows ``retry_attempt`` (unknown budget: yes)."""
@@ -636,6 +667,9 @@ class CheckPackageAuthority:
                 return await self._fall_back(
                     parallel_result, legacy, legacy_accepted, "no_admitted_package", verdict=verdict
                 )
+            verdict = _label_missing_bindings(
+                verdict, self.binding_requested, self.binding_budget_exhausted
+            )
             reconciliation = reconcile_acceptance(
                 keys,
                 verdict.verdicts,
@@ -709,6 +743,28 @@ class CheckPackageAuthority:
         except Exception:  # noqa: BLE001 - the fallback itself must stand
             log.warning("boundary.authority.fallback_not_recorded", reason=reason)
         return decided
+
+
+def _label_missing_bindings(
+    verdict: BoundaryVerdict, requested: set[str], exhausted: set[str]
+) -> BoundaryVerdict:
+    """Say why a criterion that needed a late binding still has none.
+
+    ``no_binding_after_request``: the worker was asked once and declared
+    nothing valid; ``no_binding_budget_exhausted``: no retry was left to ask.
+    The criterion stays unverified either way.
+    """
+    relabeled = {}
+    for key, item in verdict.verdicts.items():
+        if item.reason != NO_BINDING or not item.status.is_unverified:
+            continue
+        if key in requested:
+            relabeled[key] = replace(item, reason=NO_BINDING_AFTER_REQUEST)
+        elif key in exhausted:
+            relabeled[key] = replace(item, reason=NO_BINDING_BUDGET_EXHAUSTED)
+    if not relabeled:
+        return verdict
+    return replace(verdict, verdicts={**verdict.verdicts, **relabeled})
 
 
 def reveal_commitment_salts(state: BoundaryRunState | None) -> None:

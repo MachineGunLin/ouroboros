@@ -863,6 +863,7 @@ class TestCapture:
             "oracle_inconsistent_count": "1",
             "reference_contradiction_count": "0",
             "reference_unavailable_count": "3+",
+            "binding_request_count": "1",
         }
         telemetry.capture_job_outcome(
             "job-private-id",

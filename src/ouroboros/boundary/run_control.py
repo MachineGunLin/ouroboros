@@ -540,6 +540,9 @@ class CheckPackageRun:
             meta["unverified_count"] = _count_bucket(len(reconciliation.unverified))
             meta["check_tier_summary"] = tier_summary_value(reconciliation.tiers)
         meta.update(reference_check_meta(self.state))
+        if self.authority is not None and self.authority.installed:
+            # Criteria asked once for an entry_points declaration.
+            meta["binding_request_count"] = _count_bucket(len(self.authority.binding_requested))
         return meta
 
 

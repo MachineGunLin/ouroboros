@@ -120,6 +120,7 @@ the finished workspace).
 | `oracle_inconsistent_count` | `0`, `1`, `2`, `3+` |
 | `reference_contradiction_count` | `0`, `1`, `2`, `3+` |
 | `reference_unavailable_count` | `0`, `1`, `2`, `3+` |
+| `binding_request_count` | `0`, `1`, `2`, `3+` |
 
 - `check_package_status` describes the package the worker was bound to:
   `admitted` (a package passed admission on the starting tree, possibly after
@@ -175,6 +176,10 @@ the finished workspace).
   `reference_unavailable_count` buckets the criteria made unverified because
   no reference ran. Recorded when this process built the package (arm `on`),
   not on a resumed session.
+- `binding_request_count` buckets the criteria whose check needed the
+  worker's entry point (the constructor's default name did not resolve) and
+  for which the worker, having declared none, was asked once to declare it.
+  Recorded when the package governed the run's attempts (arm `on`).
 
 ### Changelog
 
@@ -190,8 +195,8 @@ the finished workspace).
   `check_package_assignment`, `check_package_status`, `package_verdict`,
   `legacy_verdict`, `reconciliation`, `legacy_failure_class`,
   `legacy_failure_class_count`, `unverified_count`, `check_tier_summary`,
-  `oracle_inconsistent_count`, `reference_contradiction_count`, and
-  `reference_unavailable_count`
+  `oracle_inconsistent_count`, `reference_contradiction_count`,
+  `reference_unavailable_count`, and `binding_request_count`
   (closed values only). The first-run notice now
   names randomized defaults and research use, and `notice_version` in
   `telemetry.json` re-displays it once to installs that saw an earlier notice.
@@ -244,7 +249,7 @@ use. Each row below is the exact property set accepted by the serializer.
 | `subagent_dispatch` | A session used subagent fan-out — at most one row per user/day/phase/fanout_kind | phase (`emitted`/`submitted`/`unknown`), fanout_kind, runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=mcp) | A retained lifecycle MCP command succeeds/is accepted, or any MCP command fails/is blocked | command, service, status (`succeeded`, `accepted`, `failed`, `rejected`, `blocked`), error_type (exception failures only), origin (`command=seed` only; closed enum, see below), runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=cli) | A direct non-internal `ooo <command>` is invoked | command, service (`cli`), status (`invoked`), app_version, os, ci, `$insert_id` |
-| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary, oracle_inconsistent_count, reference_contradiction_count, reference_unavailable_count (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
+| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary, oracle_inconsistent_count, reference_contradiction_count, reference_unavailable_count, binding_request_count (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
 | `runtime_drift` | A frozen runtime authority input (Codex config, CLI executable, dispatch registry, profile routing) is observed to have changed after the runtime initialized; the run continues on the re-baselined input | kind (closed enum: `codex_config`/`cli_executable`/`skill_dispatcher`/`mcp_handler_registry`/`skill_dispatch_registry`/`profile_routing`/`baseline_unavailable`/`attestation_timeout`/`unknown`), runtime_backend, app_version, os, ci |
 | `ac_verify_failed` | The orchestrator's deterministic AC verify gate rejects an attempt (`run_verify_commands` enabled) | cause (closed enum: `invalid_contract`/`artifacts_missing`/`artifacts_missing_found_elsewhere`/`environment_unverifiable`/`timeout`/`exit_nonzero`/`output_assertion_unmatched`/`workspace_mutated`/`unknown`), runtime_backend, app_version, os, ci |
 
