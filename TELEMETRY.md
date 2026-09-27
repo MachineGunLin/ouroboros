@@ -38,9 +38,10 @@ stable across sessions for lifecycle analysis and derived from nothing about the
 machine or user. Delete the file to reset it; opt out to stop collection. The
 same file records `notice_shown` and `notice_version`, the version of the notice
 last displayed; an older version shows the updated notice once. The notice
-counts as displayed only on an interactive terminal outside CI (or when the
-installer showed it); a notice printed into a log (`ouroboros mcp serve`, a
-pipe, CI) is not recorded and prints again next time.
+counts as displayed only on an interactive terminal outside CI, whether
+Ouroboros or the installer printed it; a notice printed into a log (`ouroboros
+mcp serve`, a pipe, CI) does not record `notice_version` and prints again next
+time.
 
 **Change policy:** scope expansions are recorded below, ship in a new
 minor/major version with a fresh notice, and default off. Scope reductions do
