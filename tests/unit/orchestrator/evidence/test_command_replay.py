@@ -1022,7 +1022,7 @@ class TestAllowlist:
             "env -u HOME make test",
             "pytest --collect-only",
             "pytest --basetemp=/tmp/elsewhere",
-            f"{sys.executable} -m pytest",
+            "/tmp/evil/python3 -m pytest",
             "/bin/sh run_tests.sh",
             "./absent.sh",
         ],
@@ -1042,6 +1042,82 @@ class TestAllowlist:
         assert replay_allowed(argv, workspace=str(self.workspace))
         assert replay_denied(argv)
         assert not command_replay.replay_admissible(candidate, str(self.workspace))
+
+    def _conda_bin(self, root: Path) -> Path:
+        """A SWE-bench-style conda environment with a python and a pytest."""
+        bin_dir = root / "miniconda3" / "envs" / "testbed" / "bin"
+        bin_dir.mkdir(parents=True)
+        _executable(bin_dir / "python3.9", "#!/bin/sh\n")
+        (bin_dir / "python").symlink_to("python3.9")
+        _executable(bin_dir / "pytest", "#!/bin/sh\n")
+        return bin_dir
+
+    def test_conda_style_interpreter_on_path_is_admitted(self, tmp_path: Path) -> None:
+        bin_dir = self._conda_bin(tmp_path / "opt")
+        environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+        for argv in (
+            (str(bin_dir / "python"), "-m", "pytest", "-q"),
+            (str(bin_dir / "python3.9"), "tests/runtests.py", "migrations"),
+            (str(bin_dir / "pytest"), "-q"),
+        ):
+            assert replay_allowed(argv, workspace=str(self.workspace), environment=environment)
+        # The environment roots also come from CONDA_PREFIX.
+        prefix = bin_dir.parent
+        assert replay_allowed(
+            (str(bin_dir / "python"), "-m", "pytest"),
+            workspace=str(self.workspace),
+            environment={"PATH": "/usr/bin:/bin", "CONDA_PREFIX": str(prefix)},
+        )
+
+    def test_verifying_interpreter_is_admitted(self) -> None:
+        assert replay_allowed(
+            (sys.executable, "-m", "pytest"),
+            workspace=str(self.workspace),
+            environment={"PATH": "/usr/bin:/bin"},
+        )
+
+    def test_interpreter_outside_the_environment_roots_is_refused(self, tmp_path: Path) -> None:
+        bin_dir = self._conda_bin(tmp_path / "opt")
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        _executable(evil / "python3", "#!/bin/sh\n")
+        environment = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+        for argv in (
+            (str(evil / "python3"), "-m", "pytest"),
+            ("/tmp/evil/python3", "-m", "pytest"),
+            # Not an interpreter or runner, although it is on PATH.
+            (str(bin_dir / "pip"), "install", "x"),
+        ):
+            assert not replay_allowed(
+                argv, workspace=str(self.workspace), environment=environment
+            ), argv
+
+    def test_symlink_resolving_outside_the_roots_is_refused(self, tmp_path: Path) -> None:
+        bin_dir = self._conda_bin(tmp_path / "opt")
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        _executable(evil / "python3", "#!/bin/sh\n")
+        (bin_dir / "python3").symlink_to(evil / "python3")
+
+        assert not replay_allowed(
+            (str(bin_dir / "python3"), "-m", "pytest"),
+            workspace=str(self.workspace),
+            environment={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        )
+
+    def test_environment_assignment_outside_the_roots_is_refused(self, tmp_path: Path) -> None:
+        for command, admitted in (
+            ("PYTHONPATH=. make test", True),
+            (f"PATH={tmp_path / 'evil'} make test", False),
+        ):
+            candidate = replay_candidate(command, str(self.workspace))
+            assert candidate is not None
+            assert (
+                command_replay.replay_admissible(
+                    candidate, str(self.workspace), {"PATH": "/usr/bin:/bin"}
+                )
+                is admitted
+            ), command
 
     def test_absolute_workspace_program_is_admitted(self) -> None:
         script = self.workspace.resolve() / "run_tests.sh"

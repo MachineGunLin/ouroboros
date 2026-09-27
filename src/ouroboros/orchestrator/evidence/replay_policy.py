@@ -33,10 +33,18 @@ A command is replayed only when that program is one of:
 (b) a script inside the workspace, run directly (``./run_tests.sh``,
     ``bin/test``) or by ``python``/``sh``/``bash`` (``tests/runtests.py``).
 
+An absolute-path program outside the workspace is admitted only when its
+name is an allowlisted interpreter or runner (``python3.9``, ``pytest``,
+``make``, ...) and its resolved real path lies inside a known environment
+root (``environment_roots``: the verifying interpreter's ``sys.prefix`` and
+``sys.base_prefix``, ``VIRTUAL_ENV``, ``CONDA_PREFIX``, and the directories
+on the replay environment's ``PATH``), as with
+``/opt/miniconda3/envs/testbed/bin/python -m pytest`` in a SWE-bench image.
+
 Refused: every other program, including the file viewers and text utilities
-in ``VIEWER_PROGRAMS``, version control, package managers, an absolute-path
-program outside the workspace, an absolute-path argument outside the
-workspace, ``xargs`` (its argv comes from stdin), and a runner in a mode that
+in ``VIEWER_PROGRAMS``, version control, package managers, any other
+absolute-path program outside the workspace, an absolute-path argument
+outside the workspace (other than such an environment program), ``xargs`` (its argv comes from stdin), and a runner in a mode that
 runs no tests (``--help``, ``--collect-only``, ``make -n``, ...). The
 denylist in ``command_replay`` stays as a second layer.
 
@@ -54,6 +62,7 @@ from dataclasses import dataclass
 import os
 from pathlib import PurePosixPath
 import re
+import sys
 
 from ouroboros.orchestrator.evidence.shell_parsing import (
     _PYTEST_NON_EXECUTING_OPTIONS,
@@ -435,6 +444,59 @@ _TARGET_FLAG_OPTIONS = frozenset(
 _LABEL_RUNNER_VALUE_OPTIONS = frozenset({"-v", "--verbosity"})
 
 
+# Programs admitted by absolute path when they resolve inside an environment
+# root (see ``environment_roots``), besides the Python interpreters.
+_ENVIRONMENT_PROGRAMS = (
+    _DIRECT_RUNNERS
+    | _JS_PACKAGE_RUNNERS
+    | frozenset(_SUBCOMMAND_RUNNERS)
+    | {"py.test", "make", "gmake", "mvn", "gradle"}
+)
+
+
+def environment_roots(environment: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Return the real paths of the known environment roots.
+
+    The verifying interpreter's ``sys.prefix`` and ``sys.base_prefix``,
+    ``VIRTUAL_ENV``, ``CONDA_PREFIX`` and every absolute ``PATH`` directory of
+    ``environment`` (the process environment when None). The filesystem root
+    itself is never a root.
+    """
+    source = os.environ if environment is None else environment
+    candidates = [
+        sys.prefix,
+        sys.base_prefix,
+        source.get("VIRTUAL_ENV", ""),
+        source.get("CONDA_PREFIX", ""),
+        *source.get("PATH", "").split(os.pathsep),
+    ]
+    roots = {
+        os.path.realpath(candidate)
+        for candidate in candidates
+        if candidate and os.path.isabs(candidate)
+    }
+    roots.discard(os.sep)
+    return tuple(sorted(roots))
+
+
+def _environment_program(program: str, roots: Sequence[str] | None) -> bool:
+    """Return True for an absolute allowlisted program inside an environment root.
+
+    With ``roots`` None (lexical linkage on an admitted command) the name
+    alone decides; otherwise the program's real path, symlinks resolved,
+    must be an executable file inside one of ``roots``.
+    """
+    if not os.path.isabs(program):
+        return False
+    name = _program_name(program)
+    if not (_is_python_executable(name) or name in _ENVIRONMENT_PROGRAMS):
+        return False
+    if roots is None:
+        return True
+    real = os.path.realpath(program)
+    return os.path.isfile(real) and os.access(real, os.X_OK) and _inside(real, roots)
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedRunner:
     """The program a command really runs and the arguments it receives.
@@ -679,7 +741,11 @@ def _runner(
 
 
 def _resolve(
-    parts: tuple[str, ...], workspace: str | None, cwd_relative: str, depth: int
+    parts: tuple[str, ...],
+    workspace: str | None,
+    cwd_relative: str,
+    depth: int,
+    roots: Sequence[str] | None,
 ) -> ResolvedRunner | None:
     if depth > _MAX_RESOLVE_DEPTH:
         return None
@@ -690,8 +756,11 @@ def _resolve(
     name = _program_name(program)
     if "/" in program or "\\" in program:
         # A path program must be a file inside the workspace: a runner the
-        # project ships (``./gradlew``, ``.venv/bin/pytest``) or its script.
+        # project ships (``./gradlew``, ``.venv/bin/pytest``) or its script;
+        # or an allowlisted interpreter or runner inside an environment root.
         if not _workspace_file(program, workspace, cwd_relative):
+            if _environment_program(program, roots):
+                return _runner(name, peeled, workspace, cwd_relative)
             return None
         resolved = _runner(name, peeled, workspace, cwd_relative)
         if resolved is not None:
@@ -714,7 +783,7 @@ def _resolve(
         if index is None:
             return None
         # The launched program passes the same allowlist (``uv run pytest``).
-        return _resolve(peeled[index:], workspace, cwd_relative, depth + 1)
+        return _resolve(peeled[index:], workspace, cwd_relative, depth + 1, roots)
     return _runner(name, peeled, workspace, cwd_relative)
 
 
@@ -731,14 +800,20 @@ def _non_executing(runner: ResolvedRunner) -> bool:
 
 
 def resolve_replay_program(
-    argv: Sequence[str], *, workspace: str | None, cwd_relative: str = "."
+    argv: Sequence[str],
+    *,
+    workspace: str | None,
+    cwd_relative: str = ".",
+    environment: Mapping[str, str] | None = None,
 ) -> ResolvedRunner | None:
     """Return the allowlisted runner ``argv`` really runs, or None.
 
     ``workspace`` None resolves lexically (no file checks); replay admission
-    always passes the workspace.
+    always passes the workspace, and ``environment`` (the replay environment,
+    the process environment when None) supplies the environment roots.
     """
-    resolved = _resolve(tuple(argv), workspace, cwd_relative, 0)
+    roots = None if workspace is None else environment_roots(environment)
+    resolved = _resolve(tuple(argv), workspace, cwd_relative, 0, roots)
     if resolved is None or _non_executing(resolved):
         return None
     return resolved
@@ -751,12 +826,36 @@ def _absolute_argument_outside(token: str, roots: Sequence[str]) -> bool:
     return not _inside(os.path.normpath(value), roots)
 
 
-def replay_allowed(argv: Sequence[str], *, workspace: str, cwd_relative: str = ".") -> bool:
+def outside_known_roots(
+    value: str, *, workspace: str, environment: Mapping[str, str] | None = None
+) -> bool:
+    """Return True when an absolute ``value`` lies outside the workspace.
+
+    ``/dev/null`` and an admitted environment program are not outside.
+    """
+    return _absolute_argument_outside(value, _workspace_roots(workspace)) and not (
+        _environment_program(value, environment_roots(environment))
+    )
+
+
+def replay_allowed(
+    argv: Sequence[str],
+    *,
+    workspace: str,
+    cwd_relative: str = ".",
+    environment: Mapping[str, str] | None = None,
+) -> bool:
     """Return True when ``argv`` may be replayed (see module docstring)."""
-    if resolve_replay_program(argv, workspace=workspace, cwd_relative=cwd_relative) is None:
+    if (
+        resolve_replay_program(
+            argv, workspace=workspace, cwd_relative=cwd_relative, environment=environment
+        )
+        is None
+    ):
         return False
-    roots = _workspace_roots(workspace)
-    return not any(_absolute_argument_outside(token, roots) for token in argv)
+    return not any(
+        outside_known_roots(token, workspace=workspace, environment=environment) for token in argv
+    )
 
 
 def _excluding_option(token: str, kind: str) -> bool:
@@ -842,6 +941,8 @@ __all__ = [
     "VIEWER_PROGRAMS",
     "ResolvedRunner",
     "claim_target_operands",
+    "environment_roots",
+    "outside_known_roots",
     "peel_wrappers",
     "replay_allowed",
     "resolve_replay_program",

@@ -85,6 +85,7 @@ from ouroboros.orchestrator.evidence.harness_observation import (
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
     claim_target_operands,
+    outside_known_roots,
     peel_wrappers,
     replay_allowed,
 )
@@ -368,10 +369,29 @@ def replay_candidate(
     )
 
 
-def replay_admissible(candidate: ReplayCandidate, workspace: str) -> bool:
-    """Return True when the allowlist admits ``candidate`` and the denylist does not refuse it."""
-    return not replay_denied(candidate.argv) and replay_allowed(
-        candidate.argv, workspace=workspace, cwd_relative=candidate.cwd_relative
+def replay_admissible(
+    candidate: ReplayCandidate,
+    workspace: str,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when the allowlist admits ``candidate`` and the denylist does not refuse it.
+
+    ``environment`` is the replay environment (the process environment when
+    None). An environment assignment in the command whose value names an
+    absolute path outside the workspace and the environment roots (for
+    example ``PATH=/tmp/elsewhere``) is refused as well.
+    """
+    if replay_denied(candidate.argv) or not replay_allowed(
+        candidate.argv,
+        workspace=workspace,
+        cwd_relative=candidate.cwd_relative,
+        environment=environment,
+    ):
+        return False
+    return not any(
+        outside_known_roots(part, workspace=workspace, environment=environment)
+        for value in candidate.env_delta.values()
+        for part in value.split(os.pathsep)
     )
 
 
@@ -916,7 +936,7 @@ async def replay_commands(
         return ()
     observations: list[CommandObservation] = []
     for candidate in candidates[:MAX_REPLAYED_COMMANDS]:
-        if not replay_admissible(candidate, workspace):
+        if not replay_admissible(candidate, workspace, env):
             continue
         observation = await _replay_one(
             candidate,
