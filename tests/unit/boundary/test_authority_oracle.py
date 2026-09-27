@@ -613,6 +613,27 @@ async def test_authority_error_with_the_gate_installed_falls_back_to_the_legacy_
     assert "unverified_count" not in meta and "check_tier_summary" not in meta
 
 
+async def test_tier_buckets_are_sent_only_when_the_package_decided(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    # T3: an admitted package whose criteria the worker never attempted is a
+    # fallback_to_legacy row without the package-only buckets.
+    seed, authority = await _authority(store, repo, tmp_path)
+    authority.install(_executor(repo))
+    crashed = tuple(
+        ACExecutionResult(ac_index=index, ac_content="c", success=False, error="runtime crashed")
+        for index in range(3)
+    )
+    parallel = ParallelExecutionResult(results=crashed, success_count=0, failure_count=3)
+    await authority(seed=seed, execution_id="exec_oracle", parallel_result=parallel)
+    assert authority.outcome.reconciliation is not None and not authority.outcome.package_decided
+    meta = await _run_for(authority).outcome_meta(
+        _NoEvents(), execution_id="exec_oracle", session_id="s", terminal_status="failed"
+    )  # type: ignore[arg-type]
+    assert meta["reconciliation"] == "fallback_to_legacy"
+    assert "unverified_count" not in meta and "check_tier_summary" not in meta
+
+
 TWO_HELD = {
     **REPLY,
     "oracles": [

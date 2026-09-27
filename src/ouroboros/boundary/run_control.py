@@ -426,7 +426,8 @@ class CheckPackageRun:
                 )
             )
         reconciliation = outcome.reconciliation if outcome is not None else None
-        if reconciliation is not None:
+        if reconciliation is not None and outcome is not None and outcome.package_decided:
+            # Only when the package decided the run (TELEMETRY.md).
             meta["unverified_count"] = _count_bucket(len(reconciliation.unverified))
             meta["check_tier_summary"] = tier_summary_value(reconciliation.tiers)
         return meta
