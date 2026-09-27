@@ -199,8 +199,7 @@ the default) and the leaf held Bash authority. The rules:
   - the Python interpreter flags `-P` and `-I` (they change `sys.path`);
   - a runner's configuration, module-resolution or selection options:
     Django `runtests.py`, `manage.py test` and `django-admin test`
-    `--settings`, `--pythonpath`, `--testrunner` and `--parallel` (the
-    SWE-bench form `--settings=test_sqlite --parallel 1` included); jest and
+    `--settings`, `--pythonpath` and `--testrunner`; jest and
     vitest `-c`/`--config`, `-t`/`--testNamePattern`,
     `--testPathIgnorePatterns`, `--testPathPattern`, `--selectProjects`,
     `--shard`, `-o`/`--onlyChanged`, `--changedSince`, `--passWithNoTests`,
@@ -219,6 +218,26 @@ the default) and the leaf held Bash authority. The rules:
     Maven `-Dtest=` (and `-Dit.test`, `-Dgroups`, `surefire.*`,
     `failsafe.*`), `-P`, `-pl`, `-s`, `-f`; Gradle `--tests`, `-P`, `-x`,
     `-b`, `-c`, `-I`, `-p`.
+
+  An option narrows only when it changes which tests run, or how modules and
+  settings resolve, relative to the runner's documented default. A process
+  count never narrows: Django `--parallel N` (any `N`, `auto` included),
+  pytest-xdist `-n`, `cargo test -j`. An option set to its documented default
+  does not narrow either. The one such default recognized is Django's
+  `tests/runtests.py --settings test_sqlite` (also `--settings=test_sqlite`,
+  and the script reached as `./tests/runtests.py`, `python tests/runtests.py`
+  or `cd tests && python runtests.py`): `runtests.py` runs
+  `os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_sqlite")` when no
+  `--settings` is given, and its `--settings` help says "either the
+  DJANGO_SETTINGS_MODULE environment variable or "test_sqlite" will be used"
+  ([django/tests/runtests.py](https://github.com/django/django/blob/main/tests/runtests.py)).
+  A command-line `DJANGO_SETTINGS_MODULE` narrows on its own and replay
+  scrubs an inherited one, so the default holds on replay. So the SWE-bench
+  form `./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1
+  <labels>` links its labels. Any other settings value, `manage.py test
+  --settings=test_sqlite` (whose default is the project's own settings), and
+  every other runner's configuration options stay narrowing: no other option
+  value is known to equal its runner's default.
 
   Two classes are told apart. Selection options (`-k`, `--tests`, `-Dtest=`,
   `-run`, `-t`, `--filter`, ...) choose which tests run; on the
