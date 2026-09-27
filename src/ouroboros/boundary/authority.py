@@ -334,7 +334,6 @@ class CheckPackageGate:
             return result
 
     async def _decide(self, ac_index: int, result: Any) -> Any:
-
         authority = self._authority
         state = authority.state
         package = state.package
