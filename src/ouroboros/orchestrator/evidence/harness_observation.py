@@ -94,9 +94,9 @@ class CommandObservation:
     transcript recorded for the original run, when it recorded one; a replay
     whose exit differs from it is never success. ``env_delta`` holds the
     environment assignments the command itself made (``NAME=value`` before
-    the program), and ``scrubbed_environment`` the variables the replay
-    removed from the environment it inherited
-    (``replay_policy.NARROWING_ENVIRONMENT``).
+    the program), and ``scrubbed_environment`` the names of the narrowing
+    variables the replay removed from the environment it inherited
+    (``replay_policy.narrowing_variable``), sorted.
     """
 
     command: str

@@ -25,9 +25,10 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
-    NARROWING_ENVIRONMENT,
+    alters_configuration,
     claim_target_operands,
     excludes_tests,
+    narrowing_assignments,
     run_may_back_test_claim,
 )
 from ouroboros.orchestrator.evidence.shell_parsing import (
@@ -406,6 +407,13 @@ def _test_command_targets_claim(
             claim=claim,
             chunk_text=chunk_test_proof_text,
         )
+    argv = _command_invocation_argv(command)
+    environment = _command_invocation_environment(command)
+    if alters_configuration(argv, environment):
+        # ``PYTHONPATH=stubs pytest -v``, ``pytest -c alt.ini`` or ``manage.py
+        # test --settings=alt``: output naming the test does not show that it
+        # passed against the workspace's code.
+        return False
     normalized_proof_text = chunk_test_proof_text.lower()
     if needle and needle in normalized_proof_text:
         return True
@@ -415,8 +423,6 @@ def _test_command_targets_claim(
         return False
     normalized_file = file_part.lower()
     normalized_command = command.lower()
-    argv = _command_invocation_argv(command)
-    environment = _command_invocation_environment(command)
     if excludes_tests(argv, environment):
         # ``pytest --ignore tests/x.py``, ``pytest -k "not x"`` or
         # ``PYTEST_ADDOPTS=--deselect=... pytest``: the named test file may
@@ -789,22 +795,15 @@ def _command_invocation_argv(command: str) -> tuple[str, ...]:
     return tuple(_strip_env_prefix(parts))
 
 
-# An assignment to a variable in ``NARROWING_ENVIRONMENT`` anywhere in the
-# command text: a prefix, an ``env`` or ``export`` form, a preamble segment,
-# or inside a shell wrapper's quoted body.
-_NARROWING_ASSIGNMENT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(" + "|".join(sorted(NARROWING_ENVIRONMENT)) + r")="
-)
-
-
 def _command_invocation_environment(command: str) -> tuple[str, ...]:
-    """Return the ``NARROWING_ENVIRONMENT`` variables ``command`` assigns.
+    """Return the narrowing variables ``command`` assigns
+    (``replay_policy.narrowing_variable``).
 
     ``_command_invocation_argv`` drops environment assignments, and a preamble
     (``export PYTEST_ADDOPTS=... &&``) is not part of the invocation at all,
     so the whole command text is searched.
     """
-    return tuple(sorted(set(_NARROWING_ASSIGNMENT_RE.findall(command))))
+    return narrowing_assignments(command)
 
 
 def _replayed_environment(run: CommandObservation) -> tuple[str, ...]:

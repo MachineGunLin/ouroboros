@@ -27,12 +27,12 @@ Execution rules (each one fails closed):
 - The command runs as a direct argv, never through a shell, in a fresh copy of
   the workspace, under the verify gate's sanitized environment and timeout,
   with ``PYTHONDONTWRITEBYTECODE=1``. At most ``MAX_REPLAYED_COMMANDS``
-  commands per criterion. The variables in
-  ``replay_policy.NARROWING_ENVIRONMENT`` (``PYTEST_ADDOPTS``,
-  ``PYTEST_PLUGINS``, ``PYTEST_DISABLE_PLUGIN_AUTOLOAD``) are removed from
-  the inherited environment, and each run records that in
-  ``scrubbed_environment``; the command's own assignments are kept, and they
-  disable target linkage instead.
+  commands per criterion. The narrowing variables
+  (``replay_policy.narrowing_variable``: ``PYTEST_ADDOPTS``, ``PYTHONPATH``,
+  ``DJANGO_SETTINGS_MODULE``, ``NODE_OPTIONS``, ``JEST_*``, ...) are removed
+  from the inherited environment, and each run records the names it removed
+  in ``scrubbed_environment``; the command's own assignments are kept, and
+  they disable target linkage instead.
 - Network access must be denied: ``sandbox-exec`` on macOS, an unprivileged
   network namespace on Linux, or a Linux process that already has no network
   interface but loopback (a container run with ``--network none``). Where none
@@ -90,9 +90,10 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
-    NARROWING_ENVIRONMENT,
     claim_target_operands,
     command_line_assignments,
+    narrowing_assignments,
+    narrowing_variable,
     outside_known_roots,
     peel_wrappers,
     replay_allowed,
@@ -487,7 +488,9 @@ def claim_links_to_command(
     is a positional operand of a test runner executing it, with no option or
     command-line configuration that excludes or narrows the tests
     (``replay_policy.claim_target_operands``; ``environment`` names the
-    variables the command assigns before ``argv``). A claim that merely
+    variables the command assigns before ``argv``, and an assignment to a
+    narrowing variable anywhere in the transcript command counts too). A claim
+    that merely
     contains a command is not linked to it.
     """
     text = _normalize(claim)
@@ -500,7 +503,10 @@ def claim_links_to_command(
     if annotated is not None and annotated.group(1) in commands:
         return True
     target = _claim_test_target(claim)
-    return target is not None and target in claim_target_operands(argv, environment)
+    if target is None:
+        return False
+    assigned = (*environment, *narrowing_assignments(transcript_command))
+    return target in claim_target_operands(argv, assigned)
 
 
 def replayed_command_supports_claim(value: str, messages: tuple[AgentMessage, ...]) -> bool:
@@ -905,9 +911,8 @@ async def _replay_one(
         }
         # Configuration the replay would inherit from the worker's environment
         # must not narrow what a test runner collects or selects.
-        inherited = {
-            key: value for key, value in env.items() if key.upper() not in NARROWING_ENVIRONMENT
-        }
+        inherited = {key: value for key, value in env.items() if not narrowing_variable(key)}
+        scrubbed = tuple(sorted(key for key in env if narrowing_variable(key)))
         run = await run_with_shell(
             [*prefix, *argv],
             cwd=str((copy_root / candidate.cwd_relative).resolve()),
@@ -933,7 +938,7 @@ async def _replay_one(
             network_isolated=True,
             transcript_returncode=candidate.transcript_returncode,
             env_delta=tuple(sorted(candidate.env_delta.items())),
-            scrubbed_environment=tuple(sorted(NARROWING_ENVIRONMENT)),
+            scrubbed_environment=scrubbed,
         )
     except OSError:
         return None

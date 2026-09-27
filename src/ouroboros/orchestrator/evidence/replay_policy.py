@@ -52,9 +52,10 @@ The same resolution decides the test-target linkage rule
 (``claim_target_operands``): a claim naming a test file or label is linked to
 a command only when it is a positional operand (not an option value) of a
 test runner that executes it, and the command neither excludes or narrows the
-tests it runs nor changes what the runner collects or selects through
+tests it runs nor changes what the runner collects, loads or imports through
 configuration. Each of these disables the target rule and the runner-output
-rules (``run_may_back_test_claim``):
+rules (``run_may_back_test_claim``); where a runner's semantics are unclear,
+an option is treated as narrowing:
 
 - an option that excludes or selects tests: ``--deselect``, ``--ignore``,
   ``-k`` and ``-m`` (pytest), ``-k`` (unittest, Django, project runner
@@ -72,12 +73,37 @@ rules (``run_may_back_test_claim``):
   (``no:cacheprovider``); ``-p``/``--pattern`` for unittest, Django and
   project runner scripts, where it is a discovery pattern;
 - an assignment on the command line (leading, or consumed by an ``env``
-  wrapper) of a variable in ``NARROWING_ENVIRONMENT`` (``PYTEST_ADDOPTS``,
-  ``PYTEST_PLUGINS``, ``PYTEST_DISABLE_PLUGIN_AUTOLOAD``), whatever the runner.
+  wrapper) of a variable in ``NARROWING_ENVIRONMENT`` (the pytest variables,
+  ``PYTHONPATH``, ``PYTHONHOME``, ``PYTHONSTARTUP``, ``PYTHONSAFEPATH``,
+  ``DJANGO_SETTINGS_MODULE``, ``NODE_OPTIONS``, ``NODE_PATH``, ``RUBYOPT``,
+  ``RUBYLIB``, ``BUNDLE_GEMFILE``, ``GOFLAGS``, ``CGO_ENABLED``) or with a
+  prefix in ``NARROWING_ENVIRONMENT_PREFIXES`` (``JEST_``, ``VITEST_``),
+  whatever the runner (``narrowing_variable``);
+- the Python interpreter flags ``-P`` and ``-I``;
+- an entry of ``_RUNNER_CONFIG_OPTIONS`` for the runner: Django ``--settings``,
+  ``--parallel``, ``--pythonpath`` and ``--testrunner``; jest and vitest
+  configuration, selection, sharding and module-mapping options; mocha,
+  phpunit and rspec configuration, filter, group and load-path options;
+  ``go test`` ``-run``, ``-skip``, ``-tags``, ``-short``, ``-list``,
+  ``-exec``, ``-mod``, ``-overlay``; Maven ``-P``, ``-pl``, ``-s``, ``-f``
+  and test-selecting ``-D`` properties (``-Dtest=``); Gradle ``--tests``,
+  ``-P``, ``-x`` and build-file options; ``cargo test`` and ``cargo nextest``
+  target and feature options, and any positional filter or option outside
+  ``_CARGO_FLAG_OPTIONS`` and ``_CARGO_VALUE_OPTIONS``.
 
-Replay also removes ``NARROWING_ENVIRONMENT`` from the environment the replay
+Narrowing has two classes. ``SELECTION`` options only choose which tests run
+(``-k``, ``--tests``, ``-Dtest=``, ``-run``, ``_RUNNER_SELECTION_OPTIONS``);
+``CONFIGURATION`` (every other entry above: the environment, interpreter
+flags, configuration files, settings, module resolution, plugin loading)
+can make a named test pass against code other than the workspace's, so the
+transcript-only rules do not accept even output that names the claimed test
+(``alters_configuration``).
+
+Replay also removes every narrowing variable from the environment the replay
 inherits (``command_replay``). ``uv run --env-file`` is refused, since the
-file may set those variables.
+file may set those variables. Configuration the workspace itself carries
+(``pytest.ini`` ``addopts``, ``conftest.py``, ``jest.config.js``) is part of
+the work under review and out of scope here.
 """
 
 from __future__ import annotations
@@ -102,6 +128,11 @@ from ouroboros.orchestrator.evidence.shell_parsing import (
 )
 
 _MAX_RESOLVE_DEPTH = 6
+# Narrowing classes (``_selection``). ``SELECTION``: an option selects, skips
+# or excludes tests by name, path or group. ``CONFIGURATION``: the runner's
+# configuration, module resolution or environment is replaced.
+SELECTION = "selection"
+CONFIGURATION = "configuration"
 
 # File viewers and text utilities: they read or list files, they never
 # execute a test. Never replayed, and never a test-target runner.
@@ -474,12 +505,154 @@ _LABEL_RUNNER_VALUE_OPTIONS = frozenset({"-v", "--verbosity"})
 # Runners whose ``-p``/``--pattern`` is a test discovery pattern.
 _PATTERN_RUNNER_KINDS = frozenset({"unittest", "django", "test-script"})
 
-# Environment variables that change what pytest collects, selects or loads.
-# Assigned on the command line they disable test-target linkage; replay also
-# removes them from the environment it inherits.
+# Per runner, options that replace its configuration, change where it imports
+# modules from, or select, shard or skip tests. Any of them disables test-target
+# linkage and the runner-output rules. Where a runner's semantics are unclear
+# the option is listed (conservative). jest and vitest long options are
+# compared case-insensitively without dashes (``--testNamePattern`` and
+# ``--test-name-pattern`` alike); ``go test`` accepts ``--name`` for ``-name``.
+_JS_CONFIG_OPTIONS = frozenset(
+    {"-c", "--config", "-t", "--testnamepattern", "--testpathignorepatterns"}
+    | {"--selectprojects", "--ignoreprojects", "--shard", "-o", "--onlychanged"}
+    | {"--changedsince", "--changed", "--lastcommit", "--findrelatedtests", "--related"}
+    | {"--passwithnotests", "--testpathpattern", "--testpathpatterns", "--testmatch"}
+    | {"--testregex", "--roots", "--rootdir", "-r", "--root", "--dir", "--project"}
+    | {"--exclude", "--setupfiles", "--setupfilesafterenv", "--modulepaths"}
+    | {"--moduledirectories", "--modulenamemapper", "--testrunner", "--testsequencer"}
+)
+_DJANGO_CONFIG_OPTIONS = frozenset({"--settings", "--parallel", "--pythonpath", "--testrunner"})
+_CARGO_CONFIG_OPTIONS = frozenset(
+    {"--skip", "--exact", "--ignored", "--features", "-F", "--no-default-features"}
+    | {"--all-features", "--lib", "--bins", "--bin", "--tests", "--test", "--examples"}
+    | {"--example", "--benches", "--bench", "--doc", "-p", "--package", "--exclude"}
+    | {"--manifest-path", "--config", "--no-run", "--list", "-Z"}
+    | {"-E", "--filter-expr", "--filterset", "--partition", "-P", "--profile", "--run-ignored"}
+)
+_RUNNER_CONFIG_OPTIONS: Mapping[str, frozenset[str]] = {
+    "jest": _JS_CONFIG_OPTIONS,
+    "vitest": _JS_CONFIG_OPTIONS,
+    "mocha": frozenset(
+        {"--config", "--package", "--opts", "--grep", "-g", "--fgrep", "-f", "--invert"}
+        | {"-i", "--ignore", "--exclude", "--file", "--require", "-r", "--extension"}
+    ),
+    "phpunit": frozenset(
+        {"-c", "--configuration", "--no-configuration", "--filter", "--exclude-filter"}
+        | {"--group", "--exclude-group", "--testsuite", "--exclude-testsuite", "--covers"}
+        | {"--uses", "--test-suffix", "--bootstrap", "--include-path", "-d"}
+    ),
+    "rspec": frozenset(
+        {"-O", "--options", "-e", "--example", "-E", "--example-matches", "-t", "--tag"}
+        | {"-P", "--pattern", "--exclude-pattern", "-I", "-r", "--require"}
+        | {"--default-path", "--only-failures", "-n", "--next-failure"}
+    ),
+    "go-test": frozenset(
+        {"-run", "-skip", "-tags", "-short", "-list", "-exec", "-toolexec", "-overlay"}
+        | {"-mod", "-modfile", "-C"}
+    ),
+    "cargo-test": _CARGO_CONFIG_OPTIONS,
+    "cargo-nextest": _CARGO_CONFIG_OPTIONS,
+    "mvn": frozenset(
+        {"-P", "--activate-profiles", "-pl", "--projects", "-s", "--settings", "-gs"}
+        | {"--global-settings", "-f", "--file"}
+    ),
+    "gradle": frozenset(
+        {"--tests", "-P", "--project-prop", "-p", "--project-dir", "-b", "--build-file"}
+        | {"-c", "--settings-file", "-I", "--init-script", "-x", "--exclude-task"}
+    ),
+    "django": _DJANGO_CONFIG_OPTIONS,
+    "test-script": _DJANGO_CONFIG_OPTIONS,
+}
+# The entries of ``_RUNNER_CONFIG_OPTIONS`` that only select or skip tests by
+# name, path or group; the others replace configuration or module resolution
+# (see ``SELECTION`` and ``CONFIGURATION``).
+_JS_SELECTION_OPTIONS = frozenset(
+    {"-t", "--testnamepattern", "--testpathignorepatterns", "--testpathpattern"}
+    | {"--testpathpatterns", "--selectprojects", "--ignoreprojects", "--shard", "-o"}
+    | {"--onlychanged", "--changedsince", "--changed", "--lastcommit", "--findrelatedtests"}
+    | {"--related", "--passwithnotests", "--exclude", "--project"}
+)
+_RUNNER_SELECTION_OPTIONS: Mapping[str, frozenset[str]] = {
+    "jest": _JS_SELECTION_OPTIONS,
+    "vitest": _JS_SELECTION_OPTIONS,
+    "mocha": frozenset(
+        {"--grep", "-g", "--fgrep", "-f", "--invert", "-i", "--ignore"} | {"--exclude"}
+    ),
+    "phpunit": frozenset(
+        {"--filter", "--exclude-filter", "--group", "--exclude-group", "--testsuite"}
+        | {"--exclude-testsuite", "--covers", "--uses", "--test-suffix"}
+    ),
+    "rspec": frozenset(
+        {"-e", "--example", "-E", "--example-matches", "-t", "--tag", "-P", "--pattern"}
+        | {"--exclude-pattern", "--only-failures", "-n", "--next-failure"}
+    ),
+    "go-test": frozenset({"-run", "-skip"}),
+    "cargo-test": frozenset({"--skip", "--exact", "--ignored"}),
+    "cargo-nextest": frozenset({"--skip", "--exact", "--ignored", "-E", "--filter-expr"}),
+    "mvn": frozenset({"-pl", "--projects"}),
+    "gradle": frozenset({"--tests", "-x", "--exclude-task"}),
+    "django": frozenset({"--parallel"}),
+    "test-script": frozenset({"--parallel"}),
+}
+_CAMEL_OPTION_KINDS = frozenset({"jest", "vitest"})
+# Runners whose short options take an attached value (``-cjest.config.js``,
+# ``-Ilib``): a table entry of two characters also matches as a prefix.
+_ATTACHED_SHORT_KINDS = frozenset({"jest", "vitest", "mocha", "phpunit", "rspec"})
+# Runners whose single-dash options are whole words (``go test -mod=vendor``,
+# ``mvn -pl core``): the option is matched as written, up to any ``=``.
+_WORD_OPTION_KINDS = frozenset({"go-test", "mvn", "gradle"})
+# Kinds whose positional arguments are test-name filters (``cargo test foo``,
+# ``cargo test -- foo``), not targets: any positional narrows, and an option
+# outside the two tables below narrows too, since its value may be a filter.
+_FILTER_OPERAND_KINDS = frozenset({"cargo-test", "cargo-nextest"})
+_CARGO_FLAG_OPTIONS = frozenset(
+    {"-q", "--quiet", "-v", "-vv", "--verbose", "-r", "--release", "--workspace", "--all"}
+    | {"--all-targets", "--no-fail-fast", "--frozen", "--locked", "--offline", "--timings"}
+    | {"--nocapture", "--no-capture", "--show-output", "--include-ignored"}
+)
+_CARGO_VALUE_OPTIONS = frozenset(
+    {"-j", "--jobs", "--target", "--target-dir", "--color", "--message-format"} | {"--test-threads"}
+)
+# Maven and Gradle ``-D`` properties that select tests.
+_BUILD_SELECTION_PROPERTIES = frozenset({"test", "it.test", "groups", "excludedgroups"})
+_BUILD_SELECTION_PROPERTY_PREFIXES = ("test.", "surefire.", "failsafe.", "maven.test.")
+# Interpreter flags that change where Python imports modules from (``-P``
+# and ``-I`` stop prepending the script or working directory to ``sys.path``).
+_NARROWING_PYTHON_FLAGS = frozenset({"-P", "-I"})
+
+# Environment variables that change what a test runner collects, selects or
+# loads, or where the code under test is imported from. Assigned on the
+# command line they disable test-target linkage; replay also removes them from
+# the environment it inherits. ``NARROWING_ENVIRONMENT_PREFIXES`` extends the
+# set to every variable with one of those prefixes.
 NARROWING_ENVIRONMENT = frozenset(
     {"PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD"}
+    | {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONSAFEPATH"}
+    | {"DJANGO_SETTINGS_MODULE", "NODE_OPTIONS", "NODE_PATH", "RUBYOPT", "RUBYLIB"}
+    | {"BUNDLE_GEMFILE", "GOFLAGS", "CGO_ENABLED"}
 )
+NARROWING_ENVIRONMENT_PREFIXES = ("JEST_", "VITEST_")
+# An assignment to one of those variables anywhere in a command's text: a
+# prefix, an ``env`` or ``export`` form, a preamble segment, or inside a shell
+# wrapper's quoted body.
+_NARROWING_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])("
+    + "|".join(sorted(NARROWING_ENVIRONMENT))
+    + "".join(f"|{prefix}[A-Za-z0-9_]*" for prefix in NARROWING_ENVIRONMENT_PREFIXES)
+    + r")="
+)
+
+
+def narrowing_variable(name: str) -> bool:
+    """Return True when environment variable ``name`` narrows a test run."""
+    upper = name.upper()
+    return upper in NARROWING_ENVIRONMENT or upper.startswith(NARROWING_ENVIRONMENT_PREFIXES)
+
+
+def narrowing_assignments(command: str) -> tuple[str, ...]:
+    """Return the narrowing variables ``command``'s text assigns anywhere, sorted."""
+    return tuple(sorted(set(_NARROWING_ASSIGNMENT_RE.findall(command))))
+
+
 # pytest ini keys that decide which tests are collected or selected; setting
 # one through ``-o``/``--override-ini`` disables test-target linkage.
 _PYTEST_SELECTION_INI_KEYS = frozenset(
@@ -553,11 +726,13 @@ class ResolvedRunner:
 
     ``kind`` names the runner (``pytest``, ``make``, ``script``, ...);
     ``arguments`` are the runner's own arguments, after the module, script or
-    subcommand that selected it.
+    subcommand that selected it. ``narrowing_interpreter`` is True when the
+    Python interpreter ran with a flag in ``_NARROWING_PYTHON_FLAGS``.
     """
 
     kind: str
     arguments: tuple[str, ...]
+    narrowing_interpreter: bool = False
 
 
 def _program_name(value: str) -> str:
@@ -676,6 +851,7 @@ def _python_runner(
     parts: Sequence[str], workspace: str | None, cwd_relative: str
 ) -> ResolvedRunner | None:
     index = 1
+    narrowing = False
     while index < len(parts):
         token = parts[index]
         if token == "-m":
@@ -683,10 +859,11 @@ def _python_runner(
                 return None
             module, arguments = parts[index + 1], tuple(parts[index + 2 :])
             if module in {"pytest", "unittest", "tox", "nox"}:
-                return ResolvedRunner(module, arguments)
+                return ResolvedRunner(module, arguments, narrowing)
             if module == "django" and arguments[:1] == ("test",):
-                return ResolvedRunner("django", arguments[1:])
+                return ResolvedRunner("django", arguments[1:], narrowing)
             return None
+        narrowing = narrowing or token in _NARROWING_PYTHON_FLAGS
         if token in _PYTHON_FLAGS:
             index += 1
             continue
@@ -703,11 +880,11 @@ def _python_runner(
             return None
         script = _project_test_runner_script(["python", *parts[index:]])
         if script is None:
-            return ResolvedRunner("script", tuple(parts[index + 1 :]))
+            return ResolvedRunner("script", tuple(parts[index + 1 :]), narrowing)
         rest = tuple(parts[index + 1 :])
         if PurePosixPath(script).name == "manage.py":
             rest = rest[1:]
-        return ResolvedRunner("test-script", rest)
+        return ResolvedRunner("test-script", rest, narrowing)
     return None
 
 
@@ -939,22 +1116,66 @@ def _excluding_option(token: str, kind: str) -> bool:
     )
 
 
-def _narrowing_option(name: str, value: str | None, kind: str) -> bool:
-    """Return True when option ``name`` (with ``value``, if it took one) changes
-    what the runner collects or selects through configuration."""
+def _option_key(name: str, kind: str) -> str:
+    """Return ``name`` as ``_RUNNER_CONFIG_OPTIONS`` spells it for ``kind``."""
+    if kind in _CAMEL_OPTION_KINDS and name.startswith("--"):
+        return "--" + name[2:].replace("-", "").lower()
+    if kind == "go-test" and name.startswith("--"):
+        return name[1:]
+    return name
+
+
+def _build_property_narrows(name: str, value: str | None) -> bool:
+    """Return True for a Maven or Gradle ``-D`` property that selects tests."""
+    if not name.startswith("-D"):
+        return False
+    key = name[2:] if len(name) > 2 else (value or "").partition("=")[0]
+    key = key.lower()
+    return key in _BUILD_SELECTION_PROPERTIES or key.startswith(_BUILD_SELECTION_PROPERTY_PREFIXES)
+
+
+def _runner_config_option(token: str, name: str, value: str | None, kind: str) -> str | None:
+    """Return the narrowing class of ``token`` among ``kind``'s
+    ``_RUNNER_CONFIG_OPTIONS``, or None when it is not one of them."""
+    options = _RUNNER_CONFIG_OPTIONS.get(kind)
+    if options is None:
+        return None
+    selection = _RUNNER_SELECTION_OPTIONS.get(kind, frozenset())
+    if kind in _WORD_OPTION_KINDS:
+        name = token.partition("=")[0]
+    if kind in {"mvn", "gradle"}:
+        if _build_property_narrows(name, value):
+            return SELECTION
+        if name.startswith("-P"):
+            return CONFIGURATION
+    key = _option_key(name, kind)
+    if key not in options and kind in _ATTACHED_SHORT_KINDS and not token.startswith("--"):
+        key = next((o for o in options if len(o) == 2 and token.startswith(o)), key)
+    if key in options:
+        return SELECTION if key in selection else CONFIGURATION
+    if kind in _FILTER_OPERAND_KINDS and name not in (_CARGO_FLAG_OPTIONS | _CARGO_VALUE_OPTIONS):
+        # An option this table does not know: its value may be a filter, and
+        # the option may change the build.
+        return CONFIGURATION
+    return None
+
+
+def _narrowing_option(name: str, value: str | None, kind: str) -> str | None:
+    """Return the narrowing class of option ``name`` (with ``value``, if it took
+    one) for pytest and the pattern runners, or None."""
     if kind == "pytest":
         if name in _PYTEST_CONFIG_OPTIONS:
-            return True
+            return CONFIGURATION
         if name in _PYTEST_OVERRIDE_OPTIONS:
             if value is None or "=" not in value:
-                return True
+                return CONFIGURATION
             key = value.partition("=")[0].strip().lower()
-            return not key or key in _PYTEST_SELECTION_INI_KEYS
-        if name == "-p":
-            return value not in NO_OP_PYTEST_PLUGINS
-    elif kind in _PATTERN_RUNNER_KINDS:
-        return name in {"-p", "--pattern"}
-    return False
+            return CONFIGURATION if not key or key in _PYTEST_SELECTION_INI_KEYS else None
+        if name == "-p" and value not in NO_OP_PYTEST_PLUGINS:
+            return CONFIGURATION
+    elif kind in _PATTERN_RUNNER_KINDS and name in {"-p", "--pattern"}:
+        return SELECTION
+    return None
 
 
 def command_line_assignments(argv: Sequence[str]) -> tuple[str, ...]:
@@ -999,19 +1220,21 @@ def command_line_assignments(argv: Sequence[str]) -> tuple[str, ...]:
 
 
 def _narrowing_environment(argv: Sequence[str], environment: Sequence[str]) -> bool:
-    names = {name.upper() for name in environment}
-    names.update(token.partition("=")[0].upper() for token in command_line_assignments(argv))
-    return not names.isdisjoint(NARROWING_ENVIRONMENT)
+    names = set(environment)
+    names.update(token.partition("=")[0] for token in command_line_assignments(argv))
+    return any(narrowing_variable(name) for name in names)
 
 
 def _selection(
     argv: Sequence[str], environment: Sequence[str]
-) -> tuple[ResolvedRunner | None, bool, frozenset[str]]:
-    """Return ``(runner, narrowed, operands)`` for ``argv``.
+) -> tuple[ResolvedRunner | None, str | None, frozenset[str]]:
+    """Return ``(runner, narrowing, operands)`` for ``argv``.
 
-    ``narrowed`` is True when an option excludes or narrows the tests the
-    runner executes, or configuration changes what it collects or selects
-    (see the module docstring); ``operands`` are then empty. ``environment``
+    ``narrowing`` is ``CONFIGURATION`` when configuration, the environment or
+    an interpreter flag changes what the runner collects, loads or imports;
+    otherwise ``SELECTION`` when an option excludes or narrows the tests it
+    executes; otherwise None (see the module docstring). ``operands`` are
+    empty unless ``narrowing`` is None. ``environment``
     names the variables the command line assigns outside ``argv`` (a replay
     candidate's ``env_delta``). Option values are never operands; a token after
     an option the tables do not know is not an operand either, since it may be
@@ -1020,14 +1243,18 @@ def _selection(
     """
     runner = resolve_replay_program(argv, workspace=None)
     if runner is None:
-        return None, False, frozenset()
-    if _narrowing_environment(argv, environment):
-        return runner, True, frozenset()
+        return None, None, frozenset()
+    if runner.narrowing_interpreter or _narrowing_environment(argv, environment):
+        return runner, CONFIGURATION, frozenset()
+    narrowing: str | None = None
     value_options = set(_TARGET_VALUE_OPTIONS)
     flag_options = set(_TARGET_FLAG_OPTIONS)
     if runner.kind in _PATTERN_RUNNER_KINDS:
         value_options |= _LABEL_RUNNER_VALUE_OPTIONS
         flag_options -= _LABEL_RUNNER_VALUE_OPTIONS
+    if runner.kind in _FILTER_OPERAND_KINDS:
+        value_options |= _CARGO_VALUE_OPTIONS
+        flag_options |= _CARGO_FLAG_OPTIONS
     operands: set[str] = set()
     after_separator = False
     arguments = runner.arguments
@@ -1039,11 +1266,15 @@ def _selection(
             after_separator = True
             continue
         if not token.startswith("-") or token == "-":
-            if not after_separator:
+            if runner.kind in _FILTER_OPERAND_KINDS:
+                # ``cargo test foo`` or ``cargo test -- foo``: a name filter.
+                narrowing = SELECTION
+            elif not after_separator:
                 operands.add(token)
             continue
         if _excluding_option(token, runner.kind):
-            return runner, True, frozenset()
+            narrowing = SELECTION
+            continue
         name, separator, inline = token.partition("=")
         value: str | None = None
         consumes_next = False
@@ -1066,9 +1297,15 @@ def _selection(
                 # examined as an option of its own (``--x --ignore t.py``).
                 value = following
                 index += 1
-        if _narrowing_option(name, value, runner.kind):
-            return runner, True, frozenset()
-    return runner, False, frozenset(operands)
+        found = _narrowing_option(name, value, runner.kind) or _runner_config_option(
+            token, name, value, runner.kind
+        )
+        if found == CONFIGURATION:
+            return runner, CONFIGURATION, frozenset()
+        narrowing = narrowing or found
+    if narrowing is not None:
+        return runner, narrowing, frozenset()
+    return runner, None, frozenset(operands)
 
 
 def excludes_tests(argv: Sequence[str], environment: Sequence[str] = ()) -> bool:
@@ -1076,8 +1313,18 @@ def excludes_tests(argv: Sequence[str], environment: Sequence[str] = ()) -> bool
     command-line configuration narrows (``--ignore``, ``-k``, ``-o addopts=``,
     ``PYTEST_ADDOPTS=``, ...). ``environment`` names variables assigned
     outside ``argv``."""
-    runner, narrowed, _ = _selection(argv, environment)
-    return runner is not None and narrowed
+    runner, narrowing, _ = _selection(argv, environment)
+    return runner is not None and narrowing is not None
+
+
+def alters_configuration(argv: Sequence[str], environment: Sequence[str] = ()) -> bool:
+    """Return True when ``argv`` resolves to a runner whose configuration, module
+    resolution or environment the command changes (``CONFIGURATION``): its
+    output cannot show that a named test passed against the workspace's code,
+    even when it names that test. ``environment`` names variables assigned
+    outside ``argv``."""
+    runner, narrowing, _ = _selection(argv, environment)
+    return runner is not None and narrowing == CONFIGURATION
 
 
 def run_may_back_test_claim(
@@ -1092,8 +1339,8 @@ def run_may_back_test_claim(
     tests/test_x.py``. ``environment`` names variables assigned outside
     ``argv`` (a replayed run's ``env_delta``).
     """
-    runner, narrowed, operands = _selection(argv, environment)
-    if runner is None or narrowed:
+    runner, narrowing, operands = _selection(argv, environment)
+    if runner is None or narrowing is not None:
         return False
     if claim_file is None:
         return True
@@ -1113,8 +1360,8 @@ def claim_target_operands(argv: Sequence[str], environment: Sequence[str] = ()) 
     configuration narrows them (see the module docstring). ``environment``
     names variables assigned outside ``argv``.
     """
-    runner, narrowed, operands = _selection(argv, environment)
-    if runner is None or narrowed or runner.kind not in TARGET_RUNNER_KINDS:
+    runner, narrowing, operands = _selection(argv, environment)
+    if runner is None or narrowing is not None or runner.kind not in TARGET_RUNNER_KINDS:
         return frozenset()
     return operands
 
@@ -1124,12 +1371,16 @@ __all__ = [
     "TARGET_RUNNER_KINDS",
     "VIEWER_PROGRAMS",
     "ResolvedRunner",
+    "alters_configuration",
     "NARROWING_ENVIRONMENT",
+    "NARROWING_ENVIRONMENT_PREFIXES",
     "NO_OP_PYTEST_PLUGINS",
     "claim_target_operands",
     "command_line_assignments",
     "environment_roots",
     "excludes_tests",
+    "narrowing_assignments",
+    "narrowing_variable",
     "outside_known_roots",
     "peel_wrappers",
     "replay_allowed",
