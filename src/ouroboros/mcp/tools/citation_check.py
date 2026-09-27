@@ -130,6 +130,10 @@ def audit_citations(
     deadline = time.monotonic() + total_budget_seconds
     checked = 0
     for url in urls:
+        # urlparse strips embedded CR/LF/TAB, so reject raw controls first.
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+            verdicts[url] = INVALID
+            continue
         try:
             parsed = urllib.parse.urlparse(url)
             hostname = parsed.hostname

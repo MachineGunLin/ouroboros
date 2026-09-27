@@ -112,6 +112,9 @@ def test_malformed_authorities_are_invalid_without_stopping_later_urls() -> None
         "https://example.com:65536",
         "https://example.com:",
         "https://bad host.example/doc",
+        "https://bad\nhost.example/doc",
+        "https://bad\rhost.example/doc",
+        "https://bad\thost.example/doc",
     )
     valid = "https://ok.example/doc"
     calls: list[str] = []
