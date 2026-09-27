@@ -82,6 +82,8 @@ from ouroboros.boundary.oracle import (
 _FRAME_LIMIT = 8 * 1024 * 1024
 _CLI_OUTPUT_LIMIT = 1024 * 1024
 _READ_CHUNK = 64 * 1024
+_MAX_EXCEPTION_NAMES = 64  # an exception's class hierarchy, never longer in practice
+_MAX_NAME_CHARS = 200
 _MAX_DEPTH = 64
 _MAX_NODES = 1_000_000
 _MAX_INT_DIGITS = 1000
@@ -188,13 +190,22 @@ def valid_entry(entry: Any, case_id: str) -> bool:
     """Whether a ``result`` frame's entry has every field the comparison reads."""
     if not isinstance(entry, dict) or entry.get("case_id") != case_id:
         return False
-    if entry.get("outcome") not in _OBSERVED or not isinstance(entry.get("repr"), str):
+    text = entry.get("repr")
+    # The harness truncates ``repr`` to MAX_REPR; a longer one is forged and
+    # would otherwise reach receipts and repair text unbounded (R3-S5).
+    if entry.get("outcome") not in _OBSERVED or not isinstance(text, str):
+        return False
+    if len(text) > _HARNESS["MAX_REPR"]:
         return False
     if entry["outcome"] == "returned":
         encodable = entry.get("encodable")
         return isinstance(encodable, bool) and (not encodable or "value" in entry)
     names = entry.get("exception")
-    return isinstance(names, list) and bool(names) and all(isinstance(n, str) for n in names)
+    return (
+        isinstance(names, list)
+        and 0 < len(names) <= _MAX_EXCEPTION_NAMES
+        and all(isinstance(n, str) and len(n) <= _MAX_NAME_CHARS for n in names)
+    )
 
 
 # --------------------------------------------------------------------------

@@ -89,6 +89,16 @@ def test_a_runtime_without_a_no_persistence_mode_is_refused(tmp_path: Path) -> N
     assert disable_session_persistence(object()) == f"{NOT_EPHEMERAL_PREFIX}:object"
 
 
+def test_a_plugin_runtime_is_refused_under_its_configured_backend() -> None:
+    # R3-A3: the reason names the backend the person configured, not the
+    # plugin runtime's class.
+    from ouroboros.orchestrator.worker_runtime import LeaderDrivenWorkerRuntime
+
+    plugin = object.__new__(LeaderDrivenWorkerRuntime)
+    plugin._runtime_backend = "claude_mcp"
+    assert disable_session_persistence(plugin) == f"{NOT_EPHEMERAL_PREFIX}:claude_mcp"
+
+
 class _PersistingRuntime(FakeRuntime):
     """A runtime with no way to keep its session off disk."""
 

@@ -164,6 +164,17 @@ def test_the_frame_parser_is_bounded() -> None:
     )
 
 
+def test_an_overlong_repr_or_exception_list_is_malformed() -> None:
+    # R3-S5: the harness truncates repr to 300 characters; a longer one is
+    # forged and never reaches receipts or repair text.
+    ok = {"case_id": "c", "outcome": "returned", "encodable": False, "repr": "x" * 300}
+    assert valid_entry(ok, "c")
+    assert not valid_entry({**ok, "repr": "x" * 301}, "c")
+    raised = {"case_id": "c", "outcome": "raised", "exception": ["ValueError"], "repr": "x"}
+    assert not valid_entry({**raised, "exception": ["E"] * 65}, "c")
+    assert not valid_entry({**raised, "exception": ["E" * 201]}, "c")
+
+
 async def test_the_comparison_runs_in_the_controller_with_modules_loaded_before_targets(
     base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

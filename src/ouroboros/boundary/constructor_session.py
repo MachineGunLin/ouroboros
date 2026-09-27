@@ -40,6 +40,11 @@ def disable_session_persistence(runtime: Any) -> str | None:
     if backend == "claude" and hasattr(runtime, "_session_cli_args"):
         runtime._session_cli_args = CLAUDE_NO_SESSION_PERSISTENCE
         return None
+    # A plugin runtime (for example LeaderDrivenWorkerRuntime) has no class
+    # backend; name the backend it was configured with, not its class.
+    configured = getattr(runtime, "runtime_backend", None)
+    if not backend and isinstance(configured, str) and configured:
+        backend = configured
     return f"{NOT_EPHEMERAL_PREFIX}:{backend or type(runtime).__name__}"
 
 
