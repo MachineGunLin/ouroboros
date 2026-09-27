@@ -80,8 +80,9 @@ an option is treated as narrowing:
   prefix in ``NARROWING_ENVIRONMENT_PREFIXES`` (``JEST_``, ``VITEST_``),
   whatever the runner (``narrowing_variable``);
 - the Python interpreter flags ``-P`` and ``-I``;
-- an entry of ``_RUNNER_CONFIG_OPTIONS`` for the runner: Django ``--settings``,
-  ``--parallel``, ``--pythonpath`` and ``--testrunner``; jest and vitest
+- an entry of ``_RUNNER_CONFIG_OPTIONS`` for the runner: Django ``--settings``
+  (except ``runtests.py``'s documented default ``test_sqlite``,
+  ``_DEFAULT_OPTION_VALUES``), ``--pythonpath`` and ``--testrunner``; jest and vitest
   configuration, selection, sharding and module-mapping options; mocha,
   phpunit and rspec configuration, filter, group and load-path options;
   ``go test`` ``-run``, ``-skip``, ``-tags``, ``-short``, ``-list``,
@@ -90,6 +91,11 @@ an option is treated as narrowing:
   ``-P``, ``-x`` and build-file options; ``cargo test`` and ``cargo nextest``
   target and feature options, and any positional filter or option outside
   ``_CARGO_FLAG_OPTIONS`` and ``_CARGO_VALUE_OPTIONS``.
+
+An option narrows only when it changes which tests run or how modules and
+settings resolve relative to the runner's documented default: a process
+count (Django ``--parallel N``, pytest-xdist ``-n``, ``cargo -j``) never
+does, and an option set to a documented default does not either.
 
 Narrowing has two classes. ``SELECTION`` options only choose which tests run
 (``-k``, ``--tests``, ``-Dtest=``, ``-run``, ``_RUNNER_SELECTION_OPTIONS``);
@@ -520,7 +526,17 @@ _JS_CONFIG_OPTIONS = frozenset(
     | {"--exclude", "--setupfiles", "--setupfilesafterenv", "--modulepaths"}
     | {"--moduledirectories", "--modulenamemapper", "--testrunner", "--testsequencer"}
 )
-_DJANGO_CONFIG_OPTIONS = frozenset({"--settings", "--parallel", "--pythonpath", "--testrunner"})
+_DJANGO_CONFIG_OPTIONS = frozenset({"--settings", "--pythonpath", "--testrunner"})
+# Option values equal to a runner's documented default: they neither select
+# tests nor change how modules and settings resolve, so they do not narrow.
+# Django's ``tests/runtests.py`` sets ``DJANGO_SETTINGS_MODULE`` to
+# ``test_sqlite`` when neither ``--settings`` nor the variable is given
+# (``os.environ.setdefault("DJANGO_SETTINGS_MODULE", "test_sqlite")``); a
+# command-line ``DJANGO_SETTINGS_MODULE`` narrows on its own, and replay scrubs
+# an inherited one. ``manage.py`` and ``django-admin`` have no such default.
+_DEFAULT_OPTION_VALUES: Mapping[tuple[str, str], frozenset[str]] = {
+    ("runtests.py", "--settings"): frozenset({"test_sqlite"}),
+}
 _CARGO_CONFIG_OPTIONS = frozenset(
     {"--skip", "--exact", "--ignored", "--features", "-F", "--no-default-features"}
     | {"--all-features", "--lib", "--bins", "--bin", "--tests", "--test", "--examples"}
@@ -590,8 +606,6 @@ _RUNNER_SELECTION_OPTIONS: Mapping[str, frozenset[str]] = {
     "cargo-nextest": frozenset({"--skip", "--exact", "--ignored", "-E", "--filter-expr"}),
     "mvn": frozenset({"-pl", "--projects"}),
     "gradle": frozenset({"--tests", "-x", "--exclude-task"}),
-    "django": frozenset({"--parallel"}),
-    "test-script": frozenset({"--parallel"}),
 }
 _CAMEL_OPTION_KINDS = frozenset({"jest", "vitest"})
 # Runners whose short options take an attached value (``-cjest.config.js``,
@@ -728,11 +742,13 @@ class ResolvedRunner:
     ``arguments`` are the runner's own arguments, after the module, script or
     subcommand that selected it. ``narrowing_interpreter`` is True when the
     Python interpreter ran with a flag in ``_NARROWING_PYTHON_FLAGS``.
+    ``script`` is the file name of a ``test-script`` runner (``runtests.py``).
     """
 
     kind: str
     arguments: tuple[str, ...]
     narrowing_interpreter: bool = False
+    script: str = ""
 
 
 def _program_name(value: str) -> str:
@@ -884,7 +900,7 @@ def _python_runner(
         rest = tuple(parts[index + 1 :])
         if PurePosixPath(script).name == "manage.py":
             rest = rest[1:]
-        return ResolvedRunner("test-script", rest, narrowing)
+        return ResolvedRunner("test-script", rest, narrowing, PurePosixPath(script).name)
     return None
 
 
@@ -1017,7 +1033,7 @@ def _resolve(
         rest = peeled[1:]
         if PurePosixPath(script).name == "manage.py":
             rest = rest[1:]
-        return ResolvedRunner("test-script", rest)
+        return ResolvedRunner("test-script", rest, script=PurePosixPath(script).name)
     if name in VIEWER_PROGRAMS or name in REFUSED_WRAPPERS:
         return None
     for launcher, spec in _LAUNCHERS.items():
@@ -1297,6 +1313,8 @@ def _selection(
                 # examined as an option of its own (``--x --ignore t.py``).
                 value = following
                 index += 1
+        if value in _DEFAULT_OPTION_VALUES.get((runner.script, name), frozenset()):
+            continue
         found = _narrowing_option(name, value, runner.kind) or _runner_config_option(
             token, name, value, runner.kind
         )

@@ -52,6 +52,20 @@ STUB_TESTS = (
 )
 
 
+DJANGO_OK_RUNNER = (
+    "import os, sys\n"
+    "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+    "from calc import add\n"
+    "ok = add(2, 3) == 5\n"
+    "print('Found 49 test(s).')\n"
+    "print('-' * 70)\n"
+    "print('Ran 49 tests in 0.214s')\n"
+    "print()\n"
+    "print('OK' if ok else 'FAILED (failures=1)')\n"
+    "sys.exit(0 if ok else 1)\n"
+)
+
+
 def _split(command: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return ``(argv, assigned names)``: leading assignments leave the argv
     as they do for a replay candidate's ``env_delta``."""
@@ -151,10 +165,37 @@ class TestRunnerOptions:
             ("python tests/runtests.py migrations", "migrations"),
             ("python tests/runtests.py --verbosity 2 migrations", "migrations"),
             ("python manage.py test app.tests", "app.tests"),
+            # Options at the runner's documented default, or that only set
+            # the number of processes, do not narrow: Django's
+            # tests/runtests.py defaults DJANGO_SETTINGS_MODULE to test_sqlite.
+            (
+                "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 "
+                "migrations.test_writer",
+                "migrations.test_writer",
+            ),
+            ("python tests/runtests.py --settings test_sqlite migrations", "migrations"),
+            ("tests/runtests.py --settings=test_sqlite migrations", "migrations"),
+            ("python tests/runtests.py --parallel 4 migrations", "migrations"),
+            ("python tests/runtests.py --parallel auto migrations", "migrations"),
+            ("python -m pytest -n 4 tests/test_bad.py", "tests/test_bad.py"),
         ],
     )
     def test_plain_runs_keep_their_target(self, command: str, target: str) -> None:
         assert target in _operands(command)
+
+    def test_the_default_settings_hold_after_a_cd_into_tests(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        command = "cd tests && python runtests.py --settings=test_sqlite --parallel 1 migrations"
+        candidate = replay_candidate(command, str(workspace))
+        assert candidate is not None
+
+        assert claim_links_to_command(
+            "migrations",
+            transcript_command=candidate.transcript_command,
+            core_command=candidate.core_command,
+            argv=candidate.argv,
+            environment=tuple(candidate.env_delta),
+        )
 
     @pytest.mark.parametrize(
         "command",
@@ -209,8 +250,12 @@ class TestRunnerOptions:
             # Django: runtests.py, manage.py test, django-admin
             "python manage.py test app --settings=alt",
             "python manage.py test --settings alt app",
-            "python tests/runtests.py --settings=test_sqlite migrations",
-            "python tests/runtests.py --parallel 1 migrations",
+            "python tests/runtests.py --settings=other migrations",
+            "python tests/runtests.py --settings=tests.test_sqlite migrations",
+            "python manage.py test app --settings=test_sqlite",
+            "python tests/runtests.py --settings=test_sqlite -k writer migrations",
+            "python tests/runtests.py --settings=test_sqlite --tag slow migrations",
+            "python tests/runtests.py --settings=test_sqlite --exclude-tag slow migrations",
             "python tests/runtests.py --pythonpath stubs migrations",
             "python -m django test app.tests --settings=proj.settings",
             # Python interpreter flags that change sys.path
@@ -328,7 +373,7 @@ class TestEndToEnd:
         "command",
         [
             "python tests/runtests.py --settings=alt migrations.test_writer",
-            "python tests/runtests.py --settings=test_sqlite --parallel 1 migrations.test_writer",
+            "python tests/runtests.py --settings=alt --parallel 1 migrations",
         ],
     )
     async def test_django_settings_run_does_not_back_the_label(
@@ -345,6 +390,45 @@ class TestEndToEnd:
         assert observation.command_runs
         assert all(run.succeeded for run in observation.command_runs)
         assert verdict.passed is False
+
+    @pytest.mark.parametrize(
+        ("command", "correct", "passed"),
+        [
+            # The SWE-bench form, naming the claimed label itself.
+            (
+                "python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 "
+                "migrations.test_writer",
+                True,
+                True,
+            ),
+            # An ancestor label covers the claimed one.
+            (
+                "python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 "
+                "migrations",
+                True,
+                True,
+            ),
+            (
+                "python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 "
+                "migrations.test_writer",
+                False,
+                False,
+            ),
+        ],
+    )
+    async def test_swe_bench_django_command_backs_the_label(
+        self, tmp_path: Path, command: str, correct: bool, passed: bool
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws", correct=correct)
+        # Django's success footer, printed only when the check passes, so the
+        # ancestor-label rule has runner output to read.
+        (workspace / "tests" / "runtests.py").write_text(DJANGO_OK_RUNNER, encoding="utf-8")
+
+        verdict, _ = await _dispatch_and_verify(
+            workspace, _ran(command, "c1", exit_code=0), _evidence(command, [DJANGO_WRITER_CLAIM])
+        )
+
+        assert verdict.passed is passed, verdict.reasons
 
     @pytest.mark.parametrize(
         "command",
