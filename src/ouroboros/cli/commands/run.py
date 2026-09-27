@@ -676,6 +676,7 @@ async def _record_cli_run_outcome(
             "run",
             terminal_status=terminal_status,
             result_meta=result_meta,
+            cli_run=True,
         )
     except Exception:
         pass
