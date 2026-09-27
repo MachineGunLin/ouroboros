@@ -202,7 +202,9 @@ A claim that no successful replay backs falls through to the transcript-only
 rules and failure classes below. Two of those rules follow the same
 principle: a claimed test file backed by a transcript run links only as an
 executed operand of a runner that nothing narrows (not
-`pytest --ignore tests/x.py`), and the functional tier does not accept a
+`pytest --ignore tests/x.py`), a bare-word claim (`test_add`) links only as a
+whole word of the command (not inside `tests/test_address.py`), and the
+functional tier does not accept a
 recorded exit that belongs to a pipeline without `pipefail`
 (`./run_tests.sh | tail -5`), since it is the last stage's status.
 

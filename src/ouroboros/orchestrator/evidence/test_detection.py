@@ -425,14 +425,19 @@ def _test_command_targets_claim(
     if normalized_file in normalized_proof_text:
         return True
     if normalized_file in normalized_command:
-        if (
-            any(character.isspace() for character in normalized_file)
-            or not any(marker in normalized_file for marker in ("/", ".", "::"))
-            or (argv and normalized_file == argv[0].lower())
+        if any(character.isspace() for character in normalized_file) or (
+            argv and normalized_file == argv[0].lower()
         ):
-            # The claim is command text or a bare word (``pytest``) contained
-            # in the recorded command, not a test file or node id.
+            # The claim is command text contained in the recorded command, or
+            # its program, not a test file or node id.
             return True
+        if not any(marker in normalized_file for marker in ("/", ".", "::")):
+            # A bare word (``pytest``, ``test_add``) links only as a whole
+            # word of the command: ``test_add`` is not in ``test_address.py``.
+            return (
+                re.search(rf"(?<![\w-]){re.escape(normalized_file)}(?![\w-])", normalized_command)
+                is not None
+            )
         # A test file or node id named in the command links only as a
         # positional operand the runner executes (not ``--rootdir
         # tests/x.py``, not ``cat tests/x.py``).

@@ -48,6 +48,7 @@ from ouroboros.orchestrator.evidence.replay_policy import (
 from ouroboros.orchestrator.evidence.shell_parsing import (
     _output_filter_pipeline_is_pipefail_protected,
 )
+from ouroboros.orchestrator.evidence.test_detection import _test_command_targets_claim
 from ouroboros.orchestrator.evidence.verification import (
     _verify_atomic_evidence_against_runtime_messages,
 )
@@ -1540,7 +1541,7 @@ class TestConfigurationNarrowing:
 
 
 class TestReviewRoundTwoMinors:
-    """Round-2 minors R2-R2 and R2-R4."""
+    """Round-2 minors R2-R2, R2-R4 and R2-R5."""
 
     def test_env_wrapper_assignment_outside_the_roots_is_refused(self, tmp_path: Path) -> None:
         # R2-R2: assignments consumed by an ``env`` wrapper get the same check
@@ -1599,3 +1600,27 @@ class TestReviewRoundTwoMinors:
     def test_set_option_clusters_enable_pipefail(self, command: str, protected: bool) -> None:
         # R2-R4.
         assert _output_filter_pipeline_is_pipefail_protected(command) is protected
+
+    @pytest.mark.parametrize(
+        ("claim", "command", "covered"),
+        [
+            ("test_add", "pytest tests/test_address.py", False),
+            ("test_add", "pytest tests/test_calc.py::test_add", True),
+            ("unit", "make unit-tests", False),
+            ("pytest", "python -m pytest -q", True),
+        ],
+    )
+    def test_bare_word_claim_links_only_as_a_whole_word(
+        self, tmp_path: Path, claim: str, command: str, covered: bool
+    ) -> None:
+        # R2-R5: the bare-word rule of the transcript path.
+        assert (
+            _test_command_targets_claim(
+                command=command,
+                claim=claim,
+                chunk_test_proof_text="1 passed in 0.01s",
+                messages=(),
+                task_cwd=str(tmp_path),
+            )
+            is covered
+        )
