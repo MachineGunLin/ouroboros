@@ -357,7 +357,10 @@ from ouroboros.orchestrator.parallel_executor_models import (
     ParallelExecutionResult,
     ParallelExecutionStageResult,
     StageExecutionOutcome,
+    check_package_record,
+    checkpoint_outcome,
     collect_decomposition_depth_warning_paths,
+    restore_check_package_record,
 )
 from ouroboros.orchestrator.profile_loader import ExecutionProfile, SuggestedModelTier
 from ouroboros.orchestrator.rate_limit import (
@@ -2014,14 +2017,16 @@ def _serialize_provisional_route_success(
     ):
         raise RuntimeError("provisional route success cannot seal malformed result context")
     summary = _canonical_result_context(result, workspace_root=workspace_root)
+    annotations = check_package_record(result)  # schema 3 exactly when arm-on fields exist
     return {
-        "schema_version": 2,
+        "schema_version": 3 if annotations else 2,
         "context_summary": _serialize_context_summary(summary),
         "conflict_files": list(_collect_result_conflict_files(result)),
         "duration_seconds": result.duration_seconds,
         "session_id": result.session_id,
         "retry_attempt": result.retry_attempt,
         "verify_gate_outcome": _serialize_verify_gate_outcome(result.verify_gate_outcome),
+        **annotations,
     }
 
 
@@ -2044,13 +2049,17 @@ def _deserialize_provisional_route_success(
             "verify_gate_outcome",
         }
     )
+    schema = value.get("schema_version") if isinstance(value, Mapping) else None
+    if schema == 3:
+        expected_keys = expected_keys | {"check_package"}
     if (
         not _mapping_has_exact_keys(value, expected_keys)
         or not isinstance(value, Mapping)
-        or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 2
+        or type(schema) is not int
+        or schema not in (2, 3)
     ):
         raise RuntimeError("provisional route success has invalid durable context")
+    annotations = restore_check_package_record(value["check_package"]) if schema == 3 else {}
     duration_seconds = value.get("duration_seconds")
     session_id = value.get("session_id")
     retry_attempt = value.get("retry_attempt")
@@ -2088,6 +2097,7 @@ def _deserialize_provisional_route_success(
         context_summary=summary,
         conflict_files=conflict_files,
         route_candidate=route_candidate,
+        **annotations,
     )
 
 
@@ -2161,8 +2171,9 @@ def _serialize_composite_result_tree(
     elif result.is_decomposed:
         raise RuntimeError("composite child result lost its decomposition decision")
     summary = _canonical_result_context(result, workspace_root=workspace_root)
+    annotations = check_package_record(result)  # schema 3 exactly when arm-on fields exist
     return {
-        "schema_version": 2,
+        "schema_version": 3 if annotations else 2,
         "ac_index": result.ac_index,
         "ac_content": result.ac_content,
         "success": result.success,
@@ -2187,6 +2198,7 @@ def _serialize_composite_result_tree(
             )
             for child in result.sub_results
         ],
+        **annotations,
     }
 
 
@@ -2222,13 +2234,17 @@ def _deserialize_composite_result_tree(
             "sub_results",
         }
     )
+    schema = value.get("schema_version") if isinstance(value, Mapping) else None
+    if schema == 3:
+        expected = expected | {"check_package"}
     if (
         not _mapping_has_exact_keys(value, expected)
         or not isinstance(value, Mapping)
-        or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 2
+        or type(schema) is not int
+        or schema not in (2, 3)
     ):
         raise RuntimeError("composite completion result tree has an invalid schema")
+    annotations = restore_check_package_record(value["check_package"]) if schema == 3 else {}
     ac_index = value.get("ac_index")
     ac_content = value.get("ac_content")
     success = value.get("success")
@@ -2326,6 +2342,7 @@ def _deserialize_composite_result_tree(
         verify_gate_outcome=verify_outcome,
         context_summary=summary,
         conflict_files=conflict_files,
+        **annotations,
     )
 
 
@@ -2374,9 +2391,10 @@ def _serialize_composite_completion_result(
         )
         for child in result.sub_results
     ]
+    annotations = check_package_record(result)  # schema 2 exactly when arm-on fields exist
     return (
         {
-            "schema_version": 1,
+            "schema_version": 2 if annotations else 1,
             "success": result.success,
             "outcome": outcome.value,
             "error": result.error,
@@ -2387,6 +2405,7 @@ def _serialize_composite_completion_result(
             "context_summary": _serialize_context_summary(summary),
             "conflict_files": list(_collect_result_conflict_files(result)),
             "sub_results": sub_results,
+            **annotations,
         },
         decision_data,
         fingerprint,
@@ -2417,13 +2436,15 @@ def _deserialize_composite_completion_result(
             "sub_results",
         }
     )
+    schema = value.get("schema_version") if isinstance(value, Mapping) else None
     if (
-        not _mapping_has_exact_keys(value, expected)
+        not _mapping_has_exact_keys(value, expected | ({"check_package"} if schema == 2 else set()))
         or not isinstance(value, Mapping)
-        or type(value.get("schema_version")) is not int
-        or value.get("schema_version") != 1
+        or type(schema) is not int
+        or schema not in (1, 2)
     ):
         raise RuntimeError("composite completion has an invalid result schema")
+    annotations = restore_check_package_record(value["check_package"]) if schema == 2 else {}
     success = value.get("success")
     raw_outcome = value.get("outcome")
     error = value.get("error")
@@ -2492,6 +2513,7 @@ def _deserialize_composite_completion_result(
         decomposition_decision=decomposition_decision,
         context_summary=summary,
         conflict_files=conflict_files,
+        **annotations,
     )
 
 
@@ -4766,11 +4788,7 @@ class ParallelACExecutor:
                                     all_results
                                 ),
                                 "ac_outcomes": {
-                                    str(result.ac_index): (
-                                        result.outcome.value
-                                        if result.outcome is not None
-                                        else ("succeeded" if result.success else "failed")
-                                    )
+                                    str(result.ac_index): checkpoint_outcome(result)
                                     for result in all_results
                                 },
                                 "failed_indices": sorted(failed_indices),
@@ -4909,19 +4927,11 @@ class ParallelACExecutor:
                             "result_retry_attempts": _checkpoint_result_retry_attempts(all_results),
                             "verify_gate_outcomes": _checkpoint_verify_gate_outcomes(all_results),
                             "ac_outcomes": {
-                                str(result.ac_index): (
-                                    result.outcome.value
-                                    if result.outcome is not None
-                                    else ("succeeded" if result.success else "failed")
-                                )
+                                str(result.ac_index): checkpoint_outcome(result)
                                 for result in all_results
                             },
                             "revalidated_ac_outcomes": {
-                                str(result.ac_index): (
-                                    result.outcome.value
-                                    if result.outcome is not None
-                                    else ("succeeded" if result.success else "failed")
-                                )
+                                str(result.ac_index): checkpoint_outcome(result)
                                 for result in all_results
                             },
                             "failed_indices": sorted(failed_indices),
@@ -9187,6 +9197,10 @@ Respond with either ATOMIC or the structured JSON object only.
                     execution_id=execution_id,
                     ac_index=ac_index,
                 )
+            legacy_rejection = None
+            if fat_harness_error is not None and getattr(self, "check_package_gate", None):
+                # Check package on: the legacy verdict is advisory (kept on the result).
+                legacy_rejection, fat_harness_error = fat_harness_error, None
             result_final_message = final_message
             if fat_harness_error is not None:
                 success = False
@@ -9337,6 +9351,7 @@ Respond with either ATOMIC or the structured JSON object only.
                 verify_gate_outcome=verify_gate_outcome,
                 error=fat_harness_error,
                 route_candidate=observed_route_candidate,
+                legacy_rejection=legacy_rejection,
             )
 
         except _BatchInterruptedForRecoverablePause:
@@ -9875,6 +9890,8 @@ Respond with either ATOMIC or the structured JSON object only.
         records that the result still needs confirmation. Verification never
         resurrects a failed worker result.
         """
+        if (gate := getattr(self, "check_package_gate", None)) is not None:
+            result = await gate(seed=seed, ac_index=ac_index, result=result)
         if not self._run_verify_commands:
             return result
         if ac_index < 0 or ac_index >= len(seed.acceptance_criteria):

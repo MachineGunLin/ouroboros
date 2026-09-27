@@ -103,6 +103,14 @@ class ACExecutionResult:
     # messages that are intentionally not persisted.
     context_summary: ACContextSummary | None = None
     conflict_files: tuple[str, ...] | None = None
+    # Check-package repair (set only when the check package is on): the
+    # counterexample text for the retry prompt, and the failure class that
+    # drives the retry kill criterion instead of the advisory legacy class.
+    check_package_repair: str | None = None
+    check_package_failure_class: str | None = None
+    # The legacy verifier's rejection that the check package made advisory.
+    # If the package cannot decide the run, it is restored (legacy fallback).
+    legacy_rejection: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize outcome so callers do not infer from error strings."""
@@ -373,6 +381,70 @@ def collect_decomposition_depth_warning_paths(
     return paths
 
 
+def checkpoint_outcome(result: ACExecutionResult) -> str:
+    """The outcome a checkpoint records for ``result``.
+
+    With the check package on, the legacy verifier's rejection is advisory
+    (``legacy_rejection``, on the result or on a sub-AC of a decomposed root)
+    and the package decides after the worker stops. A resumed run recomputes
+    the package decision (``boundary/resume.py``); work the legacy verifier
+    rejected is still checkpointed as failed, so it is never restored as
+    succeeded whatever the resumed run can decide.
+    """
+    if result.outcome is not None:
+        outcome = result.outcome.value
+    else:
+        outcome = "succeeded" if result.success else "failed"
+    if outcome in ("succeeded", "satisfied_externally") and _legacy_rejected(result):
+        return "failed"
+    return outcome
+
+
+def _legacy_rejected(result: ACExecutionResult) -> bool:
+    return bool(result.legacy_rejection) or any(_legacy_rejected(sub) for sub in result.sub_results)
+
+
+# Check-package annotations a Routing D record keeps across resume.
+_CHECK_PACKAGE_FIELDS = ("legacy_rejection", "check_package_repair", "check_package_failure_class")
+_CHECK_PACKAGE_FIELD_CHARS = 20_000
+
+
+def check_package_record(result: ACExecutionResult) -> dict[str, object]:
+    """``{"check_package": {...}}`` for a result carrying arm-on annotations, else ``{}``.
+
+    A gate-passed, legacy-rejected attempt is a provisional success whose
+    ``legacy_rejection`` must survive a resume; otherwise the resumed run
+    restores it as a clean success. Arm off sets none of these fields, so
+    its records keep their earlier bytes.
+    """
+    fields: dict[str, str] = {}
+    for name in _CHECK_PACKAGE_FIELDS:
+        value = getattr(result, name)
+        if value is None or value == "":
+            # An empty annotation carries nothing (``legacy_verdict_in_tree``
+            # reads it as no rejection); never fail a live persist on it.
+            continue
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("check package annotation is malformed")
+        fields[name] = value[:_CHECK_PACKAGE_FIELD_CHARS]
+    return {"check_package": fields} if fields else {}
+
+
+def restore_check_package_record(value: object) -> dict[str, str | None]:
+    """The annotations of a ``check_package_record`` block; fail closed on anything else."""
+    if (
+        not isinstance(value, dict)
+        or not value
+        or not set(value) <= set(_CHECK_PACKAGE_FIELDS)
+        or any(
+            not isinstance(item, str) or not item or len(item) > _CHECK_PACKAGE_FIELD_CHARS
+            for item in value.values()
+        )
+    ):
+        raise RuntimeError("check package annotation is malformed")
+    return {name: value.get(name) for name in _CHECK_PACKAGE_FIELDS}
+
+
 __all__ = [
     "ACExecutionOutcome",
     "ACExecutionResult",
@@ -380,5 +452,8 @@ __all__ = [
     "ParallelExecutionResult",
     "ParallelExecutionStageResult",
     "StageExecutionOutcome",
+    "check_package_record",
+    "checkpoint_outcome",
     "collect_decomposition_depth_warning_paths",
+    "restore_check_package_record",
 ]
