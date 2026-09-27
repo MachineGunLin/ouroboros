@@ -96,9 +96,7 @@ def reference_check_meta(state: BoundaryRunState | None) -> dict[str, str]:
     counts = report.counts()
     return {
         "oracle_inconsistent_count": _count_bucket(counts[ORACLE_INCONSISTENT]),
-        "reference_contradiction_count": _count_bucket(
-            counts[REFERENCE_CONTRADICTS_SEED_EXAMPLE]
-        ),
+        "reference_contradiction_count": _count_bucket(counts[REFERENCE_CONTRADICTS_SEED_EXAMPLE]),
         "reference_unavailable_count": _count_bucket(counts[REFERENCE_UNAVAILABLE]),
     }
 

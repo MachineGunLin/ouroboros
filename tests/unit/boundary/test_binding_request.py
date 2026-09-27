@@ -14,6 +14,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ouroboros.boundary.acceptance import PackageCriterionStatus
 from ouroboros.boundary.authority import (
     NO_BINDING_AFTER_REQUEST,
@@ -24,8 +26,9 @@ from ouroboros.boundary.package import seed_criterion_keys
 from ouroboros.boundary.run_control import CheckPackageRun
 from ouroboros.orchestrator.parallel_executor_models import ParallelExecutionResult
 from ouroboros.persistence.event_store import EventStore
-from tests.unit.boundary.test_authority_oracle import (  # noqa: F401 - fixtures
+from tests.unit.boundary.test_authority_oracle import (
     BAD_MIX,
+    BUGGY,
     FIXED,
     GOOD_MIX,
     MIX_ENTRY,
@@ -33,11 +36,25 @@ from tests.unit.boundary.test_authority_oracle import (  # noqa: F401 - fixtures
     _batch,
     _executor,
     _legacy_rejected,
-    repo,
-    store,
 )
 
 REQUEST = "could not find the entry point of this criterion"
+
+
+@pytest.fixture
+async def store():
+    event_store = EventStore("sqlite+aiosqlite:///:memory:")
+    await event_store.initialize()
+    yield event_store
+    await event_store.close()
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "mathutils.py").write_text(BUGGY)
+    return root
 
 
 async def _run(
