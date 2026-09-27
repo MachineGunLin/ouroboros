@@ -117,6 +117,9 @@ the finished workspace).
 | `legacy_failure_class_count` | `0`, `1`, `2`, `3+` |
 | `unverified_count` | `0`, `1`, `2`, `3+` |
 | `check_tier_summary` | `A:<n>,A_prime:<n>,U:<n>`, each `<n>` one of `0`, `1`, `2`, `3+` (64 values) |
+| `oracle_inconsistent_count` | `0`, `1`, `2`, `3+` |
+| `reference_contradiction_count` | `0`, `1`, `2`, `3+` |
+| `reference_unavailable_count` | `0`, `1`, `2`, `3+` |
 
 - `check_package_status` describes the package the worker was bound to:
   `admitted` (a package passed admission on the starting tree, possibly after
@@ -163,6 +166,15 @@ the finished workspace).
   point (`A`), through the entry point the worker declared (`A_prime`), or
   not at all (`U`). Both are recorded only when the package decided the run
   (arm `on`).
+- Before the package is frozen, each oracle's cases are compared with a
+  reference implementation the constructor wrote in the same reply.
+  `oracle_inconsistent_count` buckets the held-out cases excluded because
+  their stated expected value disagreed with it;
+  `reference_contradiction_count` buckets the criteria made unverified
+  because the reference did not reproduce an example stated in the Seed;
+  `reference_unavailable_count` buckets the criteria made unverified because
+  no reference ran. Recorded when this process built the package (arm `on`),
+  not on a resumed session.
 
 ### Changelog
 
@@ -177,7 +189,9 @@ the finished workspace).
   telemetry). `workflow_outcome` for `command=run` gains `check_package_arm`,
   `check_package_assignment`, `check_package_status`, `package_verdict`,
   `legacy_verdict`, `reconciliation`, `legacy_failure_class`,
-  `legacy_failure_class_count`, `unverified_count`, and `check_tier_summary`
+  `legacy_failure_class_count`, `unverified_count`, `check_tier_summary`,
+  `oracle_inconsistent_count`, `reference_contradiction_count`, and
+  `reference_unavailable_count`
   (closed values only). The first-run notice now
   names randomized defaults and research use, and `notice_version` in
   `telemetry.json` re-displays it once to installs that saw an earlier notice.
@@ -230,7 +244,7 @@ use. Each row below is the exact property set accepted by the serializer.
 | `subagent_dispatch` | A session used subagent fan-out — at most one row per user/day/phase/fanout_kind | phase (`emitted`/`submitted`/`unknown`), fanout_kind, runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=mcp) | A retained lifecycle MCP command succeeds/is accepted, or any MCP command fails/is blocked | command, service, status (`succeeded`, `accepted`, `failed`, `rejected`, `blocked`), error_type (exception failures only), origin (`command=seed` only; closed enum, see below), runtime_backend, app_version, os, ci, `$insert_id` |
 | `command_run` (service=cli) | A direct non-internal `ooo <command>` is invoked | command, service (`cli`), status (`invoked`), app_version, os, ci, `$insert_id` |
-| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
+| `workflow_outcome` | A background workflow, a terminal `ooo run`, or direct evaluation reaches a terminal result inside Ouroboros (a paused run is not terminal and emits nothing) | command, terminal_status, verified, failure_reason_code (non-success only), failure_cause (non-success `run` only; closed enum, see below), check_package_arm, check_package_assignment, check_package_status, package_verdict, legacy_verdict, reconciliation, legacy_failure_class, legacy_failure_class_count, unverified_count, check_tier_summary, oracle_inconsistent_count, reference_contradiction_count, reference_unavailable_count (`run` only; closed enums, see [Randomized defaults](#randomized-defaults)), runtime_backend, app_version, os, ci, `$insert_id` |
 | `runtime_drift` | A frozen runtime authority input (Codex config, CLI executable, dispatch registry, profile routing) is observed to have changed after the runtime initialized; the run continues on the re-baselined input | kind (closed enum: `codex_config`/`cli_executable`/`skill_dispatcher`/`mcp_handler_registry`/`skill_dispatch_registry`/`profile_routing`/`baseline_unavailable`/`attestation_timeout`/`unknown`), runtime_backend, app_version, os, ci |
 | `ac_verify_failed` | The orchestrator's deterministic AC verify gate rejects an attempt (`run_verify_commands` enabled) | cause (closed enum: `invalid_contract`/`artifacts_missing`/`artifacts_missing_found_elsewhere`/`environment_unverifiable`/`timeout`/`exit_nonzero`/`output_assertion_unmatched`/`workspace_mutated`/`unknown`), runtime_backend, app_version, os, ci |
 

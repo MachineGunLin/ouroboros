@@ -420,6 +420,15 @@ unaffected, because they call the implementation through the product harness
 and do not read workspace test configuration (a model-written script check
 that runs the project's test runner would read it).
 
+Before the package is frozen, each oracle's stated expected values are
+compared with a reference implementation the constructor writes in the same
+reply, run in the same isolated target processes: a held-out case that
+disagrees is dropped (`oracle_inconsistent`), and a criterion whose reference
+does not reproduce an example stated in the Seed, or has no reference that
+runs, is reported as unverified (`reference_contradicts_seed_example`,
+`reference_unavailable`). This catches a slip in a stated value; it does not
+catch a misreading of the criterion that the cases and the reference share.
+
 ```yaml
 boundary:
   check_package: off              # on | off; unset = randomized default

@@ -291,6 +291,9 @@ _WORKFLOW_OUTCOME_KEYS = frozenset(
         "legacy_failure_class_count",
         "unverified_count",
         "check_tier_summary",
+        "oracle_inconsistent_count",
+        "reference_contradiction_count",
+        "reference_unavailable_count",
         "$insert_id",
         "runtime_backend",
         "app_version",
@@ -336,6 +339,11 @@ _CHECK_PACKAGE_PROPERTY_VALUES: dict[str, frozenset[str]] = {
     "legacy_failure_class": _LEGACY_FAILURE_CLASSES | {"none", "accepted", "other"},
     "legacy_failure_class_count": frozenset({"0", "1", "2", "3+"}),
     "unverified_count": frozenset({"0", "1", "2", "3+"}),
+    # Reference check at construction (boundary/reference_check.py): cases
+    # excluded, and criteria made uncovered, by reason.
+    "oracle_inconsistent_count": frozenset({"0", "1", "2", "3+"}),
+    "reference_contradiction_count": frozenset({"0", "1", "2", "3+"}),
+    "reference_unavailable_count": frozenset({"0", "1", "2", "3+"}),
     # "A:<n>,A_prime:<n>,U:<n>" with each n in 0, 1, 2, 3+ (64 values).
     "check_tier_summary": frozenset(
         f"A:{a},A_prime:{b},U:{u}"

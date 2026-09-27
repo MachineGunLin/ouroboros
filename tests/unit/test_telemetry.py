@@ -860,6 +860,9 @@ class TestCapture:
             "reconciliation": "package_accepted_over_legacy_reject",
             "legacy_failure_class": "evidence_form_mismatch",
             "legacy_failure_class_count": "1",
+            "oracle_inconsistent_count": "1",
+            "reference_contradiction_count": "0",
+            "reference_unavailable_count": "3+",
         }
         telemetry.capture_job_outcome(
             "job-private-id",
@@ -888,6 +891,7 @@ class TestCapture:
                 "reconciliation": "agree",
                 "legacy_failure_class": "EVIDENCE_FORM_MISMATCH: pytest /Users/private",
                 "legacy_failure_class_count": 7,
+                "oracle_inconsistent_count": "12",
             },
         )
         telemetry.flush(timeout=2.0)
@@ -898,6 +902,7 @@ class TestCapture:
             "check_package_status",
             "package_verdict",
             "legacy_failure_class_count",
+            "oracle_inconsistent_count",
         ):
             assert key not in props
         assert props["reconciliation"] == "agree"

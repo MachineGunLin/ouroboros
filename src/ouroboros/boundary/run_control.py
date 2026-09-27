@@ -31,6 +31,11 @@ from ouroboros.boundary.authority import (
     reveal_commitment_salts,
 )
 from ouroboros.boundary.ledger import BoundaryOrderError
+from ouroboros.boundary.reference_check import (
+    ORACLE_INCONSISTENT,
+    REFERENCE_CONTRADICTS_SEED_EXAMPLE,
+    REFERENCE_UNAVAILABLE,
+)
 from ouroboros.boundary.resume import ResumedCheckPackageAuthority, load_resumed_boundary
 from ouroboros.boundary.rollout import Arm, AssignmentSource, CheckPackageAssignment
 from ouroboros.boundary.run_wiring import (
@@ -77,6 +82,25 @@ TIER_SUMMARY_TIERS = ("A", "A_prime", "U")
 def tier_summary_value(counts: dict[str, int]) -> str:
     """``check_tier_summary``: bucketed counts of tiers A, A' and U (closed set)."""
     return ",".join(f"{tier}:{_count_bucket(counts.get(tier, 0))}" for tier in TIER_SUMMARY_TIERS)
+
+
+def reference_check_meta(state: BoundaryRunState | None) -> dict[str, str]:
+    """Bucketed reference-check counts, when this process ran the check (else empty).
+
+    A resumed run in another process reports none: the counts are in the
+    journal (``boundary.oracle.reference_checked``), not in its state.
+    """
+    report = state.reference_check if state is not None else None
+    if report is None:
+        return {}
+    counts = report.counts()
+    return {
+        "oracle_inconsistent_count": _count_bucket(counts[ORACLE_INCONSISTENT]),
+        "reference_contradiction_count": _count_bucket(
+            counts[REFERENCE_CONTRADICTS_SEED_EXAMPLE]
+        ),
+        "reference_unavailable_count": _count_bucket(counts[REFERENCE_UNAVAILABLE]),
+    }
 
 
 def legacy_failure_class_from_annotations(legacy: dict[int, Any]) -> tuple[str, str]:
@@ -515,6 +539,7 @@ class CheckPackageRun:
             # Only when the package decided the run (TELEMETRY.md).
             meta["unverified_count"] = _count_bucket(len(reconciliation.unverified))
             meta["check_tier_summary"] = tier_summary_value(reconciliation.tiers)
+        meta.update(reference_check_meta(self.state))
         return meta
 
 

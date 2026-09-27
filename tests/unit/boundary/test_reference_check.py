@@ -317,3 +317,22 @@ async def test_a_command_reference_runs_as_a_script(repo: Path) -> None:
     assert report.uncovered == {}
     assert report.excluded == {"c1_greet": ("held_slip",)}
     assert [case.case_id for case in package.oracles[0].cases] == ["stated", "held_ok"]
+
+
+def test_the_counts_reach_telemetry_as_buckets() -> None:
+    from types import SimpleNamespace
+
+    from ouroboros.boundary.reference_check import ReferenceCheck
+    from ouroboros.boundary.run_control import reference_check_meta
+
+    report = ReferenceCheck(
+        excluded={"c1": ("a", "b"), "c2": ("c", "d")},
+        uncovered={"k1": REFERENCE_CONTRADICTS_SEED_EXAMPLE, "k2": REFERENCE_UNAVAILABLE},
+    )
+    assert reference_check_meta(SimpleNamespace(reference_check=report)) == {
+        "oracle_inconsistent_count": "3+",
+        "reference_contradiction_count": "1",
+        "reference_unavailable_count": "1",
+    }
+    assert reference_check_meta(None) == {}
+    assert reference_check_meta(SimpleNamespace(reference_check=None)) == {}
