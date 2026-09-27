@@ -686,3 +686,97 @@ def test_copies_never_carry_bytecode_caches(tmp_path: Path) -> None:
     copy_checkout(source, tmp_path / "copy")
     assert (tmp_path / "copy/m.py").is_file()
     assert not (tmp_path / "copy/__pycache__").exists()
+
+
+async def test_a_bare_name_in_the_criterion_is_not_tier_a_and_a_declaration_binds(
+    tmp_path: Path,
+) -> None:
+    # A2: the criterion says "interpolate(a, b, t)" without a module and the
+    # constructor guessed mathutils.interpolate. That guess is not pre-bound;
+    # the worker's valid declaration of interp.interpolate is used (A').
+    from ouroboros.boundary.binding_flow import assign_tiers, verify_with_bindings
+
+    base = _repo(tmp_path / "base", {"mathutils.py": BUGGY})
+    seed = _seed("add interpolate(a, b, t): interpolate(0, 10, 0.5) returns 5")
+    package = _package(
+        seed,
+        base,
+        symbol="mathutils.interpolate",
+        params=("a", "b", "t"),
+        cases=[
+            {
+                "case_id": "stated",
+                "args": {"a": 0, "b": 10, "t": 0.5},
+                "expect": {"kind": "returns", "value": 5},
+            },
+            {
+                "case_id": "held",
+                "args": {"a": 2, "b": 4, "t": 0.25},
+                "expect": {"kind": "returns", "value": 2.5},
+            },
+        ],
+    )
+    assert not package.oracles[0].default_resolves
+    candidate = _repo(
+        tmp_path / "cand",
+        {
+            "mathutils.py": BUGGY,
+            "interp.py": "def interpolate(a, b, t):\n    return a + (b - a) * t\n",
+        },
+    )
+    key = package.oracles[0].criterion_key
+    assignments, _ = await assign_tiers(
+        package,
+        artifact=candidate,
+        base=base,
+        declared={key: [{"symbol": "interp.interpolate"}]},
+    )
+    assert assignments["oracle_1"].tier.value == "A_prime"
+    bound = await verify_with_bindings(package, candidate, assignments)
+    assert bound.effective is not None and bound.effective.verdict is CandidateVerdict.PASS
+
+
+async def test_a_criterion_takes_its_tier_from_the_checks_that_decided_it(base: Path) -> None:
+    # A6: a criterion failed through a tier A check that also links an
+    # unverified check is "fail, tier A", not "fail, tier U".
+    from ouroboros.boundary.acceptance import PackageCriterionStatus, criterion_verdicts
+    from ouroboros.boundary.binding import BindingSource, CheckTier, TierAssignment
+
+    seed = _seed()
+    specs = [
+        build_oracle_spec(
+            seed,
+            criterion_index=0,
+            check_id=check_id,
+            call_kind="function",
+            params=("value", "low", "high"),
+            default_binding={"symbol": symbol},
+            cases=CASES,
+            base_checkout=base,
+        )
+        for check_id, symbol in (("oracle_a", "mathutils.clamp"), ("oracle_u", "mathutils.bound"))
+    ]
+    package = assemble_package(
+        seed,
+        input_digest="1" * 64,
+        generator="test",
+        oracles=[(spec, CheckRole.REPRODUCTION) for spec in specs],
+    )
+    key = specs[0].criterion_key
+    assignments = {
+        "oracle_a": TierAssignment(
+            key,
+            "oracle_a",
+            CheckTier.A,
+            specs[0].default_binding,
+            BindingSource.DEFAULT,
+            "run",
+            "x",
+        ),
+        "oracle_u": TierAssignment(
+            key, "oracle_u", CheckTier.U, None, None, "unverified", "no_binding"
+        ),
+    }
+    verification = await verify_candidate(package, base, only_checks=["oracle_a"])
+    verdict = criterion_verdicts(package, verification, assignments=assignments)[key]
+    assert (verdict.status, verdict.tier) == (PackageCriterionStatus.FAIL, CheckTier.A)

@@ -179,6 +179,10 @@ def criterion_verdicts(
             )
             continue
         tiers: list[CheckTier] = []
+        # The tier of the checks that decided each outcome (A6): a criterion
+        # failed through a tier A check is "fail, tier A" even when it also
+        # links an unverified check.
+        decided_by: dict[str, list[CheckTier]] = {"fail": [], "undecided": [], "unverified": []}
         failed: list[CheckExecution] = []
         undecided: list[str] = []
         unverified: list[str] = []
@@ -187,35 +191,44 @@ def criterion_verdicts(
         source: str | None = None
         for check_id in check_ids:
             assignment = assignments.get(check_id)
-            tiers.append(assignment.tier if assignment else CheckTier.A)
+            check_tier = assignment.tier if assignment else CheckTier.A
+            tiers.append(check_tier)
             if assignment is not None and assignment.binding is not None:
                 binding = assignment.binding.to_dict()
                 source = assignment.binding_source.value if assignment.binding_source else None
             if assignment is not None and assignment.tier is CheckTier.U:
                 if assignment.status_hint == "indeterminate":
                     undecided.append(assignment.reason)
+                    decided_by["undecided"].append(check_tier)
                 else:
                     unverified.append(assignment.reason)
+                    decided_by["unverified"].append(check_tier)
                 continue
             execution = executions.get(check_id)
             if not trusted or execution is None:
                 undecided.append("verification_untrusted" if verification else "not_run")
+                decided_by["undecided"].append(check_tier)
             elif execution.status is CheckStatus.VIOLATED:
                 failed.append(execution)
+                decided_by["fail"].append(check_tier)
             elif execution.status is CheckStatus.EXPECTED:
                 passed += 1
             else:
                 undecided.append(execution.reason)
-        tier = _weakest(tiers)
+                decided_by["undecided"].append(check_tier)
         if failed:
             status, reason = PackageCriterionStatus.FAIL, failed[0].reason
             heldout_only = all(failed_heldout_only(item.oracle_result) for item in failed)
+            tier = _weakest(decided_by["fail"])
         elif undecided:
             status, reason, heldout_only = PackageCriterionStatus.INDETERMINATE, undecided[0], False
+            tier = _weakest(decided_by["undecided"])
         elif unverified:
             status, reason, heldout_only = PackageCriterionStatus.UNVERIFIED, unverified[0], False
+            tier = _weakest(decided_by["unverified"])
         else:
             status, reason, heldout_only = PackageCriterionStatus.PASS, "passed", False
+            tier = _weakest(tiers)
         verdicts[key] = CriterionVerdict(
             key,
             status,
