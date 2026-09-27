@@ -32,6 +32,9 @@ A command is replayed only when that program is one of:
 
 (b) a script inside the workspace, run directly (``./run_tests.sh``,
     ``bin/test``) or by ``python``/``sh``/``bash`` (``tests/runtests.py``).
+    A file in an environment's ``bin`` directory (``.venv/bin/pip``,
+    ``node_modules/.bin/tsc``) is an installed program, not such a script: it
+    is admitted only as a runner of (a).
 
 An absolute-path program outside the workspace is admitted only when its
 name is an allowlisted interpreter or runner (``python3.9``, ``pytest``,
@@ -46,7 +49,9 @@ in ``VIEWER_PROGRAMS``, version control, package managers, any other
 absolute-path program outside the workspace, an absolute-path argument
 outside the workspace (other than such an environment program), ``xargs`` (its argv comes from stdin), and a runner in a mode that
 runs no tests (``--help``, ``--collect-only``, ``make -n``, ...). The
-denylist in ``command_replay`` stays as a second layer.
+denylist in ``command_replay`` stays as a second layer and judges every
+program of the same ``program_chain`` (each launcher and the program it
+launches), never a different reading of the command.
 
 The same resolution decides the test-target linkage rule
 (``claim_target_operands``): a claim naming a test file or label is linked to
@@ -115,7 +120,7 @@ the work under review and out of scope here.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import PurePosixPath
 import re
@@ -743,12 +748,18 @@ class ResolvedRunner:
     subcommand that selected it. ``narrowing_interpreter`` is True when the
     Python interpreter ran with a flag in ``_NARROWING_PYTHON_FLAGS``.
     ``script`` is the file name of a ``test-script`` runner (``runtests.py``).
+    ``programs`` is the argv of every program the command runs, from
+    ``program_chain``: each launcher, then the runner itself. The denylist is
+    applied to each of them, so it judges the same program the allowlist
+    admitted. It records how the runner was reached, not what the runner is,
+    and is left out of comparisons.
     """
 
     kind: str
     arguments: tuple[str, ...]
     narrowing_interpreter: bool = False
     script: str = ""
+    programs: tuple[tuple[str, ...], ...] = field(default=(), compare=False)
 
 
 def _program_name(value: str) -> str:
@@ -822,6 +833,68 @@ def peel_wrappers(argv: Sequence[str]) -> tuple[str, ...] | None:
             return None
         parts = parts[index:]
     return None
+
+
+def _walk(parts: tuple[str, ...]) -> tuple[tuple[tuple[str, ...], ...] | None, tuple[str, ...]]:
+    """Walk ``parts`` through its wrappers and launchers.
+
+    Returns ``(programs, assignments)``. ``programs`` is the argv of each
+    launcher in the chain followed by the argv of the program that finally
+    runs, or None when a wrapper or launcher option cannot be classified with
+    certainty, a refused wrapper appears, or the chain is too deep.
+    ``assignments`` are the ``NAME=value`` tokens consumed by ``env`` wrappers
+    up to where the walk stopped. A path program (``./uv``, ``.venv/bin/uv``)
+    is never a launcher: launchers are matched by bare name only.
+    """
+    programs: list[tuple[str, ...]] = []
+    assignments: list[str] = []
+    for _ in range(2 * _MAX_RESOLVE_DEPTH):
+        if not parts:
+            return None, tuple(assignments)
+        name = _program_name(parts[0])
+        if name in REFUSED_WRAPPERS:
+            return None, tuple(assignments)
+        spec = _WRAPPERS.get(name)
+        if spec is not None:
+            index = _skip_options(parts, 1, spec)
+            if index is None:
+                return None, tuple(assignments)
+            if spec.assignments:
+                assignments.extend(token for token in parts[1:index] if _is_env_assignment(token))
+            parts = parts[index:]
+            continue
+        launcher = next(
+            (
+                (key, option_spec)
+                for key, option_spec in _LAUNCHERS.items()
+                if tuple(token.lower() for token in parts[: len(key)]) == key
+            ),
+            None,
+        )
+        if launcher is None:
+            programs.append(parts)
+            return tuple(programs), tuple(assignments)
+        index = _skip_options(parts, len(launcher[0]), launcher[1])
+        if index is None:
+            return None, tuple(assignments)
+        programs.append(parts)
+        parts = parts[index:]
+    return None, tuple(assignments)
+
+
+def program_chain(argv: Sequence[str]) -> tuple[tuple[str, ...], ...] | None:
+    """Return the argv of every program ``argv`` runs, or None when unknown.
+
+    Wrappers (``timeout``, ``env``, ...) are peeled; each launcher (``uv run``,
+    ``npx``, ``bundle exec``, ...) is kept with its own argv and followed to
+    the program it launches, whose argv comes last. ``uv run .venv/bin/pip
+    install x`` yields ``("uv", "run", ...)`` and ``(".venv/bin/pip",
+    "install", "x")``. This is the one resolution the allowlist
+    (``resolve_replay_program``), the denylist (``command_replay``) and the
+    command-line assignments (``command_line_assignments``) share.
+    """
+    programs, _ = _walk(tuple(argv))
+    return programs
 
 
 def _environment_bin_path(program: str) -> bool:
@@ -993,17 +1066,12 @@ def _runner(
 
 
 def _resolve(
-    parts: tuple[str, ...],
+    peeled: tuple[str, ...],
     workspace: str | None,
     cwd_relative: str,
-    depth: int,
     roots: Sequence[str] | None,
 ) -> ResolvedRunner | None:
-    if depth > _MAX_RESOLVE_DEPTH:
-        return None
-    peeled = peel_wrappers(parts)
-    if not peeled:
-        return None
+    """Return the runner the final program of a ``program_chain`` is, or None."""
     program = peeled[0]
     name = _program_name(program)
     if "/" in program or "\\" in program:
@@ -1025,7 +1093,10 @@ def _resolve(
         resolved = _runner(name, peeled, workspace, cwd_relative)
         if resolved is not None:
             return resolved
-        if interpreter:
+        if interpreter or _environment_bin_path(program):
+            # A file in an environment's ``bin`` (``.venv/bin/pip``,
+            # ``node_modules/.bin/tsc``) is an installed program, not a script
+            # the project ships: it is replayed only as an allowlisted runner.
             return None
         script = _project_test_runner_script(list(peeled))
         if script is None:
@@ -1036,14 +1107,6 @@ def _resolve(
         return ResolvedRunner("test-script", rest, script=PurePosixPath(script).name)
     if name in VIEWER_PROGRAMS or name in REFUSED_WRAPPERS:
         return None
-    for launcher, spec in _LAUNCHERS.items():
-        if tuple(token.lower() for token in peeled[: len(launcher)]) != launcher:
-            continue
-        index = _skip_options(peeled, len(launcher), spec)
-        if index is None:
-            return None
-        # The launched program passes the same allowlist (``uv run pytest``).
-        return _resolve(peeled[index:], workspace, cwd_relative, depth + 1, roots)
     return _runner(name, peeled, workspace, cwd_relative)
 
 
@@ -1072,11 +1135,16 @@ def resolve_replay_program(
     always passes the workspace, and ``environment`` (the replay environment,
     the process environment when None) supplies the environment roots.
     """
+    programs = program_chain(argv)
+    if not programs:
+        return None
+    # Only the final program is resolved: every earlier entry is a launcher,
+    # and the launched program passes the same allowlist (``uv run pytest``).
     roots = None if workspace is None else environment_roots(environment)
-    resolved = _resolve(tuple(argv), workspace, cwd_relative, 0, roots)
+    resolved = _resolve(programs[-1], workspace, cwd_relative, roots)
     if resolved is None or _non_executing(resolved):
         return None
-    return resolved
+    return replace(resolved, programs=programs)
 
 
 def _absolute_argument_outside(token: str, roots: Sequence[str]) -> bool:
@@ -1098,6 +1166,28 @@ def outside_known_roots(
     )
 
 
+def admitted_runner(
+    argv: Sequence[str],
+    *,
+    workspace: str,
+    cwd_relative: str = ".",
+    environment: Mapping[str, str] | None = None,
+) -> ResolvedRunner | None:
+    """Return the runner ``argv`` runs when the allowlist admits it, or None.
+
+    The runner is ``resolve_replay_program``'s; an absolute-path argument
+    outside the workspace and the environment roots refuses the command.
+    """
+    runner = resolve_replay_program(
+        argv, workspace=workspace, cwd_relative=cwd_relative, environment=environment
+    )
+    if runner is None or any(
+        outside_known_roots(token, workspace=workspace, environment=environment) for token in argv
+    ):
+        return None
+    return runner
+
+
 def replay_allowed(
     argv: Sequence[str],
     *,
@@ -1106,15 +1196,11 @@ def replay_allowed(
     environment: Mapping[str, str] | None = None,
 ) -> bool:
     """Return True when ``argv`` may be replayed (see module docstring)."""
-    if (
-        resolve_replay_program(
+    return (
+        admitted_runner(
             argv, workspace=workspace, cwd_relative=cwd_relative, environment=environment
         )
-        is None
-    ):
-        return False
-    return not any(
-        outside_known_roots(token, workspace=workspace, environment=environment) for token in argv
+        is not None
     )
 
 
@@ -1199,40 +1285,14 @@ def command_line_assignments(argv: Sequence[str]) -> tuple[str, ...]:
 
     Leading assignments, and those consumed by an ``env`` wrapper anywhere in
     the chain of wrappers and launchers (``timeout 60 env X=1 pytest``,
-    ``uv run env X=1 pytest``).
+    ``uv run env X=1 pytest``), as ``program_chain`` walks it.
     """
     parts = tuple(argv)
-    found: list[str] = []
     index = 0
     while index < len(parts) and _is_env_assignment(parts[index]):
-        found.append(parts[index])
         index += 1
-    parts = parts[index:]
-    for _ in range(_MAX_RESOLVE_DEPTH):
-        if not parts:
-            break
-        name = _program_name(parts[0])
-        spec = _WRAPPERS.get(name)
-        launcher = next(
-            (
-                (key, option_spec)
-                for key, option_spec in _LAUNCHERS.items()
-                if tuple(token.lower() for token in parts[: len(key)]) == key
-            ),
-            None,
-        )
-        if spec is not None:
-            program_index = _skip_options(parts, 1, spec)
-        elif launcher is not None:
-            program_index = _skip_options(parts, len(launcher[0]), launcher[1])
-        else:
-            break
-        if program_index is None:
-            break
-        if spec is not None and spec.assignments:
-            found.extend(token for token in parts[1:program_index] if _is_env_assignment(token))
-        parts = parts[program_index:]
-    return tuple(found)
+    _, assignments = _walk(parts[index:])
+    return (*parts[:index], *assignments)
 
 
 def _narrowing_environment(argv: Sequence[str], environment: Sequence[str]) -> bool:
@@ -1389,6 +1449,7 @@ __all__ = [
     "TARGET_RUNNER_KINDS",
     "VIEWER_PROGRAMS",
     "ResolvedRunner",
+    "admitted_runner",
     "alters_configuration",
     "NARROWING_ENVIRONMENT",
     "NARROWING_ENVIRONMENT_PREFIXES",
@@ -1401,6 +1462,7 @@ __all__ = [
     "narrowing_variable",
     "outside_known_roots",
     "peel_wrappers",
+    "program_chain",
     "replay_allowed",
     "resolve_replay_program",
     "run_may_back_test_claim",

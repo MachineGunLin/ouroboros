@@ -109,7 +109,9 @@ the default) and the leaf held Bash authority. The rules:
   inside an environment's `bin` directory (`.venv/bin/pytest`,
   `node_modules/.bin/jest`); elsewhere an interpreter name is refused and a
   runner name is replayed as a plain script, whose operands are never test
-  targets. One exception: an absolute-path program whose name is an
+  targets. Any other file in an environment's `bin` directory
+  (`.venv/bin/pip`, `node_modules/.bin/tsc`) is an installed program, not a
+  project script, and is refused. One exception: an absolute-path program whose name is an
   allowlisted interpreter or runner (`python3.9`, `pytest`, `make`, ...) is
   admitted when its real path, symlinks resolved, lies inside a known
   environment root: `sys.prefix` or `sys.base_prefix` of the verifying
@@ -267,7 +269,10 @@ the default) and the leaf held Bash authority. The rules:
   packages (`sudo`, `ssh`, `curl`, `wget`, `docker`, `rm`, `git` other than
   read-only subcommands, `pip install`, `npm install`, `uv add`, `brew`,
   `twine`, `gh`, ...) and inline shell programs (`bash -c`) are never
-  replayed, whatever the allowlist says.
+  replayed, whatever the allowlist says. The denylist judges the same
+  resolution the allowlist admitted (`replay_policy.program_chain`): every
+  launcher in the command and the program it launches, so
+  `uv run .venv/bin/pip install x` is judged as `pip install`.
 
 A claim that no successful replay backs falls through to the transcript-only
 rules and failure classes below. Two of those rules follow the same

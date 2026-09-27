@@ -42,6 +42,8 @@ from ouroboros.orchestrator.evidence.replay_policy import (
     VIEWER_PROGRAMS,
     ResolvedRunner,
     claim_target_operands,
+    command_line_assignments,
+    program_chain,
     replay_allowed,
     resolve_replay_program,
 )
@@ -1093,15 +1095,66 @@ class TestAllowlist:
     def test_denylist_refuses_what_the_allowlist_admits(self) -> None:
         # A workspace script is admitted by the allowlist (rule b); the
         # denylist, a second layer, still refuses a pip install through it.
-        (self.workspace / ".venv" / "bin").mkdir(parents=True)
-        _executable(self.workspace / ".venv" / "bin" / "pip", "#!/bin/sh\n")
-        argv = (".venv/bin/pip", "install", "x")
+        (self.workspace / "tools").mkdir()
+        _executable(self.workspace / "tools" / "pip", "#!/bin/sh\n")
+        argv = ("tools/pip", "install", "x")
         candidate = replay_candidate(" ".join(argv), str(self.workspace))
         assert candidate is not None
 
         assert replay_allowed(argv, workspace=str(self.workspace))
         assert replay_denied(argv)
         assert not command_replay.replay_admissible(candidate, str(self.workspace))
+
+    def test_launcher_hidden_installer_is_refused(self) -> None:
+        # Bot review round 5, finding 1: ``uv run .venv/bin/pip install`` was
+        # admitted as a workspace script while the denylist judged ``uv``. The
+        # allowlist and the denylist now judge the same resolved program.
+        bin_dir = self.workspace / ".venv" / "bin"
+        bin_dir.mkdir(parents=True)
+        _executable(bin_dir / "pip", "#!/bin/sh\n")
+        _executable(bin_dir / "pytest", "#!/bin/sh\n")
+        ws = str(self.workspace)
+        for command in (
+            "uv run .venv/bin/pip install local-package.whl",
+            ".venv/bin/pip install x",
+            "uv run pip install x",
+            "uv run python -m pip install x",
+            "timeout 60 uv run env X=1 .venv/bin/pip install x",
+            "poetry run pip install x",
+        ):
+            argv = tuple(command.split())
+            assert replay_denied(argv), command
+            assert not replay_allowed(argv, workspace=ws), command
+            assert not self._allowed(command), command
+        # An installed program that is not an allowlisted runner is not a
+        # workspace script, whatever its arguments.
+        _executable(bin_dir / "coverage", "#!/bin/sh\n")
+        assert resolve_replay_program((".venv/bin/coverage", "run"), workspace=ws) is None
+        assert not self._allowed("uv run .venv/bin/coverage run -m pytest")
+        # Launcher-wrapped test runs stay admitted.
+        for command in (
+            "uv run .venv/bin/pytest -q",
+            ".venv/bin/pytest -q",
+            "uv run pytest -q",
+            "poetry run pytest -q",
+            "uv run python -m pytest -q",
+        ):
+            assert not replay_denied(tuple(command.split())), command
+            assert self._allowed(command), command
+
+    def test_allowlist_and_denylist_share_one_resolution(self) -> None:
+        bin_dir = self.workspace / ".venv" / "bin"
+        bin_dir.mkdir(parents=True)
+        _executable(bin_dir / "pytest", "#!/bin/sh\n")
+        argv = ("timeout", "60", "uv", "run", "env", "X=1", ".venv/bin/pytest", "-q")
+        assert program_chain(argv) == (
+            ("uv", "run", "env", "X=1", ".venv/bin/pytest", "-q"),
+            (".venv/bin/pytest", "-q"),
+        )
+        runner = resolve_replay_program(argv, workspace=str(self.workspace))
+        assert runner == ResolvedRunner("pytest", ("-q",))
+        assert runner is not None and runner.programs == program_chain(argv)
+        assert command_line_assignments(argv) == ("X=1",)
 
     def _conda_bin(self, root: Path) -> Path:
         """A SWE-bench-style conda environment with a python and a pytest."""

@@ -23,7 +23,9 @@ Execution rules (each one fails closed):
   runners, interpreters running a workspace script or a test module, and
   workspace scripts); the denylist (``replay_denied``: privilege, network,
   container, deletion, version-control writes, package installs) is a second
-  layer. Every other command keeps the transcript-only rules.
+  layer, applied to every program of the same resolution the allowlist
+  admitted (``replay_policy.program_chain``: each launcher and the program it
+  launches). Every other command keeps the transcript-only rules.
 - The command runs as a direct argv, never through a shell, in a fresh copy of
   the workspace, under the verify gate's sanitized environment and timeout,
   with ``PYTHONDONTWRITEBYTECODE=1``. At most ``MAX_REPLAYED_COMMANDS``
@@ -90,13 +92,13 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
 )
 from ouroboros.orchestrator.evidence.replay_policy import (
+    admitted_runner,
     claim_target_operands,
     command_line_assignments,
     narrowing_assignments,
     narrowing_variable,
     outside_known_roots,
-    peel_wrappers,
-    replay_allowed,
+    program_chain,
 )
 from ouroboros.orchestrator.evidence.shell_parsing import (
     _is_python_executable,
@@ -391,12 +393,15 @@ def replay_admissible(
     workspace and the environment roots (for example ``PATH=/tmp/elsewhere``)
     is refused as well.
     """
-    if replay_denied(candidate.argv) or not replay_allowed(
+    runner = admitted_runner(
         candidate.argv,
         workspace=workspace,
         cwd_relative=candidate.cwd_relative,
         environment=environment,
-    ):
+    )
+    # The denylist judges every program of the same resolution the allowlist
+    # admitted: each launcher and the runner it launches.
+    if runner is None or any(_program_denied(program) for program in runner.programs):
         return False
     values = [
         *candidate.env_delta.values(),
@@ -417,17 +422,25 @@ def _program_name(value: str) -> str:
 def replay_denied(argv: Sequence[str]) -> bool:
     """Return True when ``argv`` must never be replayed (see module docstring).
 
-    Wrappers are peeled with their option tables; a wrapper whose program
-    cannot be identified with certainty is denied.
+    Every program ``argv`` runs is judged (``replay_policy.program_chain``):
+    each launcher and the program it launches, after wrappers are peeled, so
+    ``uv run .venv/bin/pip install x`` is judged as ``pip install``. A chain
+    whose programs cannot be identified with certainty is denied.
     """
-    peeled = peel_wrappers(argv)
-    if not peeled:
+    programs = program_chain(argv)
+    if not programs:
         return True
-    parts = list(peeled)
+    return any(_program_denied(program) for program in programs)
+
+
+def _program_denied(parts: Sequence[str]) -> bool:
+    """Return True when one program's argv, wrappers already peeled, is denied."""
+    if not parts:
+        return True
     name = _program_name(parts[0])
     if _VERSIONED_PIP_RE.fullmatch(name):
         name = "pip"
-    arguments = parts[1:]
+    arguments = list(parts[1:])
     if name in _DENIED_PROGRAMS:
         return True
     if name in _SHELL_PROGRAMS and any(
