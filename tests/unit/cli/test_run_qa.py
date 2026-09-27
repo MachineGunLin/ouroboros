@@ -682,7 +682,7 @@ async def test_run_orchestrator_resume_uses_persisted_fat_harness_contract(
 
     tracker = SessionTracker.create(
         "exec-resume",
-        VALID_SEED_DATA["metadata"]["seed_id"],
+        "test-seed-cli-qa",  # VALID_SEED_DATA's seed_id
         session_id="sess-resume",
     )
     fake_exec = SimpleNamespace(
