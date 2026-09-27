@@ -81,6 +81,7 @@ from ouroboros.boundary.oracle import (
 
 _FRAME_LIMIT = 8 * 1024 * 1024
 _CLI_OUTPUT_LIMIT = 1024 * 1024
+_READ_CHUNK = 64 * 1024
 _MAX_DEPTH = 64
 _MAX_NODES = 1_000_000
 _MAX_INT_DIGITS = 1000
@@ -247,11 +248,21 @@ def _kill_group(process: asyncio.subprocess.Process) -> None:
             continue
 
 
+async def _discard(reader: asyncio.StreamReader | None) -> None:
+    while reader is not None and await reader.read(_READ_CHUNK):
+        pass
+
+
 async def _reap(process: asyncio.subprocess.Process) -> int | None:
-    """Kill the target's group, reap the leader, and wait (bounded) for the group to empty."""
+    """Kill the target's group, reap the leader, and wait (bounded) for the group to empty.
+
+    Unread output left in the pipe is discarded chunk by chunk: asyncio
+    reports the exit only once the pipe reaches end of file, so a reader
+    stopped at the output cap would otherwise stall the reap.
+    """
     _kill_group(process)
     try:
-        await asyncio.wait_for(process.wait(), timeout=10)
+        await asyncio.wait_for(asyncio.gather(_discard(process.stdout), process.wait()), timeout=10)
     except TimeoutError:
         code = None
     else:
@@ -291,6 +302,40 @@ async def _next_frame(
             continue  # not a frame: ignored
         payload = parse_frame(line[len(prefix) :])
         return ("frame", payload) if payload is not None else ("malformed", None)
+
+
+class CappedOutput:
+    """Output read under a hard byte cap while it streams (R3-S2).
+
+    ``fill`` stops reading once more than ``limit`` bytes arrived and sets
+    ``overflow``; at most ``limit`` bytes (plus one read chunk in flight) are
+    ever held, whatever the process writes. The caller kills the process.
+    Partial output survives a cancelled ``fill`` (for a timeout).
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.overflow = False
+        self._chunks: list[bytes] = []
+        self._size = 0
+
+    async def fill(self, reader: asyncio.StreamReader | None) -> None:
+        while reader is not None and not self.overflow:
+            chunk = await reader.read(_READ_CHUNK)
+            if not chunk:
+                return
+            room = self.limit - self._size
+            if len(chunk) > room:
+                self._chunks.append(chunk[:room])
+                self._size = self.limit
+                self.overflow = True
+                return
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(self._chunks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,9 +416,13 @@ async def _python_case(
             )
         assert process.stdin is not None
         try:
+            # Bounded like everything else in the case (R3-S4): a target that
+            # never reads its stdin cannot stall the controller.
             process.stdin.write((json.dumps(call) + "\n").encode("utf-8"))
-            await process.stdin.drain()
+            await asyncio.wait_for(process.stdin.drain(), timeout=max(deadline - loop.time(), 0.01))
             process.stdin.close()
+        except TimeoutError:
+            return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
         except (BrokenPipeError, ConnectionResetError):
             pass
         status, frame = await _next_frame(process, nonce, deadline)
@@ -391,9 +440,32 @@ async def _python_case(
         await _reap(process)
 
 
+async def _feed(process: asyncio.subprocess.Process, data: bytes) -> None:
+    assert process.stdin is not None
+    try:
+        process.stdin.write(data)
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        try:
+            process.stdin.close()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+
 async def _cli_case(
     argv: list[str], cwd: Path, env: Mapping[str, str], stdin: str, budget: float, call_text: str
 ) -> _Case:
+    """One CLI call; its stdout is read under ``_CLI_OUTPUT_LIMIT`` while it streams.
+
+    More output than the limit is an oversized observation (this case fails
+    on a candidate, the base is undecided): the process group is killed at
+    the first byte past the limit, so a target cannot make the controller
+    buffer its output (R3-S2). The stdin write shares the case deadline.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(budget, 0.01)
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
@@ -406,12 +478,16 @@ async def _cli_case(
         )
     except OSError as exc:
         return _Case("resolve", resolve="missing", detail=f"{call_text}: {exc}")
+    output = CappedOutput(_CLI_OUTPUT_LIMIT)
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(stdin.encode("utf-8")), timeout=max(budget, 0.01)
+        await asyncio.wait_for(
+            asyncio.gather(_feed(process, stdin.encode("utf-8")), output.fill(process.stdout)),
+            timeout=max(deadline - loop.time(), 0.01),
         )
+        if output.overflow:
+            return _Case("observed", entry={"outcome": "malformed", "call": call_text})
+        await asyncio.wait_for(process.wait(), timeout=max(deadline - loop.time(), 0.01))
     except TimeoutError:
-        await _reap(process)
         return _Case("observed", entry={"outcome": "timeout", "call": call_text})
     finally:
         await _reap(process)
@@ -421,7 +497,7 @@ async def _cli_case(
             "outcome": "exited",
             "call": call_text,
             "exit_code": process.returncode,
-            "stdout": stdout[:_CLI_OUTPUT_LIMIT].decode("utf-8", errors="replace"),
+            "stdout": output.data.decode("utf-8", errors="replace"),
         },
     )
 
@@ -631,6 +707,7 @@ async def run_oracle_check(
 
 
 __all__ = [
+    "CappedOutput",
     "OracleRun",
     "parse_frame",
     "run_oracle_check",

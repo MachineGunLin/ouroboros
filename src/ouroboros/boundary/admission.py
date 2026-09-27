@@ -53,7 +53,7 @@ from ouroboros.boundary.oracle import (
     journal_safe_oracle_result,
     redact_held_out,
 )
-from ouroboros.boundary.oracle_run import run_oracle_check
+from ouroboros.boundary.oracle_run import CappedOutput, run_oracle_check
 from ouroboros.boundary.package import (
     CheckPackage,
     CheckRole,
@@ -73,6 +73,8 @@ from ouroboros.boundary.tree import (
 
 ADMISSION_TIMEOUT_SECONDS = 120
 _OUTPUT_TAIL_CHARS = 2000
+# Per stream of a script check; more is ``output_oversized`` (R3-S2).
+_SCRIPT_OUTPUT_LIMIT = 8 * 1024 * 1024
 
 
 class CheckStatus(StrEnum):
@@ -246,6 +248,7 @@ class _Completed:
     timed_out: bool
     launch_error: str | None
     duration: float
+    output_overflow: bool = False
 
 
 def _command_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -289,26 +292,46 @@ async def _run_argv(
         )
     except OSError as exc:
         return _Completed(None, b"", b"", False, f"{type(exc).__name__}: {exc}", 0.0)
+    # Both streams are read under a hard cap while they stream; past it the
+    # group is killed, so a flooding check never grows controller memory.
+    out, err = CappedOutput(_SCRIPT_OUTPUT_LIMIT), CappedOutput(_SCRIPT_OUTPUT_LIMIT)
+
+    async def read(output: CappedOutput, reader: asyncio.StreamReader | None) -> None:
+        await output.fill(reader)
+        if output.overflow:
+            _kill(process, posix)
+
+    async def drain() -> None:
+        await asyncio.gather(read(out, process.stdout), read(err, process.stderr))
+        await process.wait()
+
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        await asyncio.wait_for(drain(), timeout=timeout)
     except TimeoutError:
         _kill(process, posix)
         try:
             # A descendant that left the process group can keep the pipes open;
             # never let draining them outlive the command budget.
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            await asyncio.wait_for(drain(), timeout=10)
         except TimeoutError:
             process.kill()
             await process.wait()
-            stdout, stderr = b"", b""
         return _Completed(
-            process.returncode, stdout, stderr, True, None, time.monotonic() - started
+            process.returncode, out.data, err.data, True, None, time.monotonic() - started
         )
     except asyncio.CancelledError:
         _kill(process, posix)
         await process.wait()
         raise
-    return _Completed(process.returncode, stdout, stderr, False, None, time.monotonic() - started)
+    return _Completed(
+        process.returncode,
+        out.data,
+        err.data,
+        False,
+        None,
+        time.monotonic() - started,
+        out.overflow or err.overflow,
+    )
 
 
 def _kill(process: asyncio.subprocess.Process, posix: bool) -> None:
@@ -371,6 +394,13 @@ def _classify(
         return CheckStatus.INDETERMINATE, "protected_bytes_mutated"
     if completed.launch_error is not None:
         return CheckStatus.INDETERMINATE, "launch_failed"
+    if completed.output_overflow:
+        # Killed at the output cap: on a candidate its own code flooded the
+        # check (a failure, like an oversized oracle observation); on the
+        # base nothing was decided.
+        if on_base:
+            return CheckStatus.INDETERMINATE, "output_oversized"
+        return CheckStatus.VIOLATED, "output_oversized"
     if completed.timed_out:
         return CheckStatus.INDETERMINATE, "timeout"
     if oracle_undecided:
