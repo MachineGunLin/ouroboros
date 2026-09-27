@@ -6,6 +6,7 @@ All tests inject a fake fetcher — the unit suite never touches the network.
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from ouroboros.mcp.tools.citation_check import (
     INVALID,
@@ -161,6 +162,7 @@ def test_internationalized_ipvfuture_and_encoded_zone_urls_remain_auditable() ->
         "https://bücher.example/über",
         "https://[v1.fe80]/doc",
         "https://[fe80::1%25eth0]/doc",
+        "https://[fe80::1%25eth%2D0]/doc",
     )
     calls: list[str] = []
 
@@ -177,7 +179,12 @@ def test_internationalized_ipvfuture_and_encoded_zone_urls_remain_auditable() ->
 
 
 def test_raw_malformed_citations_are_rejected_before_the_valid_url_budget() -> None:
-    malformed = (" https://bad.example/doc ", "https://[fe80::1%eth0]/doc")
+    malformed = (
+        " https://bad.example/doc ",
+        "https://[fe80::1%eth0]/doc",
+        "https://[fe80::1%2Feth0]/doc",
+        "https://[fe80::1%25]/doc",
+    )
     valid = "https://ok.example/doc"
     calls: list[str] = []
 
@@ -193,3 +200,17 @@ def test_raw_malformed_citations_are_rejected_before_the_valid_url_budget() -> N
     assert audit["urls"][valid] == VERIFIED
     assert audit["checked"] == 1
     assert calls == [valid]
+
+
+def test_urllib_representable_encoded_zones_are_fetchable() -> None:
+    for zone, normalized in (("eth%2D0", "eth-0"), ("eth%3D0", "eth=0")):
+        url = f"https://[fe80::1%25{zone}]/doc"
+        text = "```json\n" + json.dumps({"external_sources": [url]}) + "\n```"
+
+        with patch("urllib.request.urlopen") as urlopen:
+            audit = audit_citations([text])
+
+        assert audit is not None
+        assert audit["urls"][url] == VERIFIED
+        urlopen.assert_called_once()
+        assert urlopen.call_args.args[0].full_url == f"https://[fe80::1%25{normalized}]/doc"

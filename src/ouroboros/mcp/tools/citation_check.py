@@ -76,10 +76,25 @@ def _eligible_http_citation(url: str) -> bool:
     ):
         return False
     try:
-        parsed = urllib.parse.urlsplit(url)
+        # urlsplit delegates bracket literals to ipaddress, which rejects a
+        # valid percent-encoded ZoneID. Parse with the bare address, then
+        # validate the original authority and every URI component below.
+        authority_match = re.match(r"(?i)^https?://([^/?#]*)", url)
+        raw_authority = authority_match.group(1) if authority_match else None
+        parse_url = url
+        if authority_match and raw_authority is not None:
+            opening = raw_authority.find("[")
+            closing = raw_authority.find("]", opening + 1)
+            if opening >= 0 and closing > opening:
+                literal = raw_authority[opening + 1 : closing]
+                if "%" in literal:
+                    bare = literal.split("%", 1)[0]
+                    offset = authority_match.start(1)
+                    parse_url = url[: offset + opening + 1] + bare + url[offset + closing :]
+        parsed = urllib.parse.urlsplit(parse_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             return False
-        authority = parsed.netloc
+        authority = raw_authority if raw_authority is not None else parsed.netloc
         if "@" in authority:
             if authority.count("@") != 1:
                 return False
@@ -104,7 +119,17 @@ def _eligible_http_citation(url: str) -> bool:
                 ):
                     return False
             else:
-                ipaddress.IPv6Address(literal)
+                address, zone_separator, zone = literal.partition("%25")
+                if zone_separator:
+                    if (
+                        not zone
+                        or not zone.isascii()
+                        or not _uri_component_is_syntactic(zone, _UNRESERVED)
+                    ):
+                        return False
+                elif "%" in literal:
+                    return False
+                ipaddress.IPv6Address(address)
             port_suffix = authority[closing + 1 :]
             if port_suffix and not port_suffix.startswith(":"):
                 return False
@@ -174,9 +199,39 @@ def _default_fetch(url: str, timeout: float) -> bool:
     one ranged GET so it is not falsely marked dead. Anything else — DNS
     failure, TLS failure, timeout, 4xx/5xx — is "not alive right now".
     """
+    # urllib's Request rejects percent escapes inside IPv6 ZoneIDs. Decode
+    # characters it can represent in the authority without changing delimiters.
+    request_url = url
+    authority_match = re.match(r"(?i)^https?://([^/?#]*)", url)
+    if authority_match:
+        authority = authority_match.group(1)
+        opening = authority.find("[")
+        closing = authority.find("]", opening + 1)
+        if opening >= 0 and closing > opening:
+            literal = authority[opening + 1 : closing]
+            address, separator, zone = literal.partition("%25")
+            if separator and "%" in zone:
+                zone = re.sub(
+                    r"%([0-9A-Fa-f]{2})",
+                    lambda match: (
+                        char
+                        if (char := chr(int(match.group(1), 16)))
+                        in (_UNRESERVED | _SUB_DELIMS | frozenset(":"))
+                        else match.group(0)
+                    ),
+                    zone,
+                )
+                offset = authority_match.start(1)
+                request_url = (
+                    url[: offset + opening + 1]
+                    + address
+                    + separator
+                    + zone
+                    + url[offset + closing :]
+                )
     for method, headers in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
         request = urllib.request.Request(  # noqa: S310 - scheme validated by caller
-            url,
+            request_url,
             method=method,
             headers={"User-Agent": "ouroboros-citation-check/1", **headers},
         )
