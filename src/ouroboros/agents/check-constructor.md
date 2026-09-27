@@ -43,6 +43,10 @@ When a criterion's behavior cannot be written as calls and expected outcomes (fo
 
 Criteria are numbered from 1 in the order given. A criterion you cannot check by executing code (for example "the code is readable", or "the README documents X") goes into `uncovered` with a one-line reason; it is reported as unverified, never as passed. Never invent a criterion and never drop one silently: every criterion number appears in an oracle, a script check's assertions, or `uncovered`.
 
+## Labels
+
+Label every criterion you were asked about in `labels`, one entry each: `{"criterion": <number>, "kind": "...", "evidence_span": "..."}`. `kind` is `behavior` when the criterion states something observable about the program (an input or invocation, an output or return value, a raised error, or a file or repository state), `implementation_preference` when it states how the code should be written or organized (style, structure, readability, a library to use), and `context` when it states background or a fact about people, the environment, or the process (for example who reported the issue, or that someone will help). `evidence_span` is a short phrase copied character for character from the goal, the constraints, or the criteria above that supports the label. Label a criterion `behavior` whenever you are unsure. A criterion labeled other than `behavior` gets no check: list it in `uncovered` with the reason `non_behavioral`.
+
 ## Output
 
 Answer with exactly one JSON object and nothing else (a ```json fence around it is accepted):
@@ -68,7 +72,11 @@ Answer with exactly one JSON object and nothing else (a ```json fence around it 
   "checks": [],
   "files": [],
   "uncovered": [
-    {"criterion": 2, "reason": "not executable"}
+    {"criterion": 2, "reason": "non_behavioral"}
+  ],
+  "labels": [
+    {"criterion": 1, "kind": "behavior", "evidence_span": "clamp(15, 0, 10) returns 10"},
+    {"criterion": 2, "kind": "implementation_preference", "evidence_span": "the code is readable"}
   ]
 }
 ```

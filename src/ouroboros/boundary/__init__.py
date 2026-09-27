@@ -28,12 +28,13 @@ admission), and the candidate runs through the recorded bindings
 (``verify_with_bindings``); ``criterion_verdicts`` and ``artifact_verdict``
 decide.
 
-Per-check admission and the behavioral filter (``boundary/per_check.py``,
+Per-check admission and criterion labels (``boundary/per_check.py``,
 ``boundary/behavioral.py``): ``per_check_admission`` applies the A29 rule to
 a recorded admission (or ``admit_check_package(...,
 exclude_checks_individually=True)``); ``criteria_without_admitted_check``
-names the criteria that lose their authority; ``non_behavioral_criteria`` and
-``behavioral_evidence`` apply the pre-registered behavioral rule.
+names the criteria that lose their authority; ``criterion_labels`` validates
+the constructor's per-criterion kind labels and ``non_behavioral_criteria``
+reads them from a package or a reply.
 """
 
 from ouroboros.boundary.acceptance import (
@@ -61,12 +62,13 @@ from ouroboros.boundary.admission import (
 )
 from ouroboros.boundary.admission_rules import script_rule_violations, unsafe_checks
 from ouroboros.boundary.behavioral import (
-    BEHAVIORAL_RULE,
     NON_BEHAVIORAL,
-    behavioral_evidence,
-    criterion_evidence,
-    is_behavioral,
+    CriterionKind,
+    CriterionLabel,
+    criterion_labels,
+    label_summary,
     non_behavioral_criteria,
+    non_behavioral_keys,
 )
 from ouroboros.boundary.binding import (
     BINDING_GRAMMAR,
@@ -157,16 +159,17 @@ from ouroboros.boundary.selection import (
 from ouroboros.boundary.tree import tree_digest, tree_manifest
 
 __all__ = [
-    "BEHAVIORAL_RULE",
     "NON_BEHAVIORAL",
+    "CriterionKind",
+    "CriterionLabel",
+    "criterion_labels",
+    "label_summary",
+    "non_behavioral_keys",
     "NO_ADMITTED_REPRODUCTION_CHECK",
     "PRESERVATION_FAILS_ON_BASE",
     "REPRO_PASSES_ON_BASE",
-    "behavioral_evidence",
     "criteria_without_admitted_check",
-    "criterion_evidence",
     "excluded_check_ids",
-    "is_behavioral",
     "non_behavioral_criteria",
     "per_check_admission",
     "ADMISSION_TIMEOUT_SECONDS",

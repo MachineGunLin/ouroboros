@@ -105,7 +105,9 @@ def reference_check_meta(state: BoundaryRunState | None) -> dict[str, str]:
 def coverage_meta(state: BoundaryRunState | None) -> dict[str, str]:
     """Bucketed pre-dispatch coverage counts, when this process built the package (else empty).
 
-    ``non_behavioral_count``: criteria the behavioral filter gave no check;
+    ``non_behavioral_count``: criteria the constructor labeled other than
+    behavior (no check); ``label_parse_failure_count``: criteria whose label
+    was missing or invalid (treated as behavior);
     ``excluded_check_count``: checks per-check admission excluded, over every
     version; ``replacement_call_count``: replacement constructor calls (0 or 1).
     """
@@ -113,6 +115,7 @@ def coverage_meta(state: BoundaryRunState | None) -> dict[str, str]:
         return {}
     return {
         "non_behavioral_count": _count_bucket(len(state.non_behavioral)),
+        "label_parse_failure_count": _count_bucket(len(state.label_parse_failures)),
         "excluded_check_count": _count_bucket(len(state.exclusions)),
         "replacement_call_count": _count_bucket(state.replacement_calls),
     }

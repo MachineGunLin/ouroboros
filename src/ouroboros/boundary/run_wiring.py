@@ -50,7 +50,6 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-import inspect
 import json
 import os
 from pathlib import Path
@@ -73,7 +72,7 @@ from ouroboros.boundary.admission import (
     admit_check_package,
     write_receipt,
 )
-from ouroboros.boundary.behavioral import BEHAVIORAL_RULE, NON_BEHAVIORAL, non_behavioral_criteria
+from ouroboros.boundary.behavioral import NON_BEHAVIORAL, CriterionLabel, non_behavioral_keys
 from ouroboros.boundary.binding import CheckTier, TierAssignment
 from ouroboros.boundary.binding_flow import (
     BoundVerification,
@@ -101,7 +100,6 @@ from ouroboros.boundary.ledger import BoundaryLedger
 from ouroboros.boundary.oracle import apply_reveals, first_failing_heldout, repair_lines
 from ouroboros.boundary.package import (
     CheckPackage,
-    canonical_json_bytes,
     commit_package,
     new_commitment_salt,
     private_directory,
@@ -135,7 +133,6 @@ if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
     from ouroboros.persistence.event_store import EventStore
 
-ALL_CRITERIA_NON_BEHAVIORAL = "all_criteria_non_behavioral"
 REPLACEMENT_REASON = "replacement_checks"
 _FEEDBACK_TAIL_CHARS = 400
 _COUNTEREXAMPLE_TAIL_CHARS = 1500
@@ -269,7 +266,9 @@ class BoundaryRunState:
     reference_check: ReferenceCheck | None = None
     """What the reference check excluded from the bound version (``None``: not run)."""
     non_behavioral: tuple[str, ...] = ()
-    """Criterion keys the behavioral filter left without a check (``behavioral.py``)."""
+    """Criterion keys the constructor labeled other than ``behavior`` (``behavioral.py``)."""
+    label_parse_failures: tuple[str, ...] = ()
+    """Criterion keys whose label was missing or invalid (treated as ``behavior``)."""
     exclusions: tuple[tuple[str, str, str], ...] = ()
     """``(boundary_id, check_id, reason)`` for every check excluded by per-check admission."""
     replacement_calls: int = 0
@@ -347,15 +346,6 @@ def _admission_feedback(admission: AdmissionResult) -> list[str]:
                 f"exit {check.return_code}; output tail: {tail!r}"
             )
     return feedback
-
-
-async def _construct(
-    constructor: CheckConstructor, seed: Seed, base: Path, feedback: list[str], skip: frozenset[int]
-) -> Any:
-    """``constructor.construct``, telling it which criteria get no check when it can listen."""
-    if skip and "skip_criteria" in inspect.signature(constructor.construct).parameters:
-        return await constructor.construct(seed, base, feedback=feedback, skip_criteria=skip)
-    return await constructor.construct(seed, base, feedback=feedback)
 
 
 @dataclass
@@ -450,7 +440,8 @@ async def prepare_check_package(
 ) -> BoundaryRunState:
     """Construct, freeze, and admit a package, then record the actor start.
 
-    Non-behavioral criteria (``boundary/behavioral.py``) get no check. Each
+    Criteria the constructor labels non-behavioral in its reply
+    (``boundary/behavioral.py``) get no check. Each
     version is admitted per check (``boundary/per_check.py``). With the
     product policy, the behavioral criteria an admitted version leaves
     without an admitted check get one replacement call before the worker
@@ -477,34 +468,22 @@ async def prepare_check_package(
     interpreter = resolve_check_interpreter(base)
     sealer = _Sealer(ledger, seed, base, store, settings, interpreter)
     reference_check: ReferenceCheck | None = None
-    skip_indices = non_behavioral_criteria(seed)
-    non_behavioral = tuple(keys[index] for index in skip_indices)
-    skip = frozenset(index + 1 for index in skip_indices)
-    attempts = 0 if keys and len(non_behavioral) == len(keys) else settings.attempts
+    labels: dict[str, CriterionLabel] = {}
+    non_behavioral: tuple[str, ...] = ()
 
-    if not attempts:
-        # Nothing names an observable behavior: no construction, no package;
-        # the legacy verifier decides the run.
-        failure_reason = ALL_CRITERIA_NON_BEHAVIORAL
-        await ledger.record_construction_failed(
-            f"{execution_id}/check_package/v1",
-            seed_digest=digest,
-            input_digest=sha256_bytes(
-                canonical_json_bytes({"seed_digest": digest, "rule": BEHAVIORAL_RULE})
-            ),
-            reason=failure_reason,
-        )
-        versions.append(f"{execution_id}/check_package/v1")
-
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, settings.attempts + 1):
         boundary_id = f"{execution_id}/check_package/v{attempt}"
         persist = getattr(constructor, "persist_partials_to", None)
         if persist is not None:
             # Each criterion's oracle is kept as soon as it is produced.
             persist(store / "partial" / f"v{attempt}")
-        outcome = await _construct(constructor, seed, base, feedback, skip)
+        outcome = await constructor.construct(seed, base, feedback=feedback)
         package, admission, package_path = outcome.package, None, None
         references = getattr(outcome, "references", None)
+        # The constructor labels each criterion in the same reply; a criterion
+        # labeled other than ``behavior`` gets no check (``behavioral.py``).
+        labels = dict(getattr(outcome, "labels", None) or {})
+        non_behavioral = non_behavioral_keys(labels)
         if package is not None and non_behavioral:
             package = strip_criteria(package, seed, dict.fromkeys(non_behavioral, NON_BEHAVIORAL))
             if not package.checks:
@@ -619,6 +598,9 @@ async def prepare_check_package(
         reference_check=reference_check,
         commitments=tuple(sealer.commitments),
         non_behavioral=non_behavioral,
+        label_parse_failures=tuple(
+            key for key, label in labels.items() if label.parse_failure is not None
+        ),
         exclusions=tuple(sealer.exclusions),
         replacement_calls=replacement.calls,
         replacement_outcome=replacement.outcome,
@@ -1019,8 +1001,13 @@ def render_preparation(state: BoundaryRunState) -> list[str]:
         lines.append(f"Superseded versions: {', '.join(superseded)}")
     if state.non_behavioral:
         lines.append(
-            f"Non-behavioral criteria (no check; the legacy verifier decides them): "
-            f"{len(state.non_behavioral)} of {len(state.criterion_keys)}"
+            f"Non-behavioral criteria (labeled by the constructor; no check; the legacy "
+            f"verifier decides them): {len(state.non_behavioral)} of {len(state.criterion_keys)}"
+        )
+    if state.label_parse_failures:
+        lines.append(
+            f"Criterion labels missing or invalid (treated as behavior): "
+            f"{len(state.label_parse_failures)}"
         )
     if state.exclusions:
         lines.append(

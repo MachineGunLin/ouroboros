@@ -38,7 +38,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ouroboros.boundary.behavioral import NON_BEHAVIORAL
+from ouroboros.boundary.behavioral import CriterionLabel, criterion_labels
 from ouroboros.boundary.constructor_session import disable_session_persistence
 from ouroboros.boundary.incremental import construct_pieces, merge_pieces, restrict_reply
 from ouroboros.boundary.oracle import is_oracle_file
@@ -88,6 +88,10 @@ class ConstructionOutcome:
     constructor always sets it, and an oracle without a usable reference is
     then uncovered (``reference_unavailable``).
     """
+    labels: Mapping[str, CriterionLabel] | None = None
+    """Each criterion's kind label from the same reply (``behavioral.py``);
+    ``None`` when this constructor writes no labels (callers that assemble
+    packages themselves)."""
 
 
 def load_constructor_system_prompt() -> str:
@@ -112,17 +116,12 @@ def _criterion_lines(seed: Seed) -> list[str]:
 
 
 def build_constructor_prompt(
-    seed: Seed,
-    feedback: Sequence[str] = (),
-    *,
-    criterion: int | None = None,
-    skip: Collection[int] = (),
+    seed: Seed, feedback: Sequence[str] = (), *, criterion: int | None = None
 ) -> str:
     """Render the user message: goal, constraints, numbered criteria, feedback.
 
     With ``criterion`` (1-based) the message asks for that criterion only;
-    the other criteria are shown for context. ``skip`` (1-based numbers)
-    names criteria that get no check (non-behavioral, ``boundary/behavioral.py``).
+    the other criteria are shown for context.
     """
     parts = [
         "Repository: the current working directory (read-only copy of the base).",
@@ -144,13 +143,6 @@ def build_constructor_prompt(
             f"Write the oracle (or script check, or uncovered entry) for criterion {criterion} "
             "only; the other criteria are context. Use check ids that start with "
             f"`c{criterion}_`.",
-        ]
-    if skip:
-        numbers = ", ".join(str(number) for number in sorted(skip))
-        parts += [
-            "",
-            f"Criteria {numbers} name no observable behavior: write no check for them and "
-            f'list each under "uncovered" with reason "{NON_BEHAVIORAL}".',
         ]
     parts += ["", "Reply with the JSON object only."]
     return "\n".join(parts)
@@ -369,7 +361,13 @@ RuntimeFactory = Callable[..., Any]
 
 def _restricted(reply: Mapping[str, Any], numbers: Collection[int]) -> dict[str, Any]:
     """The part of ``reply`` that concerns the 1-based criteria ``numbers``."""
-    merged: dict[str, list[Any]] = {"oracles": [], "checks": [], "files": [], "uncovered": []}
+    merged: dict[str, list[Any]] = {
+        "oracles": [],
+        "checks": [],
+        "files": [],
+        "uncovered": [],
+        "labels": [],
+    }
     for number in sorted(numbers):
         part = restrict_reply(reply, number)
         for key in merged:
@@ -470,22 +468,18 @@ class CheckConstructor:
         base_checkout: Path,
         *,
         feedback: Sequence[str] = (),
-        skip_criteria: Collection[int] = (),
     ) -> ConstructionOutcome:
         """Run one attempt and return a package or a typed failure reason.
 
         By default (``per_criterion``) the attempt is incremental: one call
         per criterion under one shared deadline, each reply kept as produced
-        (``boundary/incremental.py``). ``skip_criteria`` (1-based numbers)
-        get no call and no check: they are uncovered with reason
-        ``non_behavioral``.
+        (``boundary/incremental.py``). The outcome carries each criterion's
+        kind label from the same reply(s) (``labels``).
         """
         if self._per_criterion:
-            return await self._construct_incremental(
-                seed, base_checkout, feedback=feedback, skip=frozenset(skip_criteria)
-            )
+            return await self._construct_incremental(seed, base_checkout, feedback=feedback)
         return await self._construct_single(
-            seed, base_checkout, build_constructor_prompt(seed, feedback, skip=skip_criteria)
+            seed, base_checkout, build_constructor_prompt(seed, feedback)
         )
 
     async def construct_replacements(
@@ -598,6 +592,7 @@ class CheckConstructor:
             generator,
             reply_sha,
             references=references_from_reply(parsed),
+            labels=criterion_labels(parsed, seed),
         )
 
     async def _construct_incremental(
@@ -606,7 +601,6 @@ class CheckConstructor:
         base_checkout: Path,
         *,
         feedback: Sequence[str] = (),
-        skip: frozenset[int] = frozenset(),
     ) -> ConstructionOutcome:
         system_prompt = self._system_prompt or load_constructor_system_prompt()
         base = base_checkout.resolve()
@@ -648,13 +642,6 @@ class CheckConstructor:
                 partial_dir=self._partial_dir,
                 concurrency=self._concurrency,
                 tools=CONSTRUCTOR_TOOLS,
-                numbers=[
-                    number
-                    for number in range(1, len(seed.acceptance_criteria) + 1)
-                    if number not in skip
-                ]
-                if skip
-                else None,
             )
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -677,9 +664,6 @@ class CheckConstructor:
             first = next(piece for piece in pieces if piece.status != "ok")
             return failed(first.reason or "constructor_failed")
         merged, _missing = merge_pieces(pieces)
-        merged["uncovered"].extend(
-            {"criterion": number, "reason": NON_BEHAVIORAL} for number in sorted(skip)
-        )
         try:
             package = package_from_reply(
                 merged,
@@ -703,4 +687,5 @@ class CheckConstructor:
             generator,
             reply_sha,
             references=references_from_reply(merged),
+            labels=criterion_labels(merged, seed),
         )

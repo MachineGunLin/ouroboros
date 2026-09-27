@@ -1,4 +1,4 @@
-"""A29 per-check admission, the behavioral rule, coverage buckets: the library API.
+"""A29 per-check admission, criterion labels, coverage buckets: the library API.
 
 These are the functions the study harness can call directly (one seal per
 boundary): ``per_check_admission`` on a recorded admission, then the usual
@@ -22,7 +22,11 @@ from ouroboros.boundary.acceptance import (
     verification_coverage,
 )
 from ouroboros.boundary.admission import PackageVerdict, admit_check_package
-from ouroboros.boundary.behavioral import behavioral_evidence
+from ouroboros.boundary.behavioral import (
+    CriterionKind,
+    criterion_labels,
+    non_behavioral_criteria,
+)
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.binding_flow import admission_tiers, assign_tiers, verify_with_bindings
 from ouroboros.boundary.constructor import package_from_reply
@@ -174,31 +178,82 @@ async def test_an_admission_without_exclusions_keeps_its_bytes(repo: Path) -> No
     assert "excluded_checks" not in admission.event_summary()
 
 
+DJANGO_UNDER = (
+    "When models use custom fields and mixins, generated migration files include the imports "
+    "needed to resolve referenced names and do not raise a NameError for undefined names."
+)
+WILLING = "The user is willing to assist with debugging the issue."
+
+
+def _dev_seed() -> Seed:
+    return _seed(DJANGO_UNDER, WILLING)
+
+
+def test_valid_labels_mark_only_non_behavior_as_non_behavioral() -> None:
+    seed = _dev_seed()
+    reply = {
+        "labels": [
+            {"criterion": 1, "kind": "behavior", "evidence_span": "do not raise a NameError"},
+            {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
+        ]
+    }
+    labels = criterion_labels(reply, seed)
+    assert [(label.kind, label.parse_failure) for label in labels.values()] == [
+        (CriterionKind.BEHAVIOR, None),
+        (CriterionKind.CONTEXT, None),
+    ]
+    assert non_behavioral_criteria(reply, seed) == (1,)
+
+
 @pytest.mark.parametrize(
-    ("text", "evidence"),
+    ("entry", "failure"),
     [
-        ("The user is willing to assist with debugging the issue.", None),
-        ("The code is easy to maintain.", None),
-        ("the helpers are documented in the README", None),
+        (None, "missing"),
+        ({"criterion": 2, "kind": "opinion", "evidence_span": "willing to assist"}, "invalid_kind"),
+        ({"criterion": 2, "kind": "context"}, "missing_evidence_span"),
         (
-            "When models use custom fields and mixins, generated migration files include the "
-            "imports needed to resolve referenced names and do not raise a NameError for "
-            "undefined names.",
-            "error_name",
+            {"criterion": 2, "kind": "context", "evidence_span": "not in the seed"},
+            "evidence_span_not_in_seed",
         ),
         (
-            "When the generated migration references `models.Model` in `bases`, it binds "
-            "`models` so importing the migration does not raise a `NameError`.",
-            "code_span",
+            {"criterion": 2, "kind": "context", "evidence_span": "WILLING TO ASSIST"},
+            "evidence_span_not_in_seed",
         ),
-        ("clamp(15, 0, 10) returns 10", "call"),
-        ("Update django/db/migrations/serializer.py accordingly", "path"),
-        ("interpolating 0 and 10 at 0.5 gives 5", "verb"),
-        ("Keep things consistent and/or simple.", None),
     ],
 )
-def test_the_behavioral_rule_on_examples(text: str, evidence: str | None) -> None:
-    assert behavioral_evidence(text) == evidence
+def test_a_missing_or_invalid_label_is_a_parse_failure_treated_as_behavior(
+    entry: dict[str, Any] | None, failure: str
+) -> None:
+    seed = _dev_seed()
+    first = {"criterion": 1, "kind": "behavior", "evidence_span": "NameError"}
+    labels = criterion_labels({"labels": [first, *([entry] if entry else [])]}, seed)
+    second = list(labels.values())[1]
+    assert second.kind is CriterionKind.BEHAVIOR and second.parse_failure == failure
+    assert non_behavioral_criteria({"labels": [first, *([entry] if entry else [])]}, seed) == ()
+
+
+def test_duplicate_labels_and_a_reply_without_labels_are_parse_failures() -> None:
+    seed = _dev_seed()
+    twice = {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"}
+    labels = criterion_labels({"labels": [twice, twice]}, seed)
+    assert list(labels.values())[1].parse_failure == "duplicate"
+    assert all(label.parse_failure == "missing" for label in criterion_labels({}, seed).values())
+
+
+def test_non_behavioral_criteria_reads_a_package() -> None:
+    seed = _dev_seed()
+    package = package_from_reply(
+        {
+            "uncovered": [
+                {"criterion": 1, "reason": "x"},
+                {"criterion": 2, "reason": "non_behavioral"},
+            ]
+        },
+        seed,
+        input_digest="1" * 64,
+        generator="fake",
+    )
+    assert non_behavioral_criteria(package) == (1,)
 
 
 @pytest.mark.parametrize(

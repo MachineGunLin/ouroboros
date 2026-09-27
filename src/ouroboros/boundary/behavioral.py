@@ -1,145 +1,157 @@
-"""Behavioral filter: which acceptance criteria a check package can decide.
+"""Criterion kind: a model label from the check constructor's reply, validated structurally.
 
 Seed acceptance criteria are the user's contract, so none is ever removed.
-A criterion that names nothing a check could observe (for example "The user
-is willing to assist with debugging the issue.") gets no check construction:
-it is uncovered with reason ``non_behavioral``, it is never counted as
-unverified, and the existing (legacy) verifier decides it.
+The constructor already decides, per criterion, whether it can write an
+executable check; in the same reply (no extra model call) it labels each
+criterion under ``labels``:
 
-Pre-registered rule (``BEHAVIORAL_RULE``, fixed; a change is a new version).
-A criterion is behavioral when its description, or its declared
-``verify_command`` / ``output_assertion``, names an observable input or
-invocation, output or return value, raised error, or file or repository
-state, tested by any one of:
+    {"criterion": <1-based number>, "kind": "behavior" | "implementation_preference"
+     | "context", "evidence_span": "<verbatim text from the Seed>"}
 
-1. ``code_span``: a backquoted span (```name```);
-2. ``call``: a call expression, an identifier (dotted allowed) immediately
-   followed by a parenthesized argument list, for example ``clamp(5, 0, 3)``;
-3. ``path``: a file name with a common source, data or document extension,
-   or a path with at least two ``/`` separators;
-4. ``error_name``: a CamelCase name ending in ``Error``, ``Exception`` or
-   ``Warning``;
-5. ``verb``: a word (any inflection listed in ``OBSERVABLE_VERBS``, case
-   insensitive, whole words only) from the fixed list raise, throw, return,
-   output, print, emit, display, exit, fail, pass, reject, accept, import,
-   generate, write, create, delete, save, call, invoke, give, yield, produce,
-   equal, compute, calculate, convert, parse, render, respond;
-6. ``declared_command``: the criterion declares a ``verify_command`` or an
-   ``output_assertion``.
+A criterion labeled anything other than ``behavior`` is non-behavioral: it
+gets no check (any check the reply linked to it is removed), it is uncovered
+with reason ``non_behavioral``, it is never counted as unverified, and the
+existing (legacy) verifier decides it.
 
-Otherwise it is non-behavioral. The rule reads only the Seed text; it runs
-no model and nothing in the repository.
+Validation is structural only: ``kind`` must be one of the three values and
+``evidence_span`` a non-empty verbatim substring of the Seed text (goal,
+constraints and criterion descriptions; plain containment). A missing or
+invalid label is a parse failure (``CriterionLabel.parse_failure``) and is
+treated as ``behavior``, which keeps the check path. No rule here reads the
+criterion's wording.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-import re
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ouroboros.boundary.package import CheckPackage
     from ouroboros.core.seed import Seed
 
 NON_BEHAVIORAL = "non_behavioral"
-BEHAVIORAL_RULE = "ouroboros.behavioral_rule.v1"
-
-OBSERVABLE_VERBS: Mapping[str, tuple[str, ...]] = {
-    "raise": ("raise", "raises", "raised", "raising"),
-    "throw": ("throw", "throws", "threw", "thrown", "throwing"),
-    "return": ("return", "returns", "returned", "returning"),
-    "output": ("output", "outputs", "outputted", "outputting"),
-    "print": ("print", "prints", "printed", "printing"),
-    "emit": ("emit", "emits", "emitted", "emitting"),
-    "display": ("display", "displays", "displayed", "displaying"),
-    "exit": ("exit", "exits", "exited", "exiting"),
-    "fail": ("fail", "fails", "failed", "failing"),
-    "pass": ("pass", "passes", "passed", "passing"),
-    "reject": ("reject", "rejects", "rejected", "rejecting"),
-    "accept": ("accept", "accepts", "accepted", "accepting"),
-    "import": ("import", "imports", "imported", "importing"),
-    "generate": ("generate", "generates", "generated", "generating"),
-    "write": ("write", "writes", "wrote", "written", "writing"),
-    "create": ("create", "creates", "created", "creating"),
-    "delete": ("delete", "deletes", "deleted", "deleting"),
-    "save": ("save", "saves", "saved", "saving"),
-    "call": ("call", "calls", "called", "calling"),
-    "invoke": ("invoke", "invokes", "invoked", "invoking"),
-    "give": ("give", "gives", "gave", "given", "giving"),
-    "yield": ("yield", "yields", "yielded", "yielding"),
-    "produce": ("produce", "produces", "produced", "producing"),
-    "equal": ("equal", "equals", "equaled", "equalled", "equaling", "equalling"),
-    "compute": ("compute", "computes", "computed", "computing"),
-    "calculate": ("calculate", "calculates", "calculated", "calculating"),
-    "convert": ("convert", "converts", "converted", "converting"),
-    "parse": ("parse", "parses", "parsed", "parsing"),
-    "render": ("render", "renders", "rendered", "rendering"),
-    "respond": ("respond", "responds", "responded", "responding"),
-}
-
-_EXTENSIONS = (
-    "py|pyi|js|jsx|ts|tsx|json|yaml|yml|toml|ini|cfg|conf|txt|md|rst|csv|html|htm|css"
-    "|sh|rs|go|java|kt|c|h|cc|cpp|hpp|rb|php|sql|xml|lock|env"
-)
-_TESTS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("code_span", re.compile(r"`[^`\n]+`")),
-    ("call", re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\([^()\n]*\)")),
-    (
-        "path",
-        re.compile(
-            rf"(?:\b[\w-]+(?:/[\w.-]+)*\.(?:{_EXTENSIONS})\b)|(?:[\w.-]*/[\w.-]+/[\w./-]*)",
-            re.IGNORECASE,
-        ),
-    ),
-    ("error_name", re.compile(r"\b[A-Z][A-Za-z0-9]*(?:Error|Exception|Warning)\b")),
-    (
-        "verb",
-        re.compile(
-            r"\b(?:"
-            + "|".join(sorted({form for forms in OBSERVABLE_VERBS.values() for form in forms}))
-            + r")\b",
-            re.IGNORECASE,
-        ),
-    ),
-)
+LABEL_SCHEMA = "ouroboros.criterion_label.v1"
 
 
-def behavioral_evidence(text: str) -> str | None:
-    """The first rule test ``text`` meets (``code_span``, ``call``, ...), or ``None``."""
-    for name, pattern in _TESTS:
-        if pattern.search(text or ""):
-            return name
-    return None
+class CriterionKind(StrEnum):
+    BEHAVIOR = "behavior"
+    IMPLEMENTATION_PREFERENCE = "implementation_preference"
+    CONTEXT = "context"
 
 
-def is_behavioral(text: str) -> bool:
-    """Whether ``text`` names an observable (see the module docstring)."""
-    return behavioral_evidence(text) is not None
+@dataclass(frozen=True, slots=True)
+class CriterionLabel:
+    """The constructor's label for one criterion, after structural validation."""
+
+    kind: CriterionKind
+    evidence_span: str | None = None
+    parse_failure: str | None = None
+    """Why the label was not usable (``missing``, ``invalid_kind``, ...); ``kind`` is then behavior."""
+
+    @property
+    def behavioral(self) -> bool:
+        return self.kind is CriterionKind.BEHAVIOR
 
 
-def criterion_evidence(criterion: object) -> str | None:
-    """``behavioral_evidence`` for one Seed criterion (a string or a spec)."""
-    if getattr(criterion, "verify_command", None) or getattr(criterion, "output_assertion", None):
-        return "declared_command"
-    description = getattr(criterion, "description", None)
-    text = description if isinstance(description, str) else str(criterion)
-    return behavioral_evidence(text)
+def _seed_text(seed: Seed) -> str:
+    from ouroboros.boundary.oracle import worker_visible_seed_text
+
+    return worker_visible_seed_text(seed)
 
 
-def non_behavioral_criteria(seed: Seed) -> tuple[int, ...]:
-    """0-based indices of the Seed's criteria that the rule finds non-behavioral."""
-    return tuple(
-        index
-        for index, criterion in enumerate(seed.acceptance_criteria)
-        if criterion_evidence(criterion) is None
-    )
+def _failure(reason: str) -> CriterionLabel:
+    return CriterionLabel(CriterionKind.BEHAVIOR, None, reason)
+
+
+def _label(raw: Any, seed_text: str) -> CriterionLabel:
+    if not isinstance(raw, Mapping):
+        return _failure("not_an_object")
+    try:
+        kind = CriterionKind(raw.get("kind"))
+    except ValueError:
+        return _failure("invalid_kind")
+    span = raw.get("evidence_span")
+    if not isinstance(span, str) or not span.strip():
+        return _failure("missing_evidence_span")
+    if span not in seed_text:
+        return _failure("evidence_span_not_in_seed")
+    return CriterionLabel(kind, span)
+
+
+def criterion_labels(reply: Mapping[str, Any] | None, seed: Seed) -> dict[str, CriterionLabel]:
+    """Every Seed criterion's label from a constructor reply (criterion key to label).
+
+    A criterion with no label, more than one label, or an invalid one gets a
+    parse failure and counts as ``behavior``.
+    """
+    from ouroboros.boundary.package import seed_criterion_keys
+
+    keys = seed_criterion_keys(seed)
+    text = _seed_text(seed)
+    raw_labels = reply.get("labels") if isinstance(reply, Mapping) else None
+    by_number: dict[int, list[Any]] = {}
+    if isinstance(raw_labels, Sequence) and not isinstance(raw_labels, str):
+        for raw in raw_labels:
+            number = raw.get("criterion") if isinstance(raw, Mapping) else None
+            if isinstance(number, int) and not isinstance(number, bool):
+                by_number.setdefault(number, []).append(raw)
+    labels: dict[str, CriterionLabel] = {}
+    for number, key in enumerate(keys, start=1):
+        entries = by_number.get(number, [])
+        if not entries:
+            labels[key] = _failure("missing")
+        elif len(entries) > 1:
+            labels[key] = _failure("duplicate")
+        else:
+            labels[key] = _label(entries[0], text)
+    return labels
+
+
+def non_behavioral_keys(labels: Mapping[str, CriterionLabel] | None) -> tuple[str, ...]:
+    """Criterion keys whose valid label is not ``behavior``, in label order."""
+    return tuple(key for key, label in (labels or {}).items() if not label.behavioral)
+
+
+def non_behavioral_criteria(
+    source: CheckPackage | Mapping[str, Any], seed: Seed | None = None
+) -> tuple[int, ...]:
+    """0-based indices of the non-behavioral criteria.
+
+    ``source`` is a package (criteria uncovered with reason ``non_behavioral``)
+    or a constructor reply together with its ``seed`` (the reply's labels).
+    """
+    from ouroboros.boundary.package import CheckPackage, seed_criterion_keys
+
+    if isinstance(source, CheckPackage):
+        marked = {item.criterion_key for item in source.uncovered if item.reason == NON_BEHAVIORAL}
+        return tuple(i for i, key in enumerate(source.criterion_keys) if key in marked)
+    if seed is None:
+        raise ValueError("a constructor reply needs its seed")
+    keys = seed_criterion_keys(seed)
+    marked = set(non_behavioral_keys(criterion_labels(source, seed)))
+    return tuple(i for i, key in enumerate(keys) if key in marked)
+
+
+def label_summary(labels: Mapping[str, CriterionLabel] | None) -> dict[str, int]:
+    """Counts by kind and parse failures (journal- and telemetry-safe)."""
+    counts = {kind.value: 0 for kind in CriterionKind}
+    failures = 0
+    for label in (labels or {}).values():
+        counts[label.kind.value] += 1
+        failures += label.parse_failure is not None
+    return {**counts, "parse_failures": failures}
 
 
 __all__ = [
-    "BEHAVIORAL_RULE",
+    "LABEL_SCHEMA",
     "NON_BEHAVIORAL",
-    "OBSERVABLE_VERBS",
-    "behavioral_evidence",
-    "criterion_evidence",
-    "is_behavioral",
+    "CriterionKind",
+    "CriterionLabel",
+    "criterion_labels",
+    "label_summary",
     "non_behavioral_criteria",
+    "non_behavioral_keys",
 ]

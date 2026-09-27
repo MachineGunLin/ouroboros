@@ -725,6 +725,7 @@ async def test_cli_flag_on_admits_before_dispatch_and_verifies_after(
         # The legacy double gives no verifier verdict: neither verifier has
         # evidence, so the criterion stays unverified and coverage is low.
         "non_behavioral_count": "0",
+        "label_parse_failure_count": "0",
         "excluded_check_count": "0",
         "replacement_call_count": "0",
         "verification_coverage": "low",

@@ -18,6 +18,7 @@ from ouroboros.boundary.authority import (
     existing_outcomes_from_results,
     legacy_verdict_in_tree,
 )
+from ouroboros.boundary.behavioral import criterion_labels
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import ConstructionOutcome, package_from_reply
 from ouroboros.boundary.package import seed_criterion_keys, verify_commitment
@@ -103,7 +104,12 @@ REPLY = {
             ],
         },
     ],
-    "uncovered": [{"criterion": 3, "reason": "not executable"}],
+    "uncovered": [{"criterion": 3, "reason": "non_behavioral"}],
+    "labels": [
+        {"criterion": 1, "kind": "behavior", "evidence_span": "clamp(15, 0, 10) returns 10"},
+        {"criterion": 2, "kind": "behavior", "evidence_span": "gives 5"},
+        {"criterion": 3, "kind": "implementation_preference", "evidence_span": "documented"},
+    ],
 }
 
 
@@ -112,7 +118,9 @@ class _Constructor:
         package = package_from_reply(
             REPLY, seed, input_digest="1" * 64, generator="fake", base_checkout=base
         )
-        self.outcome = ConstructionOutcome(package, None, "1" * 64, "fake")
+        self.outcome = ConstructionOutcome(
+            package, None, "1" * 64, "fake", labels=criterion_labels(REPLY, seed)
+        )
 
     async def construct(self, seed: Seed, base: Path, *, feedback=()) -> ConstructionOutcome:
         return self.outcome

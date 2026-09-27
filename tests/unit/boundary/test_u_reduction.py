@@ -13,13 +13,13 @@ from ouroboros.boundary.acceptance import (
 )
 from ouroboros.boundary.behavioral import (
     NON_BEHAVIORAL,
+    criterion_labels,
     non_behavioral_criteria,
 )
 from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.constructor import (
     CheckConstructor,
     ConstructionOutcome,
-    build_constructor_prompt,
     package_from_reply,
 )
 from ouroboros.boundary.coverage import why_excluded
@@ -123,10 +123,12 @@ class _Constructor:
         package = package_from_reply(
             reply, self.seed, input_digest="1" * 64, generator="fake", base_checkout=self.base
         )
-        return ConstructionOutcome(package, None, "1" * 64, "fake")
+        return ConstructionOutcome(
+            package, None, "1" * 64, "fake", labels=criterion_labels(reply, self.seed)
+        )
 
-    async def construct(self, seed: Seed, base: Path, *, feedback=(), skip_criteria=()):
-        self.construct_calls.append({"feedback": list(feedback), "skip": set(skip_criteria)})
+    async def construct(self, seed: Seed, base: Path, *, feedback=()):
+        self.construct_calls.append({"feedback": list(feedback)})
         return self._outcome(self.reply)
 
     async def construct_replacements(self, seed: Seed, base: Path, *, targets):
@@ -419,39 +421,71 @@ async def test_the_replacement_call_is_one_single_call_for_the_targets_only(
 # Behavioral filter
 
 
-async def test_a_non_behavioral_criterion_gets_no_check_and_no_call(
+WILLING = "The user is willing to assist with debugging the issue."
+
+
+async def test_a_criterion_labeled_non_behavioral_gets_no_check(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
-    seed = _seed(
-        "clamp(15, 0, 10) returns 10", "The user is willing to assist with debugging the issue."
-    )
-    assert non_behavioral_criteria(seed) == (1,)
-    # The constructor wrote a check for the prose criterion anyway: it is removed.
+    """The label comes from the constructor's own reply; no extra model call."""
+    seed = _seed("clamp(15, 0, 10) returns 10", WILLING)
+    # The constructor wrote a check for the context criterion anyway: it is removed.
     stray = _oracle(2, "oracle_2", "preservation", (-5, 0, 10), 0)
-    constructor = _Constructor(seed, repo, {"oracles": [GOOD_REPRO_1, stray]})
+    reply = {
+        "oracles": [GOOD_REPRO_1, stray],
+        "labels": [
+            {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
+            {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
+        ],
+    }
+    constructor = _Constructor(seed, repo, reply)
     state = await _prepare(store, repo, tmp_path, constructor, seed)
-    assert constructor.construct_calls[0]["skip"] == {2}
+    assert len(constructor.construct_calls) == 1  # the only model call
     keys = seed_criterion_keys(seed)
-    assert state.non_behavioral == (keys[1],)
+    assert state.non_behavioral == (keys[1],) and state.label_parse_failures == ()
     assert [check.check_id for check in state.package.checks] == ["oracle_1"]
     assert {item.criterion_key: item.reason for item in state.package.uncovered} == {
         keys[1]: NON_BEHAVIORAL
     }
+    assert non_behavioral_criteria(state.package) == (1,)
     assert constructor.replacement_calls == []  # never a replacement target
     assert any("Non-behavioral criteria" in line for line in render_preparation(state))
-    assert "criterion 2" not in build_constructor_prompt(seed).split("Acceptance")[0]
-    assert f'reason "{NON_BEHAVIORAL}"' in build_constructor_prompt(seed, skip={2})
-    assert f'reason "{NON_BEHAVIORAL}"' not in build_constructor_prompt(seed)
+    meta = await _meta(state)
+    assert meta["non_behavioral_count"] == "1" and meta["label_parse_failure_count"] == "0"
 
 
-async def test_a_seed_with_only_non_behavioral_criteria_calls_no_constructor(
+async def test_an_invalid_label_keeps_the_check_path(
     store: EventStore, repo: Path, tmp_path: Path
 ) -> None:
-    seed = _seed("The user is willing to assist with debugging the issue.")
-    constructor = _Constructor(seed, repo, {"oracles": []})
+    seed = _seed("clamp(15, 0, 10) returns 10", "clamp(-5, 0, 10) returns 0")
+    reply = {
+        "oracles": [GOOD_REPRO_1, GOOD_PRESERVE_3 | {"criterion": 2}],
+        "labels": [
+            {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
+            # A quote that is not in the Seed: a parse failure, treated as behavior.
+            {"criterion": 2, "kind": "context", "evidence_span": "made up"},
+        ],
+    }
+    state = await _prepare(store, repo, tmp_path, _Constructor(seed, repo, reply), seed)
+    keys = seed_criterion_keys(seed)
+    assert state.non_behavioral == () and state.label_parse_failures == (keys[1],)
+    assert {check.check_id for check in state.package.checks} == {"oracle_1", "oracle_3"}
+    assert any("labels missing or invalid" in line for line in render_preparation(state))
+    assert (await _meta(state))["label_parse_failure_count"] == "1"
+
+
+async def test_a_reply_labeling_every_criterion_non_behavioral_is_the_legacy_run(
+    store: EventStore, repo: Path, tmp_path: Path
+) -> None:
+    seed = _seed(WILLING)
+    reply = {
+        "oracles": [_oracle(1, "oracle_1", "preservation", (-5, 0, 10), 0)],
+        "labels": [{"criterion": 1, "kind": "context", "evidence_span": "willing to assist"}],
+    }
+    constructor = _Constructor(seed, repo, reply)
     state = await _prepare(store, repo, tmp_path, constructor, seed)
-    assert constructor.construct_calls == []
-    assert not state.admitted and state.failure_reason == "all_criteria_non_behavioral"
+    assert len(constructor.construct_calls) == 1
+    assert not state.admitted and state.failure_reason == "constructor_all_criteria_uncovered"
     assert await _types(store, "exec_u/check_package/v1") == [CONSTRUCTION_FAILED, ACTOR_STARTED]
 
 
@@ -501,3 +535,44 @@ async def _meta(state: Any) -> dict[str, str]:
     return await run.outcome_meta(
         _NoEvents(), execution_id="exec_u", session_id="s", terminal_status="completed"
     )  # type: ignore[arg-type]
+
+
+async def test_the_incremental_constructor_carries_each_criterions_label(repo: Path) -> None:
+    """One call per criterion; each reply's label is kept for its own criterion only."""
+    from ouroboros.boundary.behavioral import CriterionKind
+    from ouroboros.boundary.constructor import load_constructor_system_prompt
+
+    seed = _seed("clamp(15, 0, 10) returns 10", WILLING)
+    labels = [
+        {"criterion": 1, "kind": "behavior", "evidence_span": "returns 10"},
+        {"criterion": 2, "kind": "context", "evidence_span": "willing to assist"},
+    ]
+
+    class _Runtime:
+        _runtime_backend = "codex"
+        _exec_session_flags: tuple[str, ...] = ()
+        calls = 0
+
+        async def execute_task_to_result(self, prompt: str, tools=None, system_prompt=None):
+            type(self).calls += 1
+            reply = {
+                "oracles": [GOOD_REPRO_1],
+                "uncovered": [{"criterion": 2, "reason": NON_BEHAVIORAL}],
+                "labels": labels,
+            }
+            return Result.ok(TaskResult(success=True, final_message=json.dumps(reply), messages=()))
+
+    constructor = CheckConstructor(
+        runtime_backend="codex",
+        model="gpt-test",
+        runtime_factory=lambda **_kwargs: _Runtime(),
+        system_prompt="SYSTEM",
+    )
+    outcome = await constructor.construct(seed, repo)
+    assert _Runtime.calls == 2  # the per-criterion calls; no call for the labels
+    assert [label.kind for label in outcome.labels.values()] == [
+        CriterionKind.BEHAVIOR,
+        CriterionKind.CONTEXT,
+    ]
+    prompt = load_constructor_system_prompt()
+    assert '"evidence_span"' in prompt and "implementation_preference" in prompt
