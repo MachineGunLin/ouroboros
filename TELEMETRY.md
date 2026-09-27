@@ -37,7 +37,10 @@ for activity metrics, even when a host repeats a command or starts multiple MCP 
 stable across sessions for lifecycle analysis and derived from nothing about the
 machine or user. Delete the file to reset it; opt out to stop collection. The
 same file records `notice_shown` and `notice_version`, the version of the notice
-last displayed; an older version shows the updated notice once.
+last displayed; an older version shows the updated notice once. The notice
+counts as displayed only on an interactive terminal outside CI (or when the
+installer showed it); a notice printed into a log (`ouroboros mcp serve`, a
+pipe, CI) is not recorded and prints again next time.
 
 **Change policy:** scope expansions are recorded below, ship in a new
 minor/major version with a fresh notice, and default off. Scope reductions do
@@ -88,12 +91,15 @@ the finished workspace).
   the same arm. Nothing about the machine or user enters the digest.
 - **No telemetry, no randomization.** When telemetry is disabled, when no
   anonymous ID exists yet, or when the installation has not been shown the
-  current notice, the arm is `off` (the previous behavior) and recorded as
-  `fallback`. Installs that send no telemetry are never assigned at random.
+  current notice on a terminal, the arm is `off` (the previous behavior) and
+  recorded as `fallback`. Installs that send no telemetry are never assigned
+  at random.
 - **Your setting wins.** `ooo run --check-package` / `--no-check-package`,
   `OUROBOROS_CHECK_PACKAGE=on|off`, or `boundary.check_package: on|off` in
   `~/.ouroboros/config.yaml` always override the assignment, in that order of
-  precedence, and are recorded as `user_forced_on` or `user_forced_off`.
+  precedence, and are recorded as `user_forced_on` or `user_forced_off`. An
+  `OUROBOROS_CHECK_PACKAGE` value that is set but not an on/off spelling is
+  treated as `off` (`user_forced_off`), with a warning.
 - **What is recorded.** A terminal `ooo run` (CLI or MCP) adds the enumerated
   properties below to its `workflow_outcome` row. Values only: never the
   checks, the criteria, commands, paths, or output.
@@ -130,9 +136,11 @@ the finished workspace).
 - `reconciliation` compares the two for the run: `agree` (the package decided
   at least one criterion and the run verdict equals the legacy verdict),
   `package_accepted_over_legacy_reject`, `package_rejected_over_legacy_accept`,
-  `fallback_to_legacy` (arm `on`, but no package was admitted, so the legacy
-  verifier decided the run exactly as in arm `off`; `check_package_status`
-  then says why), `none` (arm `off` or package not run).
+  `fallback_to_legacy` (arm `on`, but the package decided no criterion: none
+  was admitted, the worker attempted no criterion, or the package could not
+  run its decision, so the legacy verifier decided the run exactly as in arm
+  `off`; `check_package_status` then says why), `none` (arm `off` or package
+  not run).
 - `legacy_failure_class` is the worker failure class the legacy verifier
   recorded for the first rejected criterion in criterion order (the class
   names of the orchestrator's failure taxonomy, lower-cased); `accepted` when

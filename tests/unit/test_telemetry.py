@@ -829,10 +829,24 @@ class TestCapture:
         assert "failure_reason_code" not in sent[0]["properties"]
 
     def test_cli_run_job_type_counts_as_run(self, sent: list[dict[str, Any]]) -> None:
-        telemetry.capture_job_outcome("exec:1", "run", terminal_status="completed")
+        telemetry.capture_job_outcome("exec:1", "run", terminal_status="completed", cli_run=True)
         telemetry.flush(timeout=2.0)
 
         assert sent[0]["properties"]["command"] == "run"
+
+    def test_a_job_merely_named_run_is_not_a_run(self, sent: list[dict[str, Any]]) -> None:
+        # T6: job_type is caller-controlled; only the CLI marks its outcome.
+        telemetry.capture_job_outcome(
+            "job:1",
+            "run",
+            terminal_status="completed",
+            result_meta={"check_package_arm": "on", "package_verdict": "pass"},
+        )
+        telemetry.flush(timeout=2.0)
+
+        props = sent[0]["properties"]
+        assert props["command"] == "extension_job"
+        assert "check_package_arm" not in props and "package_verdict" not in props
 
     def test_run_outcome_forwards_closed_check_package_dimensions(
         self, sent: list[dict[str, Any]]
@@ -866,6 +880,7 @@ class TestCapture:
             "job-private-id",
             "run",
             terminal_status="failed",
+            cli_run=True,
             result_meta={
                 "check_package_arm": "maybe",
                 "check_package_status": "/Users/private/project",
@@ -1152,6 +1167,11 @@ class TestCliCapture:
 
 
 class TestNotice:
+    @pytest.fixture(autouse=True)
+    def _on_a_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # These tests cover what is recorded once the notice reached a person.
+        monkeypatch.setattr(telemetry, "_notice_reaches_a_person", lambda: True)
+
     def test_notice_shown_once(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1652,6 +1672,79 @@ class TestStateRepair:
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert state["distinct_id"] == outputs[0]
+
+
+class TestNoticeDisplay:
+    """T1: the notice counts as shown only when a person saw it on a terminal."""
+
+    def _state(self, tmp_path: Path) -> dict[str, Any]:
+        return json.loads((tmp_path / ".ouroboros" / "telemetry.json").read_text(encoding="utf-8"))
+
+    def test_without_a_terminal_the_notice_prints_but_is_not_recorded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        # mcp serve: stdin from /dev/null, stderr captured into a log.
+        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+        telemetry.show_first_run_notice()
+        assert "anonymous" in capsys.readouterr().err.lower()
+        state = self._state(tmp_path)
+        assert state["notice_shown"] is False and "notice_version" not in state
+        # The install stays outside randomized defaults (fallback arm).
+        assert telemetry.rollout_identity() is None
+
+    def test_ci_is_not_a_person_even_on_a_terminal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
+        monkeypatch.setenv("CI", "true")
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+        telemetry.show_first_run_notice()
+        assert self._state(tmp_path)["notice_shown"] is False
+        assert telemetry.rollout_identity() is None
+
+    def test_an_upgraded_plugin_install_is_not_disclosed_by_a_headless_start(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # notice_shown true from an earlier version, no notice_version.
+        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
+        monkeypatch.delenv("CI", raising=False)
+        state_path = tmp_path / ".ouroboros" / "telemetry.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "distinct_id": "5eed0000-0000-4000-8000-000000000000",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "notice_shown": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        telemetry._reset_for_tests()
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+        telemetry.show_first_run_notice()
+        assert "notice_version" not in self._state(tmp_path)
+        assert telemetry.rollout_identity() is None
+
+    def test_on_a_terminal_the_notice_is_recorded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("OUROBOROS_POSTHOG_API_KEY", "phc_test")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+        telemetry.show_first_run_notice()
+        assert "anonymous" in capsys.readouterr().err.lower()
+        state = self._state(tmp_path)
+        assert state["notice_shown"] is True and state["notice_version"] == 4
+        assert telemetry.rollout_identity() == state["distinct_id"]
 
 
 class TestNoticeRace:

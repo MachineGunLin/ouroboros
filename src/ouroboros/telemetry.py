@@ -209,10 +209,6 @@ _EXTENSION_TOOL_NAME = "ouroboros_extension_tool"
 
 _JOB_FUNNEL: dict[str, str] = {
     "execute_seed": "run",
-    # The CLI ``ooo run`` records its terminal outcome under this job type
-    # (cli/commands/run.py:_record_cli_run_outcome); without it the CLI rows
-    # folded to ``extension_job`` instead of counting as ``run``.
-    "run": "run",
     "evolve_step": "evolve",
     "auto": "auto",
     "evaluate": "evaluate",
@@ -1231,8 +1227,15 @@ def capture_job_outcome(
     *,
     terminal_status: str,
     result_meta: dict[str, Any] | None = None,
+    cli_run: bool = False,
 ) -> None:
     """Capture a durable background-job terminal transition.
+
+    ``cli_run`` is set only by the CLI ``ooo run``
+    (``cli/commands/run.py:_record_cli_run_outcome``), whose outcome counts as
+    ``command=run``. A job merely named ``run`` does not: ``job_type`` is
+    caller-controlled, so a third-party job could otherwise pass as a run and
+    forward check-package arm values.
 
     ``command_run`` submission receipts and durable outcomes are deliberately
     different events. Evaluation completion is also different from verified
@@ -1255,9 +1258,13 @@ def capture_job_outcome(
         )
         resolution = classify_failure(normalized_status, meta)
         command = (
-            _JOB_FUNNEL.get(job_type, job_type)
-            if job_type in _CANONICAL_JOB_TYPES
-            else _EXTENSION_JOB_COMMAND
+            "run"
+            if cli_run
+            else (
+                _JOB_FUNNEL.get(job_type, job_type)
+                if job_type in _CANONICAL_JOB_TYPES
+                else _EXTENSION_JOB_COMMAND
+            )
         )
         properties: dict[str, Any] = {
             "command": command,
@@ -1432,6 +1439,12 @@ def show_first_run_notice() -> None:
     The notice also prints once more when the state's ``notice_version`` is
     older than ``_NOTICE_VERSION`` (see ``_recorded_notice_version``).
 
+    ``notice_shown`` and ``notice_version`` are written only when the notice
+    reached a person (``_notice_reaches_a_person``: an interactive terminal,
+    not CI). A notice printed into a captured log (``mcp serve``, a pipe, CI)
+    is not recorded, so the notice keeps printing and the install stays
+    outside randomized defaults until it is shown on a terminal.
+
     ``state.get("notice_shown")`` below is a plain truthiness check, which
     is safe because _validate_state (and every candidate constructor --
     _fresh_candidate, _build_repair_candidate) guarantees the field is
@@ -1457,11 +1470,35 @@ def show_first_run_notice() -> None:
         import sys
 
         print(f"\n{_NOTICE}\n", file=sys.stderr)
+        if not _notice_reaches_a_person():
+            # Printed into a log nobody is known to read (mcp serve, CI, a
+            # pipe): not recorded as shown, so randomized defaults stay off
+            # (rollout_identity) until the notice reaches a terminal.
+            return
         state["notice_shown"] = True
         state["notice_version"] = _NOTICE_VERSION
         _write_state(state)
     except Exception:
         pass
+
+
+def _notice_reaches_a_person() -> bool:
+    """Whether the notice printed to stderr is displayed to a person.
+
+    True only for an interactive terminal outside CI. No other surface
+    (the MCP server, the plugin) displays the notice or acknowledges it, so
+    those runs never count as disclosed; ``scripts/install.sh`` records its
+    own display separately.
+    """
+    import sys
+
+    ci = os.environ.get("CI", "").strip().lower()
+    if ci and ci not in {"0", "false", "no"}:
+        return False
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
 
 
 def _reset_for_tests() -> None:
