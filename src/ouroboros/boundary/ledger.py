@@ -710,7 +710,7 @@ def _require_assignable(state: VersionState, item: CheckBindingRecord) -> None:
 
 
 def _require_bound_run(state: VersionState, record: VerificationRecord) -> None:
-    """A verification runs only runnable bound checks, at their bound tiers."""
+    """A verification runs only runnable bound checks, at their bound tiers and bindings."""
     runnable = {key for key, item in state.bound.items() if item.tier in _RUNNABLE_TIERS}
     assert state.manifest is not None
     roles = {check.check_id: check.role for check in state.manifest.checks}
@@ -721,6 +721,11 @@ def _require_bound_run(state: VersionState, record: VerificationRecord) -> None:
         not set(ran) | set(tiers) | set(record.bindings or {}) <= runnable
         or any(state.bound[key].tier is not tier for key, tier in tiers.items())
         or any(check.role is not roles[check.check_id] for check in record.checks)
+        or any(state.bound[key].binding != value for key, value in (record.bindings or {}).items())
+        or any(
+            check.binding is not None and check.binding != state.bound[check.check_id].binding
+            for check in record.checks
+        )
     ):
         raise BoundaryOrderError("a verification runs a check other than the bound runnable ones")
     if not state.verifications:
@@ -732,17 +737,38 @@ def _require_bound_run(state: VersionState, record: VerificationRecord) -> None:
 
 
 def _effective(state: VersionState) -> tuple[dict[str, JournalCheckExecution], bool]:
-    """The deciding results (the re-run over the run) and whether they are trusted."""
-    if not state.verifications:
+    """The deciding results (the re-run over the run) and whether they are trusted.
+
+    The product's own rule (``binding_flow.BoundVerification.effective``,
+    ``acceptance.criterion_verdicts`` and the candidate identity check of
+    ``run_wiring``): the results decide only when every run saw the same
+    candidate tree, unchanged under it (one tree digest before and after
+    each run); the deciding run's receipt flags no mutation; no deciding
+    check changed a protected byte; and at least one check ran. A check the
+    re-run replaced is judged by the re-run only (a transient
+    protected-byte mutation is why a check is re-run).
+    """
+    runs = state.verifications
+    if not runs:
         return {}, False
-    first = state.verifications[0]
-    results = {check.check_id: check for check in first.checks}
-    if len(state.verifications) == 1:
-        return results, not first.protected_bytes_mutated and bool(results)
-    rerun = state.verifications[1]
-    results.update({c.check_id: c for c in rerun.checks if c.check_id in results})
-    mutated = any(check.mutated_paths for check in results.values()) or any(
-        run.artifact_tree_digest != run.artifact_tree_digest_after for run in (first, rerun)
+    results = {check.check_id: check for check in runs[0].checks}
+    for rerun in runs[1:]:
+        results.update({c.check_id: c for c in rerun.checks if c.check_id in results})
+    trees = {
+        digest
+        for run in runs
+        for digest in (run.artifact_tree_digest, run.artifact_tree_digest_after)
+    }
+    flagged = (
+        runs[0].protected_bytes_mutated if len(runs) == 1 else runs[-1].protected_bytes_mutated
+    )
+    mutated = (
+        flagged
+        or len(trees) != 1
+        or any(
+            check.mutated_paths or check.protected_digest_before != check.protected_digest_after
+            for check in results.values()
+        )
     )
     return results, not mutated and bool(results)
 

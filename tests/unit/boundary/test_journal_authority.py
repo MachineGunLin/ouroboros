@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from ouroboros.boundary.binding import CheckTier
+from ouroboros.boundary.binding import Binding, CallKind, CheckTier
 from ouroboros.boundary.events import (
     ACTOR_STARTED,
     BOUNDARY_AGGREGATE_TYPE,
@@ -366,7 +366,7 @@ async def _oracle_verified(
     store: EventStore,
     checkout: Path,
     *,
-    held_out_passed: bool = True,
+    held_out_passed: bool | None = True,
     candidate: dict[str, bool] | None = None,
     base: dict[str, bool] | None = None,
 ) -> tuple[BoundaryLedger, CheckPackage]:
@@ -397,7 +397,9 @@ async def _oracle_verified(
     )
     payload = BindingsPayload.model_validate({"phase": "final", "checks": [bound]})
     await ledger.record_bindings(B, package_id=package.package_id, payload=payload)
-    passed = candidate if candidate is not None else {"c1": True, "c2": held_out_passed}
+    if candidate is None and held_out_passed is None:
+        return ledger, package  # bound, not yet verified
+    passed = candidate if candidate is not None else {"c1": True, "c2": bool(held_out_passed)}
     run = _oracle_run(package, passed)
     verification = verification_receipt(package, checkout).model_copy(update={"checks": (run,)})
     await ledger.record_candidate_verification(B, verification)
@@ -882,3 +884,105 @@ def test_the_base_failing_rule_reads_the_receipt_and_its_journal_form_alike(
         assert not held_out_all_passed(checks[0].oracle_result)
     assert held_out_all_passed(oracle_result(package, "oracle_1", {"c2": True, "c3": True}))
     assert not held_out_all_passed(None)
+
+
+# --------------------------------------------------------------------------
+# Trust: a verification the product would distrust verifies nothing.
+
+
+def _run_on(package: CheckPackage, checkout: Path, run: Any, before: str, after: str) -> Any:
+    receipt = verification_receipt(package, checkout)
+    return receipt.model_copy(
+        update={
+            "checks": (run,),
+            "artifact_tree_digest": before,
+            "artifact_tree_digest_after": after,
+        }
+    )
+
+
+_PASSING = {"c1": True, "c2": True}
+X, Y = "1" * 64, "2" * 64
+
+
+async def _pass_refused(ledger: BoundaryLedger, package: CheckPackage) -> None:
+    (key,) = package.criterion_keys
+    passed = _decision([_criterion(0, key, "pass")])
+    with pytest.raises(BoundaryOrderError, match="does not show"):
+        await ledger.record_acceptance_reconciled(
+            B, package_id=package.package_id, reconciliation=passed
+        )
+    undecided = _decision([_criterion(0, key, "indeterminate")])
+    await ledger.record_acceptance_reconciled(
+        B, package_id=package.package_id, reconciliation=undecided
+    )
+
+
+async def test_a_pass_on_a_candidate_tree_that_changed_under_verification_is_refused(
+    store, base_checkout
+) -> None:
+    ledger, package = await _oracle_verified(store, base_checkout, held_out_passed=None)
+    run = _oracle_run(package, _PASSING)
+    await ledger.record_candidate_verification(B, _run_on(package, base_checkout, run, X, Y))
+    await _pass_refused(ledger, package)
+
+
+def _timed_out(package: CheckPackage) -> Any:
+    return expected_execution(package.checks[0]).model_copy(
+        update={"status": CheckStatus.INDETERMINATE, "reason": "timeout", "tier": CheckTier.A}
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "rerun"),
+    [((X, X), (X, Y)), ((X, X), (Y, Y)), ((X, Y), (Y, Y))],
+    ids=["rerun_tree_changed", "rerun_on_another_candidate", "first_tree_changed"],
+)
+async def test_a_rerun_pass_on_a_changed_or_other_candidate_is_refused(
+    store, base_checkout, first: tuple[str, str], rerun: tuple[str, str]
+) -> None:
+    ledger, package = await _oracle_verified(store, base_checkout, held_out_passed=None)
+    await ledger.record_candidate_verification(
+        B, _run_on(package, base_checkout, _timed_out(package), *first)
+    )
+    run = _oracle_run(package, _PASSING)
+    await ledger.record_candidate_verification(B, _run_on(package, base_checkout, run, *rerun))
+    await _pass_refused(ledger, package)
+
+
+async def test_a_rerun_pass_on_the_same_unchanged_candidate_is_recorded(
+    store, base_checkout
+) -> None:
+    ledger, package = await _oracle_verified(store, base_checkout, held_out_passed=None)
+    await ledger.record_candidate_verification(
+        B, _run_on(package, base_checkout, _timed_out(package), X, X)
+    )
+    run = _oracle_run(package, _PASSING)
+    await ledger.record_candidate_verification(B, _run_on(package, base_checkout, run, X, X))
+    (key,) = package.criterion_keys
+    await ledger.record_acceptance_reconciled(
+        B, package_id=package.package_id, reconciliation=_decision([_criterion(0, key, "pass")])
+    )
+
+
+async def test_a_pass_whose_check_changed_protected_bytes_is_refused(store, base_checkout) -> None:
+    ledger, package = await _oracle_verified(store, base_checkout, held_out_passed=None)
+    run = _oracle_run(package, _PASSING).model_copy(update={"protected_digest_after": "9" * 64})
+    await ledger.record_candidate_verification(B, _run_on(package, base_checkout, run, X, X))
+    await _pass_refused(ledger, package)
+
+
+async def test_a_verification_through_another_binding_than_the_bound_one_is_refused(
+    store, base_checkout
+) -> None:
+    ledger, package = await _oracle_verified(store, base_checkout, held_out_passed=None)
+    (key,) = package.criterion_keys
+    other = Binding(criterion_key=key, symbol="mathutils.other", call_kind=CallKind.FUNCTION)
+    run = _oracle_run(package, _PASSING).model_copy(update={"binding": other})
+    with pytest.raises(BoundaryOrderError):
+        await ledger.record_candidate_verification(B, _run_on(package, base_checkout, run, X, X))
+    receipt = _run_on(package, base_checkout, _oracle_run(package, _PASSING), X, X)
+    with pytest.raises(BoundaryOrderError):
+        await ledger.record_candidate_verification(
+            B, receipt.model_copy(update={"bindings": {"oracle_1": other}})
+        )
