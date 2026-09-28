@@ -521,7 +521,8 @@ def validate_package_for_seed(package: CheckPackage, seed: Seed) -> None:
     """Raise ``CheckPackageError`` unless ``package`` is bound to ``seed``."""
     if package.seed_digest != seed_digest(seed):
         raise CheckPackageError("check package seed_digest does not match the Seed")
-    if set(package.criterion_keys) != set(seed_criterion_keys(seed)):
+    if tuple(package.criterion_keys) != seed_criterion_keys(seed):
+        # Order included: decisions are indexed by the Seed's criterion positions.
         raise CheckPackageError("check package criterion keys do not match the Seed")
 
 

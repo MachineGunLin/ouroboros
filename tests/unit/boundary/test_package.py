@@ -49,6 +49,16 @@ def test_package_for_another_seed_is_refused(package) -> None:
         validate_package_for_seed(package, other)
 
 
+def test_a_package_with_the_seed_keys_in_another_order_is_refused(seed, package) -> None:
+    # Criterion order is the Seed's: decisions are indexed by position, so the
+    # same keys in another order name other criteria.
+    keys = seed_criterion_keys(seed)
+    reordered = package.model_copy(update={"criterion_keys": (keys[1], keys[0], *keys[2:])})
+    assert set(reordered.criterion_keys) == set(keys)
+    with pytest.raises(CheckPackageError, match="criterion keys"):
+        validate_package_for_seed(reordered, seed)
+
+
 def test_file_content_must_match_digest() -> None:
     with pytest.raises(ValidationError, match="digest mismatch"):
         PackageFile(path="probe/x.py", sha256="0" * 64, content="print(1)\n")
