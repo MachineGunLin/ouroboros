@@ -18,6 +18,7 @@ from rich.console import Console
 import structlog
 import yaml
 
+from ouroboros.boundary.run_control import CheckPackageRun, NotAppliedReason, not_applied_meta
 from ouroboros.config.loader import (
     default_execution_efficiency_mode,
     get_auto_evaluate_enabled,
@@ -1384,6 +1385,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     "status": DELEGATED_TO_SUBAGENT,
                     "dispatch_mode": "plugin",
                     "runtime_backend": self.agent_runtime_backend,
+                    **not_applied_meta(NotAppliedReason.PLUGIN_DISPATCH),
                     "model_tier": model_tier,
                     "efficiency_mode": execution_preferences.efficiency_mode.value,
                     "frugality_assurance": execution_preferences.frugality_assurance.value,
@@ -1663,6 +1665,12 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                 )
 
                 skip_qa = arguments.get("skip_qa", False)
+                check_package = CheckPackageRun.resolve().bind(
+                    runner,
+                    event_store,
+                    Path(workspace.effective_cwd) if workspace else resolved_cwd,
+                    effective_runtime_backend,
+                )
                 if not is_resume:
                     prepared = await runner.prepare_session(
                         seed,
@@ -1810,8 +1818,10 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                             )
 
                         if _resume_existing:
+                            await check_package.prepare_resumed(_tracker.execution_id)
                             result = await _runner.resume_session(_tracker.session_id, _seed)
                         else:
+                            await check_package.prepare_bound(_seed, _tracker.execution_id)
                             result = await _runner.execute_precreated_session(
                                 seed=_seed,
                                 tracker=_tracker,
@@ -2034,6 +2044,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     f"{execution_preferences.frugality_assurance.value}\n"
                 )
                 message += _run_only_verification_text(tracker.session_id)
+                message += "".join(f"{line}\n" for line in check_package.render_outcome())
                 # Best-effort live dashboard URL (singleton daemon, reused across
                 # runs; default on, opt out via OUROBOROS_DASHBOARD=0). Offloaded
                 # to a thread so the healthz/first-spawn wait never blocks the loop.
@@ -2079,6 +2090,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                 }
                 if success is not None:
                     meta["success"] = success
+                meta.update(await check_package.meta_for(tracker, session_status, resume=is_resume))
                 if synchronous and session_status in {
                     SessionStatus.FAILED,
                     SessionStatus.CANCELLED,
@@ -2675,6 +2687,7 @@ class StartExecuteSeedHandler:
                 "status": DELEGATED_TO_PLUGIN,
                 "dispatch_mode": "plugin",
                 "runtime_backend": self.agent_runtime_backend,
+                **not_applied_meta(NotAppliedReason.PLUGIN_DISPATCH),
                 "efficiency_mode": execution_preferences.efficiency_mode.value,
                 "frugality_assurance": execution_preferences.frugality_assurance.value,
                 **({} if is_resume else _plugin_fat_harness_downgrade_meta(execution_mode)),
@@ -2727,6 +2740,8 @@ class StartExecuteSeedHandler:
             configured_auto_evaluate=get_auto_evaluate_enabled(),
             configured_auto_evolve=get_auto_evolve_enabled(),
         )
+        check_package = CheckPackageRun.resolve()  # run_control owns the MCP fields
+        keep = auto_evaluate_enabled or check_package.keeps_runner_result(resume=bool(session_id))
 
         # The shared pipeline owns the ``should_cancel()`` pre-work guard.
         async def _runner(_handle) -> MCPToolResult:
@@ -2771,7 +2786,7 @@ class StartExecuteSeedHandler:
             links=JobLinks(
                 session_id=session_id or new_session_id,
                 execution_id=execution_id,
-                preserve_runner_result=auto_evaluate_enabled,
+                preserve_runner_result=keep,
             ),
             work_fn=_runner,
             cancelled_text="Seed execution cancelled before restart work began.",
@@ -2839,6 +2854,7 @@ class StartExecuteSeedHandler:
             "frugality_assurance": execution_preferences.frugality_assurance.value,
             "job_observer": observer,
             **_run_only_verification_meta(snapshot.links.session_id),
+            **check_package.pending_meta(resume=bool(session_id)),
         }
         if idempotency_key:
             self._idempotency_meta[idempotency_key] = dict(meta)
