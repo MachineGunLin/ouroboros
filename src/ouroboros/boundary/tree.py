@@ -15,36 +15,58 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 import hashlib
-import os
 from pathlib import Path
 import shutil
 import stat
+
+from ouroboros.core.filesystem_capability import NoFollowDirectoryChain, open_directory_anchor
 
 DEFAULT_UNPROTECTED_NAMES: frozenset[str] = frozenset(
     {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis"}
 )
 
-_CHUNK = 1024 * 1024
 UNREADABLE = "unreadable"
 
 
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+def _file_sha256(directory: NoFollowDirectoryChain, name: str) -> str:
+    """SHA-256 of the regular file ``name`` in a held directory (``hash_regular_file``).
 
-
-def _file_sha256(path: Path) -> str:
-    """SHA-256 of a regular file, read without following a link or blocking on a pipe.
-
-    A path swapped for a link, a pipe or a device after it was listed raises
-    ``OSError`` (the caller records it as ``UNREADABLE``).
+    A name swapped for a link, a pipe or a device, or a directory of its
+    path swapped or moved while it is read, raises ``OSError`` (the caller
+    records it as ``UNREADABLE``); outside bytes are never hashed.
     """
-    descriptor = os.open(path, _READ_FLAGS)
-    with os.fdopen(descriptor, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise OSError(f"not a regular file: {path}")
-        digest = hashlib.sha256()
-        while chunk := handle.read(_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return directory.hash_regular_file(name)
+
+
+def _walk(
+    directory: NoFollowDirectoryChain, prefix: str, skip: frozenset[str], manifest: dict[str, str]
+) -> None:
+    """Record every entry below a held directory, opening each child through it."""
+    try:
+        names = directory.names()
+    except OSError:
+        manifest[prefix.rstrip("/") or "."] = UNREADABLE
+        return
+    for name in names:
+        if name in skip:
+            continue
+        relative = prefix + name
+        try:
+            mode = directory.status(name).st_mode
+            if stat.S_ISLNK(mode):
+                manifest[relative] = f"symlink:{directory.read_link(name)}"
+            elif stat.S_ISDIR(mode):
+                child = directory.descend(name)
+                try:
+                    _walk(child, relative + "/", skip, manifest)
+                finally:
+                    child.close()
+            elif stat.S_ISREG(mode):
+                manifest[relative] = _file_sha256(directory, name)
+            else:
+                manifest[relative] = UNREADABLE
+        except OSError:
+            manifest[relative] = UNREADABLE
 
 
 def tree_manifest(
@@ -52,44 +74,26 @@ def tree_manifest(
     *,
     unprotected_names: Iterable[str] = DEFAULT_UNPROTECTED_NAMES,
 ) -> dict[str, str]:
-    """Return ``{relative_path: digest}`` for every protected file under ``root``."""
+    """Return ``{relative_path: digest}`` for every protected file under ``root``.
+
+    ``root`` is held once (``open_directory_anchor``) and everything below it
+    is opened by name through held directory descriptors, never through a
+    rebuilt path, so a directory swapped for a link while the tree is read
+    cannot lead outside it. Where held traversal is unavailable the whole
+    tree is ``UNREADABLE`` (``{".": UNREADABLE}``).
+    """
     skip = frozenset(unprotected_names)
-    base = root.resolve()
+    try:
+        anchor = open_directory_anchor(root.resolve())
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {".": UNREADABLE}
     manifest: dict[str, str] = {}
-
-    def unreadable_directory(error: OSError) -> None:
-        if error.filename is not None:
-            path = Path(error.filename)
-            if path != base and not any(part in skip for part in path.relative_to(base).parts):
-                manifest[path.relative_to(base).as_posix()] = UNREADABLE
-
-    walk = os.walk(base, followlinks=False, onerror=unreadable_directory)
-    for dirpath, dirnames, filenames in walk:
-        current = Path(dirpath)
-        kept: list[str] = []
-        for name in dirnames:
-            if name in skip:
-                continue
-            full = current / name
-            if full.is_symlink():
-                manifest[full.relative_to(base).as_posix()] = f"symlink:{os.readlink(full)}"
-                continue
-            kept.append(name)
-        dirnames[:] = kept
-        for name in filenames:
-            if name in skip:
-                continue
-            full = current / name
-            relative = full.relative_to(base).as_posix()
-            if full.is_symlink():
-                manifest[relative] = f"symlink:{os.readlink(full)}"
-            elif full.is_file():
-                try:
-                    manifest[relative] = _file_sha256(full)
-                except OSError:
-                    manifest[relative] = UNREADABLE
-            else:
-                manifest[relative] = UNREADABLE
+    try:
+        _walk(anchor, "", skip, manifest)
+    finally:
+        anchor.close()
     return manifest
 
 
