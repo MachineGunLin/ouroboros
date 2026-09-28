@@ -296,6 +296,23 @@ def test_a_malformed_enabled_record_makes_recovery_undecidable(package, base_che
         assert isinstance(projection, RecoveryUndecidable)
 
 
+def test_a_version_holding_another_aggregate_makes_recovery_undecidable(
+    package, base_checkout
+) -> None:
+    # Another run's well-formed version, handed in as this run's v1.
+    other = boundary_version_id("run_other", 1)
+    moved = [
+        package_frozen_event(other, package),
+        admission_completed_event(other, admission_receipt(package, base_checkout)),
+        actor_started_event(
+            other, actor_id="run_other", package_id=package.package_id, runtime=None
+        ),
+    ]
+    assert verify_boundary_order(_timed(moved)) == ()
+    projection = recovery_projection(RUN, _enabled(), {1: _timed(moved)})
+    assert isinstance(projection, RecoveryUndecidable)
+
+
 # --------------------------------------------------------------------------
 # Genuine receipts pass the gateway (it never refuses what the product writes).
 
