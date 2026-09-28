@@ -613,7 +613,7 @@ def _manifest_event_data(
             "criterion_keys": list(keys),
             "checks": checks,
             "files": [],
-            "base_files": [],
+            "base_file_count": 0,
             "scratch_path_count": 0,
             "uncovered": [],
             "binding_grammar": "g",
