@@ -611,19 +611,9 @@ class ManifestOracleData(_Payload):
 
 
 class ManifestFile(_Payload):
-    """Every other package file in the manifest: its kind, digest and size."""
+    """Every other package file in the manifest: its kind only (no digest, no size)."""
 
     kind: Literal["oracle_harness", "generated"]
-    sha256: str
-    size: int = Field(ge=0)
-
-    _sha = field_validator("sha256")(_hex)
-
-
-class ManifestBaseFile(_Payload):
-    sha256: str
-
-    _sha = field_validator("sha256")(_hex)
 
 
 class ManifestOracle(_Payload):
@@ -663,7 +653,7 @@ class ManifestRecord(_Payload):
     criterion_keys: tuple[str, ...]
     checks: tuple[ManifestCheck, ...]
     files: tuple[ManifestOracleData | ManifestFile, ...]
-    base_files: tuple[ManifestBaseFile, ...]
+    base_file_count: int = Field(ge=0)
     scratch_path_count: int = Field(ge=0)
     uncovered: tuple[UncoveredRecord, ...]
     binding_grammar: str | None = None

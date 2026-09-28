@@ -208,7 +208,7 @@ _SEVEN = (
     "generated_at",
     "generator",
     "files",
-    "base_files",
+    "base_file_count",
     "scratch_path_count",
 )
 
