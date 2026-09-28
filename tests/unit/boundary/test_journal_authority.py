@@ -861,3 +861,24 @@ async def test_a_decision_whose_root_index_names_another_criterion_is_refused(
         await ledger.record_acceptance_reconciled(
             B, package_id=package.package_id, reconciliation=swapped
         )
+
+
+def test_the_base_failing_rule_reads_the_receipt_and_its_journal_form_alike(
+    base_checkout,
+) -> None:
+    from ouroboros.boundary.per_check import base_failing_held_out, held_out_all_passed
+    from ouroboros.boundary.receipts import AdmissionJournal
+
+    package = seal_package(held_out_package())
+    live = admission_receipt(package, base_checkout)
+    base = live.checks[0].model_copy(
+        update={"oracle_result": oracle_result(package, "oracle_1", {"c2": True})}
+    )
+    live = live.model_copy(update={"checks": (base,)})
+    journal = AdmissionJournal.model_validate(live.event_summary())
+    for checks in (live.checks, journal.checks):
+        assert base_failing_held_out(checks, set()) == {"oracle_1": frozenset({"c3"})}
+        assert base_failing_held_out(checks, {"oracle_1"}) == {}
+        assert not held_out_all_passed(checks[0].oracle_result)
+    assert held_out_all_passed(oracle_result(package, "oracle_1", {"c2": True, "c3": True}))
+    assert not held_out_all_passed(None)

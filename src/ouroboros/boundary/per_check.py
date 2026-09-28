@@ -40,7 +40,7 @@ it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Protocol
 
 from ouroboros.boundary.binding import CheckTier
@@ -68,6 +68,66 @@ ROLE_EXCLUSION_REASONS: Mapping[CheckRole, frozenset[str]] = {
 }
 """The exclusion reasons a check of each role can have
 (``held_out_not_discriminating`` only for a reproduction oracle)."""
+
+
+class HeldOutCase(Protocol):
+    """One case of an oracle result (``oracle.CaseResult`` or ``receipts.JournalCase``)."""
+
+    @property
+    def case_id(self) -> str: ...
+
+    @property
+    def held_out(self) -> bool: ...
+
+    @property
+    def passed(self) -> bool: ...
+
+
+class CaseResults(Protocol):
+    """An oracle result (``oracle.OracleResult`` or ``receipts.JournalOracleResult``)."""
+
+    @property
+    def cases(self) -> Sequence[HeldOutCase]: ...
+
+
+class CheckResults(Protocol):
+    """A check's result (``receipts.CheckExecution`` or ``receipts.JournalCheckExecution``)."""
+
+    @property
+    def check_id(self) -> str: ...
+
+    @property
+    def oracle_result(self) -> CaseResults | None: ...
+
+
+def held_out_all_passed(result: CaseResults | None) -> bool:
+    """At least one held-out case ran and every held-out case passed.
+
+    On the base this is a reproduction oracle that cannot verify a pass
+    (``held_out_not_discriminating``): no held-out case shows anything a
+    candidate fixed.
+    """
+    held = [case for case in (result.cases if result is not None else ()) if case.held_out]
+    return bool(held) and all(case.passed for case in held)
+
+
+def base_failing_held_out(
+    checks: Iterable[CheckResults], excluded: Collection[str]
+) -> dict[str, frozenset[str]]:
+    """Per admitted oracle check, the held-out cases its base run failed at admission.
+
+    ``checks`` are the admission's check results (the receipt or its journal
+    form), ``excluded`` the checks it excluded. Only a held-out case listed
+    here for its check, passing on the candidate, verifies a pass; a check
+    without an oracle result is not listed and verifies none.
+    """
+    return {
+        check.check_id: frozenset(
+            case.case_id for case in check.oracle_result.cases if case.held_out and not case.passed
+        )
+        for check in checks
+        if check.oracle_result is not None and check.check_id not in excluded
+    }
 
 
 def per_check_admission(admission: AdmissionResult) -> AdmissionResult:
@@ -187,7 +247,12 @@ __all__ = [
     "PRESERVATION_FAILS_ON_BASE",
     "REPRO_PASSES_ON_BASE",
     "ROLE_EXCLUSION_REASONS",
+    "CaseResults",
+    "CheckResults",
+    "HeldOutCase",
+    "base_failing_held_out",
     "criteria_without_admitted_check",
     "excluded_check_ids",
+    "held_out_all_passed",
     "per_check_admission",
 ]

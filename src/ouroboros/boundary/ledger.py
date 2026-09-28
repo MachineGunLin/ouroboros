@@ -67,6 +67,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from ouroboros.boundary.binding import BindingSource, CheckTier
 from ouroboros.boundary.events import (
     ACCEPTANCE_RECONCILED,
@@ -136,13 +138,16 @@ from ouroboros.boundary.per_check import (
     EXCLUSION_REASONS,
     HELD_OUT_NOT_DISCRIMINATING,
     ROLE_EXCLUSION_REASONS,
+    base_failing_held_out,
     criteria_without_admitted_check,
+    held_out_all_passed,
 )
 from ouroboros.boundary.receipts import (
     AdmissionResult,
     CandidateVerification,
     CheckStatus,
     JournalCheckExecution,
+    JournalOracleResult,
 )
 from ouroboros.core.errors import OuroborosError
 from ouroboros.core.seed import Seed
@@ -340,16 +345,13 @@ def _minted(item: Mapping[str, Any], spec: Mapping[str, Any] | None, keys: Seque
     )
 
 
-def _held_out_all_passed(manifest: FrozenManifest, check_id: str, item: Mapping[str, Any]) -> bool:
-    """An oracle's base run passed every held-out case it ran (at least one)."""
-    result = item.get("oracle_result")
-    cases = result.get("cases") if isinstance(result, Mapping) else None
-    held = [case for case in cases or () if isinstance(case, Mapping) and case.get("held_out")]
-    return (
-        check_id in manifest.oracle_checks
-        and bool(held)
-        and all(case.get("passed") is True for case in held)
-    )
+def _not_discriminating(manifest: FrozenManifest, check_id: str, item: Mapping[str, Any]) -> bool:
+    """An oracle check whose recorded base run passed every held-out case it ran."""
+    try:
+        result = JournalOracleResult.model_validate(item.get("oracle_result"))
+    except ValidationError:
+        return False
+    return check_id in manifest.oracle_checks and held_out_all_passed(result)
 
 
 # Tiers admission records (``admission.base_run_tiers``): an oracle check is
@@ -412,7 +414,7 @@ def admitted_exclusions(manifest: FrozenManifest, data: Mapping[str, Any]) -> fr
                 or recorded[check.check_id] != reason
                 or (
                     reason == HELD_OUT_NOT_DISCRIMINATING
-                    and not _held_out_all_passed(manifest, check.check_id, item)
+                    and not _not_discriminating(manifest, check.check_id, item)
                 )
             ):
                 raise BoundaryOrderError("an excluded check was not excluded for its role")
@@ -559,13 +561,7 @@ def _admission(state: VersionState, event: BaseEvent, record: AdmissionRecord) -
         raise BoundaryOrderError("an admitted package's record has no interpreter pin")
     admitted_exclusions(state.manifest, event.data)
     excluded = dict(record.excluded_checks or {})
-    base_failing = {
-        check.check_id: frozenset(
-            case.case_id for case in check.oracle_result.cases if case.held_out and not case.passed
-        )
-        for check in record.checks
-        if check.oracle_result is not None and check.check_id not in excluded
-    }
+    base_failing = base_failing_held_out(record.checks, excluded)
     return replace(
         state,
         phase=Phase.ADMITTED,
