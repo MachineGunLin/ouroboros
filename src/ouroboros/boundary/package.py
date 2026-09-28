@@ -48,6 +48,7 @@ from ouroboros.boundary.oracle import (
     positive_ordinal,
 )
 from ouroboros.core.filesystem_capability import (
+    HeldPathChanged,
     NoFollowDirectoryChain,
     open_nofollow_directory_chain,
 )
@@ -648,6 +649,8 @@ def publish_exact(target: Path, data: bytes) -> Path:
     try:
         if not directory.create_exclusive(absolute.name, data):
             _confirm_published(directory, absolute.name, data)
+    except HeldPathChanged as exc:
+        raise CheckPackageError(f"{target.name} was replaced while it was published") from exc
     finally:
         directory.close()
     return target

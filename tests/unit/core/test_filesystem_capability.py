@@ -11,6 +11,7 @@ import pytest
 from ouroboros.core import filesystem_capability
 from ouroboros.core.filesystem_capability import (
     CheckoutFileRefusal,
+    HeldPathChanged,
     RegularFile,
     open_directory_anchor,
     open_nofollow_directory_chain,
@@ -173,3 +174,53 @@ def test_a_descended_chain_closes_only_its_own_descriptor(checkout: Path) -> Non
     finally:
         anchor.close()
     assert filesystem_capability.nofollow_directory_capabilities_available()
+
+
+def test_a_leaf_replaced_while_it_is_written_is_never_reported_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    real_write = os.write
+    swapped: list[bool] = []
+
+    def swapping(descriptor: int, data: object) -> int:
+        if not swapped:
+            swapped.append(True)
+            (store / "record.json").rename(store / "ours.json")
+            (store / "record.json").write_bytes(b"planted")
+        return real_write(descriptor, data)  # type: ignore[arg-type]
+
+    chain = open_nofollow_directory_chain(store)
+    try:
+        monkeypatch.setattr(os, "write", swapping)
+        with pytest.raises(HeldPathChanged):
+            chain.create_exclusive("record.json", b"expected")
+    finally:
+        monkeypatch.setattr(os, "write", real_write)
+        chain.close()
+    assert swapped
+    # The planted file is not ours to remove; nothing reported it as published.
+    assert (store / "record.json").read_bytes() == b"planted"
+
+
+def test_publish_exact_refuses_a_target_replaced_while_it_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ouroboros.boundary.package import CheckPackageError, publish_exact
+
+    target = tmp_path / "store" / "record.json"
+    target.parent.mkdir()
+    real_write = os.write
+
+    def swapping(descriptor: int, data: object) -> int:
+        if target.exists() and target.read_bytes() == b"":
+            target.rename(tmp_path / "store" / "ours.json")
+            target.write_bytes(b"planted")
+        return real_write(descriptor, data)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "write", swapping)
+    with pytest.raises(CheckPackageError):
+        publish_exact(target, b"expected")
+    monkeypatch.setattr(os, "write", real_write)
+    assert target.read_bytes() == b"planted"

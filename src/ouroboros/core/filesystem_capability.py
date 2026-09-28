@@ -61,6 +61,10 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+class HeldPathChanged(OSError):
+    """A held directory or a file created through it no longer has the name it was opened by."""
+
+
 @dataclass(frozen=True, slots=True)
 class RegularFile:
     """A regular file read through a held chain: its identity and its bytes."""
@@ -241,10 +245,12 @@ class NoFollowDirectoryChain:
     def create_exclusive(self, name: str, data: bytes, *, mode: int = 0o600) -> bool:
         """Create ``name`` in the leaf holding exactly ``data``; ``False`` if ``name`` exists.
 
-        The file is created exclusively (``O_EXCL``, never through a link).
-        If writing fails, or the chain no longer names its directories once
-        the bytes are written, the file is removed, but only while ``name``
-        is still the inode this call created, and the error is raised.
+        The file is created exclusively (``O_EXCL``, never through a link),
+        written and synced; ``True`` is returned only if ``name`` then still
+        names the inode written here and the chain still names its
+        directories (``HeldPathChanged`` otherwise). On any failure the file is
+        removed, but only while ``name`` is still the inode this call created,
+        and the error is raised.
         """
         if not _canonical_name(name):
             msg = "file capability names must be canonical names"
@@ -257,8 +263,13 @@ class NoFollowDirectoryChain:
             view = memoryview(data)
             while view:
                 view = view[os.write(descriptor, view) :]
+            os.fsync(descriptor)
+            # Success only while ``name`` still is the inode written here and
+            # every held directory is still named by its parent.
+            if not _same_inode(os.fstat(descriptor), self.status(name)):
+                raise HeldPathChanged(f"{name} was replaced while it was published")
             if not self.postvalidate():
-                raise OSError(f"the directory of {name} moved while it was published")
+                raise HeldPathChanged(f"the directory of {name} moved while it was published")
         except BaseException:
             self._unlink_created(name, descriptor)
             raise
