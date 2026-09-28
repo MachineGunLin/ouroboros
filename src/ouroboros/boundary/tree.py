@@ -65,7 +65,9 @@ def _walk(
                 manifest[relative] = _file_sha256(directory, name)
             else:
                 manifest[relative] = UNREADABLE
-        except OSError:
+        except (OSError, RecursionError):
+            # A tree deeper than the walk (or the descriptors) can hold is
+            # recorded as unreadable, never a crash of the whole manifest.
             manifest[relative] = UNREADABLE
 
 
