@@ -156,10 +156,15 @@ class CheckBindingRecord(_Payload):
 
 
 class BindingsPayload(_Payload):
-    """``boundary.binding.recorded``: every check's tier and binding (data, no code)."""
+    """``boundary.binding.recorded``: every check's tier and binding (data, no code).
+
+    ``final``: the run's bindings, once, before its verification; ``repair``:
+    one attempt's bindings while the worker runs; ``resumed``: a resumed run's
+    bindings, before the verification and decision it records.
+    """
 
     schema_version: Literal["ouroboros.binding_record.v1"] = "ouroboros.binding_record.v1"
-    phase: Literal["final", "repair"]
+    phase: Literal["final", "repair", "resumed"]
     checks: tuple[CheckBindingRecord, ...]
     root_ac_index: int | None = None
     retry_attempt: int | None = None
