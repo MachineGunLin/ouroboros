@@ -9,7 +9,6 @@ import sys
 import pytest
 
 from ouroboros.boundary.admission import (
-    HELD_OUT_NOT_DISCRIMINATING,
     admit_binding,
     admit_check_package,
     base_failing_held_out,
@@ -17,12 +16,15 @@ from ouroboros.boundary.admission import (
 )
 from ouroboros.boundary.binding import CallKind, CheckTier, parse_binding
 from ouroboros.boundary.check_env import pin_interpreter
-from ouroboros.boundary.events import package_frozen_event
-from ouroboros.boundary.ledger import admitted_exclusions, frozen_manifest
+from ouroboros.boundary.events import admission_completed_event, package_frozen_event
+from ouroboros.boundary.ledger import admitted_exclusions, frozen_manifest, version_state
 from ouroboros.boundary.oracle import failed_heldout_only
 from ouroboros.boundary.oracle_build import assemble_package, build_oracle_spec
 from ouroboros.boundary.package import CheckRole, seal_package
-from ouroboros.boundary.per_check import REPRO_PASSES_ON_BASE, criteria_without_admitted_check
+from ouroboros.boundary.per_check import (
+    HELD_OUT_NOT_DISCRIMINATING,
+    criteria_without_admitted_check,
+)
 from ouroboros.boundary.receipts import (
     AdmissionJournal,
     CandidateVerdict,
@@ -772,23 +774,30 @@ async def test_a_held_out_case_the_base_already_passes_discriminates_nothing(
     # candidate special-casing the visible input "passed" it. Such an oracle
     # is not admitted; its criterion is uncovered (legacy-decided).
     seed, specs, package = _two_criteria_package()
-    admission = await admit_check_package(package, base)
+    admission = await admit_check_package(
+        package, base, interpreter=pin_interpreter(sys.executable, "test")
+    )
 
     assert admission.verdict is PackageVerdict.ADMITTED
     by_id = {check.check_id: check for check in admission.checks}
     assert by_id["oracle_1"].status is CheckStatus.VIOLATED
     assert by_id["oracle_1"].reason == HELD_OUT_NOT_DISCRIMINATING
-    assert admission.excluded_checks == {"oracle_1": REPRO_PASSES_ON_BASE}
+    assert admission.excluded_checks == {"oracle_1": HELD_OUT_NOT_DISCRIMINATING}
     assert admission.check_tiers == {"oracle_1": "C", "oracle_2": "A"}
     assert criteria_without_admitted_check(package, admission.excluded_checks) == {
-        specs[0].criterion_key: REPRO_PASSES_ON_BASE
+        specs[0].criterion_key: HELD_OUT_NOT_DISCRIMINATING
     }
     # Which held-out cases failed on the base, by id only, from the receipt
     # and from its journal form alike.
     journal = AdmissionJournal.model_validate(admission.event_summary())
     assert base_failing_held_out(admission) == {"oracle_2": ("c2",)}
     assert base_failing_held_out(journal) == {"oracle_2": ("c2",)}
-    # The ledger accepts the record admission wrote.
-    frozen = package_frozen_event("boundary_b2", package).data
-    manifest = frozen_manifest(frozen)
+    # The ledger accepts the record admission wrote, and its replay gives
+    # the same base-failing held-out cases (the rule a verified pass needs).
+    frozen = package_frozen_event("boundary_b2", package)
+    manifest = frozen_manifest(frozen.data)
     assert admitted_exclusions(manifest, admission.event_summary()) == frozenset({"oracle_1"})
+    replayed = version_state([frozen, admission_completed_event("boundary_b2", admission)])
+    assert replayed.base_failing == {
+        check_id: frozenset(ids) for check_id, ids in base_failing_held_out(admission).items()
+    }

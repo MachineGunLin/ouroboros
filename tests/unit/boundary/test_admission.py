@@ -37,10 +37,10 @@ async def test_happy_path_admits_every_check(tmp_path: Path, base_checkout, pack
     assert result.package_sha256 == package.sha256
     assert result.seed_digest == package.seed_digest
     checks = _by_id(result)
-    assert checks["repro-add"].status is CheckStatus.EXPECTED
-    assert checks["repro-add"].reason == "reached_failing_assertion"
-    assert checks["repro-add"].signature_seen
-    assert checks["preserve-zero"].reason == "preservation_passed"
+    assert checks["script_1_1"].status is CheckStatus.EXPECTED
+    assert checks["script_1_1"].reason == "reached_failing_assertion"
+    assert checks["script_1_1"].signature_seen
+    assert checks["script_2_1"].reason == "preservation_passed"
     assert not result.protected_bytes_mutated
     assert result.base_tree_digest == result.base_tree_digest_after == before
     # Generated files never touch the base checkout.
@@ -80,7 +80,7 @@ async def test_reproduction_failing_for_wrong_reason_is_indeterminate(
     package = build_package(seed, repro_script=import_error)
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    repro = _by_id(result)["repro-add"]
+    repro = _by_id(result)["script_1_1"]
     assert repro.status is CheckStatus.INDETERMINATE
     assert repro.reason == "failure_signature_absent"
     assert repro.return_code not in (0, None)
@@ -93,9 +93,9 @@ async def test_reproduction_passing_on_base_is_excluded_on_its_own(
     package = build_package(seed, repro_script="print('vacuous')\n")
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    assert _by_id(result)["repro-add"].reason == "reproduction_passed_on_base"
+    assert _by_id(result)["script_1_1"].reason == "reproduction_passed_on_base"
     assert result.verdict is PackageVerdict.ADMITTED
-    assert result.excluded_checks == {"repro-add": "repro_passes_on_base"}
+    assert result.excluded_checks == {"script_1_1": "repro_passes_on_base"}
 
 
 async def test_preservation_failure_is_excluded_and_retained(
@@ -108,11 +108,11 @@ async def test_preservation_failure_is_excluded_and_retained(
     # Per-check admission: the failed check is excluded on its own and stays
     # in the receipt; the rest of the package is admitted.
     assert result.verdict is PackageVerdict.ADMITTED
-    assert result.excluded_checks == {"preserve-zero": "preservation_fails_on_base"}
-    assert checks["repro-add"].status is CheckStatus.EXPECTED
-    assert checks["preserve-zero"].status is CheckStatus.VIOLATED
-    assert checks["preserve-zero"].reason == "preservation_failed"
-    assert "preservation_failed:preserve-zero" in result.reasons
+    assert result.excluded_checks == {"script_2_1": "preservation_fails_on_base"}
+    assert checks["script_1_1"].status is CheckStatus.EXPECTED
+    assert checks["script_2_1"].status is CheckStatus.VIOLATED
+    assert checks["script_2_1"].reason == "preservation_failed"
+    assert "preservation_failed:script_2_1" in result.reasons
     assert len(result.checks) == len(package.checks)
 
 
@@ -127,14 +127,14 @@ async def test_protected_byte_mutation_is_indeterminate_and_flagged(
     base_before = tree_digest(base_checkout)
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    repro = _by_id(result)["repro-add"]
+    repro = _by_id(result)["script_1_1"]
     assert repro.status is CheckStatus.INDETERMINATE
     assert repro.reason == "protected_bytes_mutated"
     assert repro.mutated_paths == ("calc.py",)
     assert repro.protected_digest_before != repro.protected_digest_after
     assert result.protected_bytes_mutated
     assert result.verdict is PackageVerdict.INDETERMINATE
-    assert "protected_bytes_mutated:repro-add" in result.reasons
+    assert "protected_bytes_mutated:script_1_1" in result.reasons
     # The mutation happened on the isolated copy, not the pinned base.
     assert tree_digest(base_checkout) == base_before
 
@@ -146,7 +146,7 @@ async def test_mutating_a_package_file_is_also_protected(
     package = build_package(seed, preserve_script=mutate_self)
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    assert _by_id(result)["preserve-zero"].mutated_paths == ("probe/test_zero.py",)
+    assert _by_id(result)["script_2_1"].mutated_paths == ("probe/test_zero.py",)
     assert result.verdict is PackageVerdict.INDETERMINATE
 
 
@@ -160,7 +160,7 @@ async def test_scratch_and_undeclared_outputs_are_separated(
     package = build_package(seed, preserve_script=writes, scratch_paths=("out",))
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    zero = _by_id(result)["preserve-zero"]
+    zero = _by_id(result)["script_2_1"]
     assert zero.scratch_outputs == ("out/log.txt",)
     assert zero.undeclared_outputs == ("stray.txt",)
     assert zero.mutated_paths == ()
@@ -173,7 +173,7 @@ async def test_timeout_is_indeterminate(tmp_path: Path, seed, base_checkout) -> 
         package, base_checkout, work_dir=tmp_path / "w", timeout_seconds=1
     )
 
-    zero = _by_id(result)["preserve-zero"]
+    zero = _by_id(result)["script_2_1"]
     assert zero.timed_out
     assert zero.reason == "timeout"
     assert result.verdict is PackageVerdict.INDETERMINATE
@@ -183,7 +183,7 @@ async def test_launch_failure_is_indeterminate(tmp_path: Path, seed, base_checko
     package = build_package(seed, repro_argv=("definitely-not-a-binary-7f3e", "x"))
     result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
 
-    assert _by_id(result)["repro-add"].reason == "launch_failed"
+    assert _by_id(result)["script_1_1"].reason == "launch_failed"
     assert result.verdict is PackageVerdict.INDETERMINATE
 
 
@@ -227,8 +227,8 @@ async def test_candidate_verification_pass_and_fail(
     assert passed.artifact_tree_digest == tree_digest(fixed_checkout)
     assert passed.package_sha256 == package.sha256
     assert failed.verdict is CandidateVerdict.FAIL
-    assert _by_id(failed)["repro-add"].reason == "reproduction_still_failing"
-    assert _by_id(failed)["repro-add"].signature_seen
+    assert _by_id(failed)["script_1_1"].reason == "reproduction_still_failing"
+    assert _by_id(failed)["script_1_1"].signature_seen
 
 
 async def test_reused_work_dir_is_refused(tmp_path: Path, base_checkout, package) -> None:
@@ -248,10 +248,10 @@ async def test_candidate_reproduction_without_signature_is_indeterminate(
     result = await verify_candidate(package, fixed_checkout, work_dir=tmp_path / "w")
 
     checks = _by_id(result)
-    assert checks["repro-add"].status is CheckStatus.INDETERMINATE
-    assert checks["repro-add"].reason == "failure_signature_absent"
+    assert checks["script_1_1"].status is CheckStatus.INDETERMINATE
+    assert checks["script_1_1"].reason == "failure_signature_absent"
     # Preservation has no signature: its non-zero exit is a failure.
-    assert checks["preserve-zero"].reason == "preservation_failed"
+    assert checks["script_2_1"].reason == "preservation_failed"
     assert result.verdict is CandidateVerdict.FAIL
 
 
@@ -411,7 +411,7 @@ async def test_a_candidate_directory_at_a_package_file_path_is_a_layout_fault_pe
 
     assert result.verdict is CandidateVerdict.INDETERMINATE
     assert not any(reason.startswith("package_path_collision") for reason in result.reasons)
-    assert {check.check_id for check in result.checks} == {"repro-add", "preserve-zero"}
+    assert {check.check_id for check in result.checks} == {"script_1_1", "script_2_1"}
     assert {check.status for check in result.checks} == {CheckStatus.INDETERMINATE}
     assert {check.reason for check in result.checks} == {admission.CANDIDATE_LAYOUT}
     assert copied == []
@@ -429,6 +429,6 @@ async def test_a_candidate_special_file_at_a_package_path_is_unreadable_per_chec
 
     assert result.verdict is CandidateVerdict.INDETERMINATE
     assert not any(reason.startswith("package_path_collision") for reason in result.reasons)
-    assert {check.check_id for check in result.checks} == {"repro-add", "preserve-zero"}
+    assert {check.check_id for check in result.checks} == {"script_1_1", "script_2_1"}
     assert {check.status for check in result.checks} == {CheckStatus.INDETERMINATE}
     assert {check.reason for check in result.checks} == {admission.CANDIDATE_UNREADABLE}

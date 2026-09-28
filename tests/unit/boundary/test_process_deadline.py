@@ -94,7 +94,7 @@ async def test_a_script_whose_child_outlives_it_ends_on_the_deadline(
         assert _gone_within(pid, 1.0), "the child the check left in its group is still alive"
     finally:
         _stop(pidfile)
-    preserve = next(check for check in result.checks if check.check_id == "preserve-zero")
+    preserve = next(check for check in result.checks if check.check_id == "script_2_1")
     assert preserve.status is CheckStatus.INDETERMINATE
     assert preserve.reason == "timeout" and preserve.timed_out
     # Two checks run one after the other, each bounded by its own deadline.
