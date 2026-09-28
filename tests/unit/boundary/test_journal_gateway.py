@@ -50,7 +50,14 @@ from ouroboros.boundary.receipts import PackageVerdict
 from ouroboros.events.base import BaseEvent
 from ouroboros.persistence.event_store import EventStore
 
-from .journal_fixtures import admission_receipt, expected_execution, verification_receipt
+from .journal_fixtures import (
+    admission_receipt,
+    criterion,
+    decision_data,
+    expected_execution,
+    final_bindings,
+    verification_receipt,
+)
 
 RUN = "run_gateway"
 VERSION = boundary_version_id(RUN, 1)
@@ -94,55 +101,20 @@ def _started(package: CheckPackage, checkout: Path) -> list[BaseEvent]:
 
 
 def _final_bindings(package: CheckPackage) -> BaseEvent:
-    checks = [
-        {
-            "criterion_key": check.assertions[0].criterion_key,
-            "check_id": check.check_id,
-            "tier": "S",
-            "binding_source": None,
-            "binding": None,
-            "status_hint": None,
-            "reason": "r",
-            "declared": None,
-        }
-        for check in package.checks
-    ]
-    payload = BindingsPayload.model_validate({"phase": "final", "checks": checks})
-    return binding_recorded_event(VERSION, package_id=package.package_id, payload=payload)
+    return binding_recorded_event(
+        VERSION, package_id=package.package_id, payload=final_bindings(package)
+    )
 
 
-def _decision(keys: tuple[str, ...], **update: Any) -> dict[str, Any]:
-    """A decision the reconciliation rule can write: every criterion a package pass."""
-    criteria = [
-        {
-            "root_ac_index": index,
-            "criterion_key": key,
-            "package_status": "pass",
-            "tier": "S",
-            "reason": "r",
-            "failed_heldout_only": False,
-            "binding": None,
-            "existing_outcome": "succeeded",
-            "existing_failure_class": None,
-            "existing_accepted": True,
-            "accepted": True,
-            "governed_by": "check_package",
-            "declared_binding_pass": False,
-            **update,
-        }
-        for index, key in enumerate(keys)
-    ]
-    return {
-        "schema_version": "ouroboros.acceptance_reconciliation.v3",
-        "run_accepted": all(item["accepted"] for item in criteria),
-        "existing_run_accepted": True,
-        "artifact_verdict": "pass",
-        "verified_pass_count": len(keys),
-        "unverified_count": 0,
-        "criterion_count": len(keys),
-        "tier_summary": {},
-        "criteria": criteria,
-    }
+def _decision(keys: tuple[str, ...], *statuses: str, **update: Any) -> dict[str, Any]:
+    """A decision the reconciliation rule can write (by default every criterion a pass)."""
+    statuses = statuses or ("pass",) * len(keys)
+    return decision_data(
+        [
+            criterion(index, key, status, **update)
+            for index, (key, status) in enumerate(zip(keys, statuses, strict=True))
+        ]
+    )
 
 
 # --------------------------------------------------------------------------
@@ -183,11 +155,10 @@ def test_an_accepted_decision_for_a_criterion_the_manifest_lacks_is_flagged(
     assert verify_boundary_order(_timed(verified)) == ()
     violations = verify_boundary_order(_timed([*verified, decided]))
     assert any("frozen manifest" in problem for problem in violations)
-    # The same decision over exactly the manifest's criteria is recorded.
-    genuine = _planted(
-        ACCEPTANCE_RECONCILED,
-        {**_decision(package.criterion_keys), "package_id": package.package_id},
-    )
+    # A decision over exactly the manifest's criteria, with the statuses the
+    # (empty, so untrusted) verification supports, is recorded.
+    supported = _decision(package.criterion_keys, "indeterminate", "indeterminate", "uncovered")
+    genuine = _planted(ACCEPTANCE_RECONCILED, {**supported, "package_id": package.package_id})
     assert verify_boundary_order(_timed([*verified, genuine])) == ()
 
 
@@ -222,21 +193,12 @@ def _versions(package: CheckPackage, checkout: Path) -> dict[int, list[BaseEvent
 
 
 def _undecided_resume(keys: tuple[str, ...]) -> dict[str, Any]:
-    data = _decision(
-        keys,
-        package_status="indeterminate",
-        accepted=False,
-        tier="A",
-        reason="boundary_record_missing",
-    )
+    reason = "boundary_record_missing"
     return {
-        **data,
-        "run_accepted": False,
-        "artifact_verdict": "indeterminate",
-        "verified_pass_count": 0,
+        **_decision(keys, *("indeterminate",) * len(keys), reason=reason),
         "source": "none",
         "held_out_checks": [],
-        "reason": "boundary_record_missing",
+        "reason": reason,
         "package_id": None,
     }
 
@@ -266,12 +228,7 @@ def test_a_malformed_run_level_resume_makes_recovery_undecidable(
     if data == "cites_a_package":
         data = {**_undecided_resume(keys), "package_id": package.package_id}
     elif data == "claims_a_pass":
-        data = {
-            **_decision(keys),
-            **_undecided_resume(keys),
-            "criteria": _decision(keys)["criteria"],
-        }
-        data.update(run_accepted=True)
+        data = {**_undecided_resume(keys), **_decision(keys)}
     elif data == "names_held_out_checks":
         data = {**_undecided_resume(keys), "held_out_checks": [package.checks[0].check_id]}
     projection = recovery_projection(RUN, [*_enabled(), _run_resumed(data)], versions)
@@ -369,10 +326,8 @@ async def test_a_duplicate_boundary_in_one_start_batch_is_refused_before_append(
 # The decisive authority of a pass is its own field; the display tier has none.
 
 
-def _one(keys: tuple[str, ...] = ("k",), **update: Any) -> dict[str, Any]:
-    data = _decision(keys, **update)
-    data["run_accepted"] = all(item["accepted"] for item in data["criteria"])
-    return data
+def _one(**update: Any) -> dict[str, Any]:
+    return _decision(("k",), **update)
 
 
 def test_a_declared_binding_pass_is_recorded_whatever_the_display_tier() -> None:

@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 import pytest
 
+from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.events import (
     ACTOR_STARTED,
     ADMISSION_COMPLETED,
@@ -40,12 +41,25 @@ from ouroboros.boundary.ledger import (
     verify_boundary_order,
 )
 from ouroboros.boundary.package import CheckPackageError, seal_package, seed_criterion_keys
-from ouroboros.boundary.receipts import AdmissionResult, CandidateVerification, write_receipt
+from ouroboros.boundary.receipts import (
+    AdmissionResult,
+    CandidateVerification,
+    CheckStatus,
+    write_receipt,
+)
 from ouroboros.events.base import BaseEvent
 from ouroboros.persistence.event_store import EventStore
 
 from .conftest import INPUT_DIGEST, REPRO_SCRIPT, SIGNATURE, build_package, make_seed
-from .journal_fixtures import admission_receipt, verification_receipt
+from .journal_fixtures import (
+    admission_receipt,
+    criterion,
+    decision_data,
+    expected_execution,
+    final_bindings,
+    verification_receipt,
+)
+from .test_package_identity import held_out_package
 
 CONTRACT = RunContract(check_timeout_seconds=120)
 KEYS = seed_criterion_keys(make_seed())
@@ -159,7 +173,9 @@ async def test_candidate_verification_cites_the_frozen_package(
     await ledger.record_package_frozen("task-1/V1", package)
     await ledger.record_admission("task-1/V1", admission)
     await ledger.record_actor_started("actor-1", ["task-1/V1"])
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
+    )
     verification = verification_receipt(package, base_checkout)
     event = await ledger.record_candidate_verification("task-1/V1", verification)
 
@@ -367,7 +383,9 @@ async def test_a_candidate_verification_for_another_seed_is_refused(
     await ledger.record_package_frozen("task-1/V1", package)
     await ledger.record_admission("task-1/V1", admission)
     await ledger.record_actor_started("actor-1", ["task-1/V1"])
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
+    )
     verification = verification_receipt(package, base_checkout)
     foreign = verification.model_copy(update={"seed_digest": "f" * 64})
     with pytest.raises(BoundaryOrderError, match="different Seed"):
@@ -403,18 +421,8 @@ async def test_an_undecided_resume_is_recorded_only_for_a_run_that_was_on(store)
     from ouroboros.boundary.events import ResumedPayload
 
     ledger = BoundaryLedger(store)
-    payload = ResumedPayload(
-        schema_version="s",
-        run_accepted=False,
-        existing_run_accepted=False,
-        artifact_verdict="indeterminate",
-        verified_pass_count=0,
-        unverified_count=0,
-        criterion_count=0,
-        tier_summary={},
-        criteria=(),
-        source="none",
-        reason="boundary_record_missing",
+    payload = ResumedPayload.model_validate(
+        decision_data([], source="none", reason="boundary_record_missing")
     )
     with pytest.raises(BoundaryOrderError, match="was on"):
         await ledger.record_resumed_undecided("run_x", payload=payload)
@@ -422,60 +430,19 @@ async def test_an_undecided_resume_is_recorded_only_for_a_run_that_was_on(store)
     await ledger.record_resumed_undecided("run_x", payload=payload)
 
 
-def _bindings(tier: str) -> BindingsPayload:
-    return BindingsPayload.model_validate(
-        {
-            "phase": "final",
-            "checks": [
-                {
-                    "criterion_key": KEYS[0],
-                    "check_id": "repro-add",
-                    "tier": tier,
-                    "binding_source": None,
-                    "binding": None,
-                    "status_hint": None,
-                    "reason": "r",
-                    "declared": None,
-                }
+def _decision(*statuses: str, undecided: str | None = None) -> ReconciliationPayload:
+    """One status per criterion of the frozen manifest (one status: the same for all)."""
+    statuses = statuses * len(KEYS) if len(statuses) == 1 else statuses
+    extra = {} if undecided is None else {"undecided_reason": undecided}
+    return ReconciliationPayload.model_validate(
+        decision_data(
+            [
+                criterion(index, key, status)
+                for index, (key, status) in enumerate(zip(KEYS, statuses, strict=True))
             ],
-        }
+            **extra,
+        )
     )
-
-
-def _decision(status: str, *, undecided: str | None = None) -> ReconciliationPayload:
-    """The same ``status`` for every criterion of the frozen manifest."""
-    criteria = [
-        {
-            "root_ac_index": index,
-            "criterion_key": key,
-            "package_status": status,
-            "tier": "A",
-            "reason": "r",
-            "failed_heldout_only": False,
-            "binding": None,
-            "existing_outcome": "succeeded",
-            "existing_failure_class": None,
-            "existing_accepted": True,
-            "accepted": status in ("pass", "unverified", "uncovered"),
-            "governed_by": "check_package",
-            "declared_binding_pass": False,
-        }
-        for index, key in enumerate(KEYS)
-    ]
-    data = {
-        "schema_version": "ouroboros.acceptance_reconciliation.v3",
-        "run_accepted": status in ("pass", "unverified", "uncovered"),
-        "existing_run_accepted": True,
-        "artifact_verdict": status,
-        "verified_pass_count": len(KEYS) if status == "pass" else 0,
-        "unverified_count": 0,
-        "criterion_count": len(KEYS),
-        "tier_summary": {},
-        "criteria": criteria,
-    }
-    if undecided is not None:
-        data["undecided_reason"] = undecided
-    return ReconciliationPayload.model_validate(data)
 
 
 async def _started(store, package, admission) -> BoundaryLedger:
@@ -493,7 +460,9 @@ async def test_a_verified_decision_needs_the_candidate_verification_of_runnable_
     # verification raised; a reconciliation claiming a verified status must
     # not follow the bindings alone. Refused on write, flagged on replay.
     ledger = await _started(store, package, admission)
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
+    )
     for status in ("pass", "fail", "unverified"):
         with pytest.raises(BoundaryOrderError, match="acceptance must cite a verification"):
             await ledger.record_acceptance_reconciled(
@@ -516,7 +485,9 @@ async def test_an_undecided_decision_after_a_failed_verification_is_recorded(
     # as undecided. It needs no candidate verification, and cannot smuggle a
     # verified status.
     ledger = await _started(store, package, admission)
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
+    )
     with pytest.raises(ValueError, match="undecided decision carries only"):
         _decision("pass", undecided="authority_error:OSError")
     await ledger.record_acceptance_reconciled(
@@ -534,7 +505,9 @@ async def test_an_undecided_decision_that_accepts_an_indeterminate_criterion_is_
     # indeterminate criterion. The payload model refuses it, and a payload
     # built without validation is refused on write and flagged on replay.
     ledger = await _started(store, package, admission)
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
+    )
     valid = _decision("indeterminate", undecided="authority_error:OSError")
     accepted = valid.criteria[0].model_copy(update={"accepted": True})
     raw = valid.model_dump(mode="json")
@@ -561,16 +534,37 @@ async def test_an_undecided_decision_that_accepts_an_indeterminate_criterion_is_
 
 
 async def test_bindings_with_no_runnable_check_may_be_followed_by_an_unrun_decision(
-    store, package, admission
+    store, base_checkout
 ) -> None:
+    # An oracle whose default binding did not resolve on the base (admitted
+    # tier U) and no declared binding: nothing runs, the criterion is unverified.
+    package = seal_package(held_out_package())
+    (key,) = package.criterion_keys
+    admission = admission_receipt(package, base_checkout)
+    admission = admission.model_copy(update={"check_tiers": {"oracle_1": CheckTier.U}})
     ledger = await _started(store, package, admission)
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("U"))
+    unbound = {
+        "criterion_key": key,
+        "check_id": "oracle_1",
+        "tier": "U",
+        "binding_source": None,
+        "binding": None,
+        "status_hint": "unverified",
+        "reason": "no_binding",
+        "declared": None,
+    }
+    payload = BindingsPayload.model_validate({"phase": "final", "checks": [unbound]})
+    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=payload)
+
+    def decided(status: str) -> ReconciliationPayload:
+        return ReconciliationPayload.model_validate(decision_data([criterion(0, key, status)]))
+
     with pytest.raises(BoundaryOrderError, match="claims a verified status"):
         await ledger.record_acceptance_reconciled(
-            "task-1/V1", package_id=package.package_id, reconciliation=_decision("pass")
+            "task-1/V1", package_id=package.package_id, reconciliation=decided("pass")
         )
     await ledger.record_acceptance_reconciled(
-        "task-1/V1", package_id=package.package_id, reconciliation=_decision("unverified")
+        "task-1/V1", package_id=package.package_id, reconciliation=decided("unverified")
     )
 
 
@@ -578,12 +572,22 @@ async def test_a_verified_decision_follows_the_candidate_verification(
     store, package, admission, base_checkout
 ) -> None:
     ledger = await _started(store, package, admission)
-    await ledger.record_bindings("task-1/V1", package_id=package.package_id, payload=_bindings("A"))
-    await ledger.record_candidate_verification(
-        "task-1/V1", verification_receipt(package, base_checkout)
+    await ledger.record_bindings(
+        "task-1/V1", package_id=package.package_id, payload=final_bindings(package)
     )
+    repro = expected_execution(package.checks[0]).model_copy(
+        update={"status": CheckStatus.VIOLATED, "reason": "reproduction_failed"}
+    )
+    verification = verification_receipt(package, base_checkout).model_copy(
+        update={"checks": (repro,)}
+    )
+    await ledger.record_candidate_verification("task-1/V1", verification)
+    # The repro check failed; the preservation check did not run (undecided);
+    # the third criterion has no check.
     await ledger.record_acceptance_reconciled(
-        "task-1/V1", package_id=package.package_id, reconciliation=_decision("fail")
+        "task-1/V1",
+        package_id=package.package_id,
+        reconciliation=_decision("fail", "indeterminate", "uncovered"),
     )
     assert verify_boundary_order(await ledger.events("task-1/V1")) == ()
 
@@ -600,11 +604,19 @@ def _manifest_event_data(
         "seed_digest": "2" * 64,
         "record_sha256": "a" * 64,
         "manifest": {
+            "schema_version": "ouroboros.check_package.v2",
             "package_id": "1" * 64,
             "seed_digest": "2" * 64,
+            "input_digest": "3" * 64,
+            "generated_at": "2026-09-28T00:00:00+00:00",
+            "generator": "test",
             "criterion_keys": list(keys),
             "checks": checks,
+            "files": [],
+            "base_files": [],
+            "scratch_path_count": 0,
             "uncovered": [],
+            "binding_grammar": "g",
             "oracles": oracles,
         },
     }
@@ -620,7 +632,15 @@ def _check(check_id: str, role: str, *keys: str) -> dict[str, Any]:
 
 
 def _oracle(check_id: str, key: str, held_out: int) -> dict[str, Any]:
-    return {"check_id": check_id, "criterion_key": key, "held_out_count": held_out}
+    return {
+        "check_id": check_id,
+        "criterion_key": key,
+        "call_kind": "function",
+        "param_count": 1,
+        "target_named_in_criterion": False,
+        "case_count": 3,
+        "held_out_count": held_out,
+    }
 
 
 _BASE_REASON = {
@@ -633,6 +653,7 @@ _EXCLUSION = {"reproduction": "repro_passes_on_base", "preservation": "preservat
 def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> dict[str, Any]:
     """The admission record ``admit_check_package`` writes for the frozen manifest."""
     roles = {check["check_id"]: check["role"] for check in frozen["manifest"]["checks"]}
+    oracles = {oracle["check_id"] for oracle in frozen["manifest"]["oracles"]}
     return {
         "schema_version": "ouroboros.check_admission.v2",
         "package_id": frozen["package_id"],
@@ -647,7 +668,10 @@ def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> d
         "base_tree_digest_after": "b" * 64,
         "interpreter_sha256": "d" * 64,
         "interpreter_realpath_sha256": "d" * 64,
-        "check_tiers": {check_id: "C" if check_id in excluded else "A" for check_id in roles},
+        "check_tiers": {
+            check_id: "C" if check_id in excluded else "A" if check_id in oracles else "S"
+            for check_id in roles
+        },
         "excluded_checks": {check_id: _EXCLUSION[roles[check_id]] for check_id in excluded} or None,
         "checks": [
             {
@@ -820,13 +844,11 @@ def test_the_projection_applies_admission_exclusions_and_the_reproduction_rule()
         ],
         [
             _oracle("repro_1", "k1", 2),
-            _oracle("keep_1", "k1", 0),
-            _oracle("repro_2", "k2", 0),
             _oracle("hidden_2", "k2", 3),
         ],
     )
     # repro_1 excluded: k1 keeps only a preservation check, so it is not covered;
-    # hidden_2 excluded: k2 stays covered by repro_2, which had no held-out case.
+    # hidden_2 excluded: k2 stays covered by repro_2, a script check (no held-out case).
     events = _journal(frozen, _admission_data(frozen, ("repro_1", "hidden_2")))
     projection = recovery_projection("run_p", _enabled(), {1: events})
     assert isinstance(projection, RecoveryBound)

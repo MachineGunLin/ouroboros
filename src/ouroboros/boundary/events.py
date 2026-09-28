@@ -27,14 +27,28 @@ receipts are stored separately (``package.write_package_record``,
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
-from ouroboros.boundary.binding import Binding, BindingSource, CheckTier
-from ouroboros.boundary.package import CheckPackage, package_record_bytes, sha256_bytes
+from ouroboros.boundary.binding import Binding, BindingSource, CallKind, CheckTier, tier_summary
+from ouroboros.boundary.package import (
+    PACKAGE_ID_BYTES,
+    CheckPackage,
+    CheckRole,
+    package_record_bytes,
+    sha256_bytes,
+)
 from ouroboros.boundary.receipts import (
     AdmissionJournal,
     AdmissionResult,
@@ -186,6 +200,27 @@ _GOVERNORS = frozenset({"check_package", "execution", "existing_verifier"})
 _PACKAGE_ACCEPTS = frozenset({"pass", "unverified", "uncovered"})
 _EXISTING_DECIDES = frozenset({"unverified", "uncovered"})
 _UNDECIDED_STATUSES = frozenset({"indeterminate", "uncovered"})
+_NOT_PACKAGE_DECIDED = frozenset({"unverified", "uncovered"})
+LEGACY_RULE_SCHEMA = "ouroboros.acceptance_reconciliation.v3"
+"""The decision schema of the product (``legacy_decides_unverified``): the only one journaled."""
+LOW_COVERAGE_SHARE = 0.5
+_EXISTING_PASS_OUTCOMES = frozenset({"succeeded", "satisfied_externally"})
+
+
+def artifact_verdict_of(statuses: Iterable[str]) -> str:
+    """Precedence: fail, then indeterminate, then pass (one verified pass), else unverified."""
+    values = set(statuses)
+    for verdict in ("fail", "indeterminate", "pass"):
+        if verdict in values:
+            return verdict
+    return "unverified"
+
+
+def coverage_of(total: int, not_decided: int, unverified: int) -> str:
+    """``low`` when half or more of ``total`` were not decided by the package or any is unverified."""
+    if unverified or (total and not_decided / total >= LOW_COVERAGE_SHARE):
+        return "low"
+    return "partial" if not_decided else "full"
 
 
 class ReconciliationPayload(_Payload):
@@ -246,7 +281,61 @@ class ReconciliationPayload(_Payload):
             raise ValueError("the run's acceptance disagrees with its criteria")
         if self.criterion_count != len(self.criteria):
             raise ValueError("criterion_count disagrees with the criteria")
+        statuses = [item.package_status for item in self.criteria]
+        if (
+            self.artifact_verdict != artifact_verdict_of(statuses)
+            or self.verified_pass_count != statuses.count("pass")
+            or self.unverified_count != len(self._unverified())
+            or self.tier_summary != tier_summary(item.tier for item in self.criteria)
+        ):
+            raise ValueError("a decision's summary disagrees with its criteria")
         return self
+
+    def _unverified(self) -> list[CriterionDecisionRecord]:
+        """Criteria no verifier decided: not the package's, and not legacy-decided."""
+        return [
+            item
+            for item in self.criteria
+            if item.package_status in _NOT_PACKAGE_DECIDED
+            and item.governed_by != "existing_verifier"
+        ]
+
+    def check_product_rule(self) -> None:
+        """``ValueError`` unless the product's rule (``legacy_decides_unverified``) wrote it.
+
+        The product decides every run under that rule (schema
+        ``LEGACY_RULE_SCHEMA``): a criterion the package did not verify
+        (unverified or uncovered) is decided by the existing verifier's own
+        verdict; the package accepts one only where the existing verifier
+        accepted it without evidence, so it never accepts over a rejection.
+        The rule's summary (legacy-decided count, coverage) is present and
+        agrees with the criteria.
+        """
+        if self.schema_version != LEGACY_RULE_SCHEMA:
+            raise ValueError("a journaled decision is made under the product's legacy rule")
+        for item in self.criteria:
+            if (
+                item.package_status in _NOT_PACKAGE_DECIDED
+                and item.accepted
+                and not item.existing_accepted
+            ):
+                raise ValueError("a criterion the package did not verify is the legacy verdict")
+            # The existing verifier accepts only a successful outcome; with no
+            # per-criterion outcome its verdict is the run's.
+            if item.existing_outcome is None:
+                if item.existing_accepted != self.existing_run_accepted:
+                    raise ValueError("a criterion without an outcome takes the run's verdict")
+            elif item.existing_accepted and item.existing_outcome not in _EXISTING_PASS_OUTCOMES:
+                raise ValueError("the existing verifier accepted an outcome that is no success")
+        legacy = sum(1 for item in self.criteria if item.governed_by == "existing_verifier")
+        not_decided = sum(1 for i in self.criteria if i.package_status in _NOT_PACKAGE_DECIDED)
+        accepted_unverified = [i for i in self._unverified() if i.governed_by != "execution"]
+        coverage = coverage_of(len(self.criteria), not_decided, len(accepted_unverified))
+        if self.legacy_decided_count != legacy or self.verification_coverage != coverage:
+            raise ValueError("a decision's legacy summary disagrees with its criteria")
+        indexes = sorted(item.root_ac_index for item in self.criteria)
+        if indexes != list(range(len(self.criteria))):
+            raise ValueError("a decision names each root criterion once, by position")
 
 
 class ResumedPayload(ReconciliationPayload):
@@ -496,17 +585,119 @@ class EnabledRecord(_Payload):
         return Cited(None)
 
 
-class FrozenRecord(_Payload):
-    """``boundary.check_package.frozen`` as journaled.
+_HEX = frozenset("0123456789abcdef")
 
-    ``manifest`` is the package's own summary (``CheckPackage.manifest_summary``);
-    ``ledger.frozen_manifest`` validates the identities it holds.
+
+def _hex(value: str, length: int = 64) -> str:
+    if len(value) != length or not set(value) <= _HEX:
+        raise ValueError(f"a digest or id is {length} lowercase hex characters")
+    return value
+
+
+class ManifestCheck(_Payload):
+    """One check in ``CheckPackage.manifest_summary``."""
+
+    check_id: str = Field(min_length=1)
+    role: CheckRole
+    criterion_keys: tuple[str, ...]
+    assertion_ids: tuple[str, ...]
+
+
+class ManifestOracleData(_Payload):
+    """The oracle data file in the manifest: named by kind, never by digest."""
+
+    kind: Literal["oracle_data"]
+    held_out_redacted: Literal[True]
+
+
+class ManifestFile(_Payload):
+    """Every other package file in the manifest: its kind, digest and size."""
+
+    kind: Literal["oracle_harness", "generated"]
+    sha256: str
+    size: int = Field(ge=0)
+
+    _sha = field_validator("sha256")(_hex)
+
+
+class ManifestBaseFile(_Payload):
+    sha256: str
+
+    _sha = field_validator("sha256")(_hex)
+
+
+class ManifestOracle(_Payload):
+    """One oracle in the manifest: ids, kind and counts, no case and no symbol."""
+
+    check_id: str
+    criterion_key: str
+    call_kind: CallKind
+    param_count: int = Field(ge=0)
+    target_named_in_criterion: bool
+    case_count: int = Field(ge=1)
+    held_out_count: int = Field(ge=1)
+    """Every oracle declares at least one held-out case (``oracle.OracleSpec``)."""
+
+    @model_validator(mode="after")
+    def _counts(self) -> ManifestOracle:
+        if self.held_out_count > self.case_count:
+            raise ValueError("an oracle holds out more cases than it has")
+        return self
+
+
+class ManifestRecord(_Payload):
+    """The exact closed schema of ``CheckPackage.manifest_summary`` (the frozen manifest).
+
+    ``binding_grammar`` and ``oracles`` are written together and only for a
+    package with oracles. ``ledger.frozen_manifest`` checks how the fields
+    relate (links, coverage, oracles).
     """
+
+    schema_version: Literal["ouroboros.check_package.v1", "ouroboros.check_package.v2"]
+    package_id: str
+    seed_digest: str
+    input_digest: str
+    generated_at: str
+    """ISO 8601 with a UTC offset, as the package writes it (``datetime.isoformat``)."""
+    generator: str | None
+    criterion_keys: tuple[str, ...]
+    checks: tuple[ManifestCheck, ...]
+    files: tuple[ManifestOracleData | ManifestFile, ...]
+    base_files: tuple[ManifestBaseFile, ...]
+    scratch_path_count: int = Field(ge=0)
+    uncovered: tuple[UncoveredRecord, ...]
+    binding_grammar: str | None = None
+    oracles: tuple[ManifestOracle, ...] | None = None
+
+    _digests = field_validator("seed_digest", "input_digest")(_hex)
+    _id = field_validator("package_id")(lambda value: _hex(value, 2 * PACKAGE_ID_BYTES))
+
+    @field_validator("generated_at")
+    @classmethod
+    def _iso(cls, value: str) -> str:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None or moment.isoformat() != value:
+            raise ValueError("generated_at is the package's timezone-aware ISO timestamp")
+        return value
+
+    @model_validator(mode="after")
+    def _oracles_together(self) -> ManifestRecord:
+        fields = self.model_fields_set
+        if ("oracles" in fields) != ("binding_grammar" in fields) or self.oracles == ():
+            raise ValueError("a manifest lists oracles and their grammar together, or neither")
+        return self
+
+
+class FrozenRecord(_Payload):
+    """``boundary.check_package.frozen`` as journaled (``package_frozen_event``)."""
 
     package_id: str
     seed_digest: str
     record_sha256: str
-    manifest: dict[str, Any]
+    manifest: ManifestRecord
+
+    _digests = field_validator("seed_digest", "record_sha256")(_hex)
+    _id = field_validator("package_id")(lambda value: _hex(value, 2 * PACKAGE_ID_BYTES))
 
     def cited(self) -> Cited:
         return Cited(self.package_id, self.seed_digest)
@@ -517,7 +708,9 @@ class ConstructionFailedRecord(_Payload):
 
     seed_digest: str
     input_digest: str
-    reason: str
+    reason: str = Field(min_length=1)
+
+    _digests = field_validator("seed_digest", "input_digest")(_hex)
 
     def cited(self) -> Cited:
         return Cited(None, self.seed_digest)
@@ -567,38 +760,70 @@ class SupersededRecord(_Payload):
 
 
 class BindingsRecord(BindingsPayload):
-    """``boundary.binding.recorded`` as journaled."""
+    """``boundary.binding.recorded`` as journaled: one record per check, each once."""
 
     package_id: str
 
+    @model_validator(mode="after")
+    def _once(self) -> BindingsRecord:
+        ids = [item.check_id for item in self.checks]
+        if len(set(ids)) != len(ids):
+            raise ValueError("bindings name a check twice")
+        return self
+
     def cited(self) -> Cited:
         declared = [item.declared for item in self.checks if item.declared is not None]
+        bindings = [
+            binding
+            for binding in (
+                *(item.binding for item in self.checks),
+                *(item.binding for item in declared),
+            )
+            if binding is not None
+        ]
         return Cited(
             self.package_id,
             criterion_keys=(
                 *(item.criterion_key for item in self.checks),
                 *(item.criterion_key for item in declared),
+                *(binding.criterion_key for binding in bindings),
             ),
             check_ids=tuple(item.check_id for item in self.checks),
         )
 
 
 class VerificationRecord(VerificationJournal):
-    """``boundary.candidate.verified`` as journaled."""
+    """``boundary.candidate.verified`` as journaled: one result per check, each once."""
+
+    @model_validator(mode="after")
+    def _once(self) -> VerificationRecord:
+        ids = [check.check_id for check in self.checks]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a verification names a check twice")
+        return self
 
     def cited(self) -> Cited:
-        return Cited(self.package_id, self.seed_digest, check_ids=self.check_ids())
+        keys = tuple(binding.criterion_key for binding in (self.bindings or {}).values())
+        return Cited(
+            self.package_id, self.seed_digest, criterion_keys=keys, check_ids=self.check_ids()
+        )
 
 
 def _decision_cited(package_id: str | None, criteria: tuple[CriterionDecisionRecord, ...]) -> Cited:
     keys = tuple(item.criterion_key for item in criteria)
-    return Cited(package_id, criterion_keys=keys, decided=keys)
+    bound = tuple(item.binding.criterion_key for item in criteria if item.binding is not None)
+    return Cited(package_id, criterion_keys=(*keys, *bound), decided=keys)
 
 
 class ReconciledRecord(ReconciliationPayload):
-    """``boundary.acceptance.reconciled`` as journaled."""
+    """``boundary.acceptance.reconciled`` as journaled (under the product's rule)."""
 
     package_id: str | None
+
+    @model_validator(mode="after")
+    def _product_rule(self) -> ReconciledRecord:
+        self.check_product_rule()
+        return self
 
     def cited(self) -> Cited:
         return _decision_cited(self.package_id, self.criteria)
@@ -608,6 +833,11 @@ class ResumedRecord(ResumedPayload):
     """``boundary.acceptance.resumed`` as journaled (on a version or on the run)."""
 
     package_id: str | None
+
+    @model_validator(mode="after")
+    def _product_rule(self) -> ResumedRecord:
+        self.check_product_rule()
+        return self
 
     def cited(self) -> Cited:
         cited = _decision_cited(self.package_id, self.criteria)
