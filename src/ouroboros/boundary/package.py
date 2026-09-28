@@ -42,7 +42,10 @@ from ouroboros.boundary.oracle import (
     ORACLE_HARNESS_PATH,
     ORACLE_HARNESS_SOURCE,
     OracleSpec,
+    oracle_check_id,
     oracle_data_text,
+    oracle_ordinal,
+    positive_ordinal,
 )
 from ouroboros.core.filesystem_capability import (
     NoFollowDirectoryChain,
@@ -105,6 +108,40 @@ def normalize_relative_path(value: str) -> str:
             return "."
         raise ValueError(f"path must not contain '.' or '..' components: {value!r}")
     return PurePosixPath(*parts).as_posix()
+
+
+_SCRIPT_CHECK_PREFIX = "script_"
+
+
+def script_check_id(criterion_number: int, ordinal: int) -> str:
+    """The product's id of the ``ordinal``-th script check first linking criterion ``criterion_number``."""
+    if criterion_number < 1 or ordinal < 1:
+        raise ValueError("criterion numbers and ordinals start at 1")
+    return f"{_SCRIPT_CHECK_PREFIX}{criterion_number}_{ordinal}"
+
+
+def script_assertion_id(check_id: str, position: int) -> str:
+    """The product's id of the assertion at 1-based ``position`` in a script check."""
+    if position < 1:
+        raise ValueError("assertion positions start at 1")
+    return f"{check_id}.a{position}"
+
+
+def _is_minted_script(check: CheckSpec, criterion_number: int) -> bool:
+    """``check`` carries exactly the ids the product mints for a script check of its criterion."""
+    prefix = f"{_SCRIPT_CHECK_PREFIX}{criterion_number}_"
+    if not check.check_id.startswith(prefix):
+        return False
+    ordinal = positive_ordinal(check.check_id[len(prefix) :])
+    return (
+        ordinal is not None
+        and check.check_id == script_check_id(criterion_number, ordinal)
+        and [link.assertion_id for link in check.assertions]
+        == [
+            script_assertion_id(check.check_id, position)
+            for position in range(1, len(check.assertions) + 1)
+        ]
+    )
 
 
 class CheckRole(StrEnum):
@@ -295,6 +332,19 @@ class CheckPackage(BaseModel, frozen=True):
                         f"criterion {link.criterion_key}"
                     )
                 linked.add(link.criterion_key)
+        numbers = {key: number for number, key in enumerate(keys, start=1)}
+        oracle_ids = {spec.check_id for spec in self.oracles}
+        for check in self.checks:
+            # Ids are persisted: only the product's minted form is accepted, so
+            # no identifier a caller chose (which could spell a held-out
+            # value) can reach a record, a receipt or the journal.
+            if check.check_id not in oracle_ids and not _is_minted_script(
+                check, numbers[check.assertions[0].criterion_key]
+            ):
+                raise ValueError(
+                    "a script check carries the product's ids (script_check_id, "
+                    "script_assertion_id)"
+                )
         uncovered = [item.criterion_key for item in self.uncovered]
         if len(set(uncovered)) != len(uncovered):
             raise ValueError("uncovered criterion keys must be unique")
@@ -322,20 +372,25 @@ class CheckPackage(BaseModel, frozen=True):
             )
         checks = {check.check_id: check for check in self.checks}
         files = {item.path: item.content for item in self.files}
+        numbers = {key: number for number, key in enumerate(self.criterion_keys, start=1)}
         seen: set[str] = set()
         for spec in self.oracles:
             check = checks.get(spec.check_id)
             if check is None or spec.check_id in seen:
                 raise ValueError(f"oracle {spec.check_id} needs exactly one check")
             seen.add(spec.check_id)
-            if check.argv != oracle_argv(spec.check_id) or check.cwd != ".":
-                raise ValueError(f"oracle check {spec.check_id} must run the product harness")
-            if check.failure_signature not in (None, spec.failure_signature) or (
-                check.role is CheckRole.REPRODUCTION and not check.failure_signature
+            ordinal = oracle_ordinal(spec.check_id)
+            number = numbers.get(spec.criterion_key)
+            if (
+                ordinal is None
+                or number is None
+                or spec.check_id != oracle_check_id(number, ordinal)
             ):
-                raise ValueError(f"oracle check {spec.check_id} has a foreign failure signature")
-            if {link.criterion_key for link in check.assertions} != {spec.criterion_key}:
-                raise ValueError(f"oracle check {spec.check_id} must link only its criterion")
+                raise ValueError(f"oracle {spec.check_id} is not the product's id of its criterion")
+            if check != oracle_check(spec, check.role):
+                # The harness argv, the frozen failure signature, one assertion
+                # per case with the product's ids, and only its criterion.
+                raise ValueError(f"oracle check {spec.check_id} must be the product harness check")
         if files.get(ORACLE_HARNESS_PATH) != ORACLE_HARNESS_SOURCE:
             raise ValueError("oracle packages carry the product harness unchanged")
         if files.get(ORACLE_DATA_PATH) != oracle_data_text(self.oracles):
@@ -389,25 +444,24 @@ class CheckPackage(BaseModel, frozen=True):
     def manifest_summary(self) -> dict[str, Any]:
         """The package's safe projection: what the journal and the stored record carry.
 
-        Built from an allowlist of values the product computed: the package
-        id (``seal_package``; ``None`` before it is sealed), the Seed and
-        input digests, criterion keys, product-minted check and assertion
-        ids, roles, links, file kinds and counts. No value is a function of
-        bytes the constructor wrote: no file path, argv, script, failure
-        signature, binding symbol, parameter name, case, locator or scratch
-        path, and no digest or size of a package file, since any of them can
-        carry a held-out value or let anyone confirm a guessed one offline.
-        The package itself is never named by an unkeyed digest either. Two
-        packages that differ only in what the constructor wrote have the same
-        projection, apart from their random ids and timestamps.
+        Built from an allowlist of values whose provenance the model itself
+        enforces: the package id (minted by ``seal_package``; ``None`` before
+        it is sealed), the Seed digest and criterion keys (bound to the Seed
+        by ``validate_package_for_seed``), check and assertion ids (the
+        model accepts only the product's minted forms), roles and call kinds
+        (closed enums), file kinds and counts. Nothing a caller or the
+        constructor supplies as free text or bytes is copied: no file path,
+        argv, script, failure signature, binding symbol, parameter name,
+        case, locator, scratch path, uncovered reason, generator label, input
+        digest or timestamp, and no digest or size of a package file, since
+        any of them can carry a held-out value or let anyone confirm a guessed
+        one offline. Two packages that differ only in such values have the
+        same projection, apart from their random ids.
         """
         return {
             "schema_version": self.schema_version,
             "package_id": self.package_id if self.sealed else None,
             "seed_digest": self.seed_digest,
-            "input_digest": self.input_digest,
-            "generated_at": self.generated_at.isoformat(),
-            "generator": self.generator,
             "criterion_keys": list(self.criterion_keys),
             "checks": [
                 {
@@ -421,7 +475,7 @@ class CheckPackage(BaseModel, frozen=True):
             "files": [_file_projection(item) for item in self.files],
             "base_file_count": len(self.base_files),
             "scratch_path_count": len(self.scratch_paths),
-            "uncovered": [item.model_dump(mode="json") for item in self.uncovered],
+            "uncovered": [{"criterion_key": item.criterion_key} for item in self.uncovered],
             **self._oracle_summary(),
         }
 

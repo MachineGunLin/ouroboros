@@ -124,12 +124,12 @@ def build_package(
         "generator": "test-generator",
         "checks": (
             CheckSpec(
-                check_id="repro-add",
+                check_id="script_1_1",
                 role=CheckRole.REPRODUCTION,
                 argv=repro_argv or (PY, "probe/test_add.py"),
                 assertions=(
                     AssertionLink(
-                        assertion_id="add_sums_operands",
+                        assertion_id="script_1_1.a1",
                         criterion_key=keys[0],
                         file="probe/test_add.py",
                     ),
@@ -137,12 +137,12 @@ def build_package(
                 failure_signature=SIGNATURE,
             ),
             CheckSpec(
-                check_id="preserve-zero",
+                check_id="script_2_1",
                 role=CheckRole.PRESERVATION,
                 argv=(PY, "probe/test_zero.py"),
                 assertions=(
                     AssertionLink(
-                        assertion_id="zero_identity",
+                        assertion_id="script_2_1.a1",
                         criterion_key=keys[1],
                         file="probe/test_zero.py",
                     ),

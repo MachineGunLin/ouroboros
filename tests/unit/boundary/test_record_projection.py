@@ -24,6 +24,7 @@ from ouroboros.boundary.package import (
     CheckRole,
     CheckSpec,
     PackageFile,
+    UncoveredObligation,
     package_record,
     package_record_bytes,
     seal_package,
@@ -87,7 +88,7 @@ def _reply(secret: str = SENTINEL) -> dict[str, Any]:
         "role": "reproduction",
         "argv": ["python3", _script_path(secret)],
         "failure_signature": f"CLAMP_FAILED_{secret}_SIGNATURE",
-        "assertions": [{"criterion": 3, "assertion_id": f"b{secret}"}],
+        "assertions": [{"criterion": 2, "assertion_id": f"b{secret}"}],
     }
     return {
         "oracles": [oracle],
@@ -97,13 +98,22 @@ def _reply(secret: str = SENTINEL) -> dict[str, Any]:
     }
 
 
+def _caller_metadata(secret: str) -> dict[str, Any]:
+    """Metadata a caller passes with a package, each carrying ``secret``."""
+    return {
+        "input_digest": hashlib.sha256(secret.encode()).hexdigest(),
+        "generator": f"constructor_{secret}",
+        "generated_at": FIXED_TIME.replace(microsecond=int(secret[:6])),
+    }
+
+
 def _from_reply(secret: str = SENTINEL) -> CheckPackage:
+    keys = seed_criterion_keys(SEED)
     return package_from_reply(
         _reply(secret),
         SEED,
-        input_digest="1" * 64,
-        generator="constructor-model",
-        generated_at=FIXED_TIME,
+        product_uncovered={keys[2]: f"held_out_{secret}"},
+        **_caller_metadata(secret),
     )
 
 
@@ -130,16 +140,18 @@ def test_no_constructor_text_reaches_the_record_or_the_summary() -> None:
 
 
 def _assembled(secret: str = SENTINEL) -> CheckPackage:
-    """A package a caller assembled, with ``secret`` in base_files and scratch_paths too."""
+    """A package a caller assembled directly, with ``secret`` in every free-form field.
+
+    Metadata, the uncovered reason, the script, its path, links and
+    locator, base_files and scratch_paths.
+    """
     seed = SEED
     keys = seed_criterion_keys(seed)
     script = PackageFile.from_content(_script_path(secret), _script(secret))
     return CheckPackage(
         seed_digest=seed_digest(seed),
         criterion_keys=keys,
-        input_digest="1" * 64,
-        generated_at=FIXED_TIME,
-        generator="assembler",
+        **_caller_metadata(secret),
         checks=(
             CheckSpec(
                 check_id="script_1_1",
@@ -147,15 +159,16 @@ def _assembled(secret: str = SENTINEL) -> CheckPackage:
                 argv=("python3", _script_path(secret)),
                 assertions=tuple(
                     AssertionLink(
-                        assertion_id="script_1_1.a1",
+                        assertion_id=f"script_1_1.a{position}",
                         criterion_key=key,
                         file=_script_path(secret),
                         locator=f"line {secret}",
                     )
-                    for key in keys
+                    for position, key in enumerate(keys[:2], start=1)
                 ),
             ),
         ),
+        uncovered=(UncoveredObligation(criterion_key=keys[2], reason=f"held_out_{secret}"),),
         files=(script,),
         base_files=(
             BaseFileRef(
@@ -198,7 +211,7 @@ def _normalized(package: CheckPackage) -> tuple[bytes, str, str]:
 
 
 @pytest.mark.parametrize("build", [_from_reply, _assembled])
-@pytest.mark.parametrize("other", ["4409", "12", "987654321"])
+@pytest.mark.parametrize("other", ["4409", "12", "987654"])
 def test_packages_differing_only_in_constructor_bytes_persist_identically(
     build: Callable[[str], CheckPackage], other: str
 ) -> None:
@@ -220,3 +233,103 @@ def test_a_held_out_value_in_a_script_cannot_be_enumerated_from_the_record() -> 
         if hashlib.sha256(_script(guess).encode()).hexdigest().encode() in haystack
     ]
     assert recovered == []
+
+
+# ---------------------------------------------------------------- persisted ids
+
+
+def _script_check(check_id: str, assertion_ids: tuple[str, ...]) -> CheckSpec:
+    keys = seed_criterion_keys(SEED)
+    return CheckSpec(
+        check_id=check_id,
+        role=CheckRole.PRESERVATION,
+        argv=("python3", _script_path("1")),
+        assertions=tuple(
+            AssertionLink(assertion_id=assertion_id, criterion_key=key)
+            for assertion_id, key in zip(assertion_ids, keys, strict=False)
+        ),
+    )
+
+
+def _direct(*checks: CheckSpec, **fields: Any) -> CheckPackage:
+    keys = seed_criterion_keys(SEED)
+    return CheckPackage(
+        seed_digest=seed_digest(SEED),
+        criterion_keys=keys,
+        input_digest="1" * 64,
+        generated_at=FIXED_TIME,
+        checks=checks,
+        files=(PackageFile.from_content(_script_path("1"), _script("1")),),
+        uncovered=tuple(
+            UncoveredObligation(criterion_key=key, reason="constructor_omitted")
+            for key in keys
+            if key not in {link.criterion_key for check in checks for link in check.assertions}
+        ),
+        **fields,
+    )
+
+
+def test_a_directly_built_package_carries_only_minted_script_ids() -> None:
+    assert _direct(_script_check("script_1_1", ("script_1_1.a1", "script_1_1.a2")))
+    for check in (
+        _script_check(f"check_{SENTINEL}", ("check_6173.a1",)),  # free text
+        _script_check("script_2_1", ("script_2_1.a1",)),  # names another criterion
+        _script_check("script_1_1", (f"a{SENTINEL}",)),  # free assertion id
+        _script_check("script_1_1", ("script_1_1.a2",)),  # not its position
+        _script_check("script_1_01", ("script_1_01.a1",)),  # not the minted form
+    ):
+        with pytest.raises(ValueError):
+            _direct(check)
+
+
+def _oracle_spec(check_id: str) -> Any:
+    from ouroboros.boundary.oracle_build import build_oracle_spec
+
+    oracle = _reply("7")["oracles"][0]
+    return build_oracle_spec(
+        SEED,
+        criterion_index=0,
+        check_id=check_id,
+        call_kind=oracle["call_kind"],
+        params=oracle["params"],
+        default_binding=oracle["default_binding"],
+        cases=oracle["cases"],
+    )
+
+
+def test_a_directly_built_oracle_check_is_the_product_harness_check_exactly() -> None:
+    from ouroboros.boundary.oracle_build import assemble_package
+    from ouroboros.boundary.package import oracle_check
+
+    spec = _oracle_spec("oracle_1")
+    assert assemble_package(
+        SEED, input_digest="1" * 64, generator=None, oracles=[(spec, CheckRole.REPRODUCTION)]
+    )
+    # An oracle id naming another criterion than the one it checks.
+    with pytest.raises(ValueError):
+        assemble_package(
+            SEED,
+            input_digest="1" * 64,
+            generator=None,
+            oracles=[(_oracle_spec("oracle_2"), CheckRole.REPRODUCTION)],
+        )
+    # The oracle check with an assertion id the harness check does not have.
+    minted = oracle_check(spec, CheckRole.REPRODUCTION)
+    altered = minted.model_copy(
+        update={
+            "assertions": (
+                minted.assertions[0].model_copy(update={"assertion_id": f"a{SENTINEL}"}),
+                *minted.assertions[1:],
+            )
+        }
+    )
+    packaged = assemble_package(
+        SEED, input_digest="1" * 64, generator=None, oracles=[(spec, CheckRole.REPRODUCTION)]
+    )
+    with pytest.raises(ValueError):
+        CheckPackage.model_validate(
+            {
+                **packaged.model_dump(),
+                "checks": [altered.model_dump(), *[c.model_dump() for c in packaged.checks[1:]]],
+            }
+        )
