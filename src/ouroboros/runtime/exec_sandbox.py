@@ -192,7 +192,9 @@ roots while the command runs, and reads of anything the user can read. On
 Windows also: objects every AppContainer may write (an ACL that grants ``ALL
 APPLICATION PACKAGES`` write), the container's named-object namespace, and
 per-run grants left on roots whose launcher was killed (their caller deletes
-the roots).
+the roots), and the profile of a launcher killed in the moment between
+creating the command's AppContainer profile and deleting it (before the
+command is resumed): its folder and registry key stay behind.
 """
 
 from __future__ import annotations

@@ -50,7 +50,9 @@ process. In order:
    normal exit, failure of the command, failure of any step above). If the
    launcher itself is terminated, its job handle closes and the kernel
    kills the whole tree; the per-run grants then remain on the roots, whose
-   caller deletes them, and name a SID that no process holds any more.
+   caller deletes them, and name a SID that no process holds any more. A
+   launcher terminated between creating the profile and deleting it (before
+   the command is resumed) leaves the profile's folder and registry key.
 
 Exit status: the command's, or 125 when the sandbox could not be applied,
 126 or 127 when the command could not be started.

@@ -492,7 +492,13 @@ class TestUnavailable:
         self, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """End to end: the real Win32 call fails, the probe fails, confine refuses."""
-        monkeypatch.setattr(exec_sandbox, "_appcontainer_name", lambda: "x" * 200)
+        # 65 valid characters: one over CreateAppContainerProfile's limit, and
+        # short enough that every path built from it stays under MAX_PATH.
+        name = "ouroboros.sandbox." + "a" * 47
+        assert len(name) == 65
+        with pytest.raises(launcher.SandboxError, match="CreateAppContainerProfile"):
+            launcher.create_profile(launcher._api(), name)
+        monkeypatch.setattr(exec_sandbox, "_appcontainer_name", lambda: name)
         probe = exec_sandbox.filesystem_backend.__wrapped__  # type: ignore[attr-defined]
         monkeypatch.setattr(exec_sandbox, "filesystem_backend", probe)
 
