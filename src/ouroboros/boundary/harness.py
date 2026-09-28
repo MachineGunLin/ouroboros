@@ -5,7 +5,9 @@ One process role and one in-process role.
 target <nonce> <call_kind> <symbol>
     Runs in the project interpreter (-I -B) with the checkout copy under test
     as cwd. It imports and resolves the symbol, then writes the frame
-    '<nonce> {"phase": "resolved", ...}'. Only after that frame does the
+    '<nonce> {"phase": "resolved", ...}' (``resolve`` is ``ok``, ``missing``,
+    ``import_error``, or ``unprovable`` where the platform cannot prove the
+    code is a checkout file without following links). Only after that frame does the
     controller send ONE call on stdin: the inputs, never an expectation. The
     observation is written as '<nonce> {"phase": "result", ...}'. Frames go to
     the process's original stdout; everything the target code prints goes to
