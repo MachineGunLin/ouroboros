@@ -173,8 +173,14 @@ class CheckInterpreter:
 def pin_interpreter(path: str, source: str) -> CheckInterpreter:
     """Pin ``path`` by the real path of its binary and that file's SHA-256.
 
-    The sandbox policy is read here, once, and travels with the pin.
+    A path with a directory part is made absolute here, against the current
+    directory, but not resolved (a virtualenv's ``bin/python3`` stays its
+    own path): every check runs in its own copy of the checkout, where a
+    relative path would name nothing. A bare name is left as it is. The
+    sandbox policy is read here, once, and travels with the pin.
     """
+    if os.path.dirname(path):
+        path = os.path.abspath(path)
     real = os.path.realpath(path)
     try:
         digest = _file_sha256(real) if os.path.isfile(real) else ""

@@ -249,11 +249,8 @@ def _stop_survivor(pidfile: Path) -> None:
         pass
 
 
-async def test_a_flood_that_ends_in_the_timeout_is_still_oversized(
-    tmp_path: Path, monkeypatch
-) -> None:
+async def test_a_flood_that_ends_in_the_timeout_is_still_oversized(tmp_path: Path) -> None:
     """A survivor holding the pipe sends the overflow to the timeout path."""
-    monkeypatch.setattr(admission_module, "_REAP_GRACE_SECONDS", 1)
     pidfile = tmp_path / "pid"
     script = tmp_path / "flood.py"
     script.write_text(
@@ -281,13 +278,10 @@ async def test_a_flood_that_ends_in_the_timeout_is_still_oversized(
     assert status == (CheckStatus.VIOLATED, "output_oversized")
 
 
-async def test_a_cancelled_script_check_does_not_wait_on_a_survivor(
-    tmp_path: Path, monkeypatch
-) -> None:
+async def test_a_cancelled_script_check_does_not_wait_on_a_survivor(tmp_path: Path) -> None:
     """Cancelling (Ctrl-C, MCP cancel) is bounded like the timeout path."""
     import asyncio
 
-    monkeypatch.setattr(admission_module, "_REAP_GRACE_SECONDS", 1)
     pidfile = tmp_path / "pid"
     script = tmp_path / "hold.py"
     script.write_text(_SURVIVOR.format(tail="time.sleep(60)"))

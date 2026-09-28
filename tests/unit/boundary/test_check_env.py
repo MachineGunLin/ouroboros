@@ -256,6 +256,28 @@ async def test_admission_runs_checks_with_the_resolved_interpreter(
     assert result.interpreter_source == "project_venv"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX venv layout")
+async def test_a_pin_from_a_relative_checkout_runs_from_the_copied_checkout(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The checkout is named relative to the working directory; every check
+    # runs in its own copy, so a relative interpreter path would not resolve.
+    _fake_venv(repo)
+    monkeypatch.chdir(tmp_path)
+    chosen = resolve_check_interpreter(Path(repo.name), environ={})
+    assert chosen.source == "project_venv"
+    assert Path(chosen.path).is_absolute()
+    assert chosen.problem() is None
+    result = await admit_check_package(
+        _preservation_package(_seed("add(2, 3) returns 5")),
+        Path(repo.name),
+        env={"PATH": os.environ.get("PATH", "")},
+        interpreter=chosen,
+    )
+    assert result.verdict.value == "admitted", result.reasons
+    assert result.interpreter == str(repo / ".venv" / "bin" / "python3")
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_the_entry_point_refuses_a_replaced_interpreter(tmp_path: Path) -> None:
     python = _fake_venv(tmp_path / "project")

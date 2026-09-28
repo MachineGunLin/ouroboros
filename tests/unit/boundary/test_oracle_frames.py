@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -19,6 +20,7 @@ import pytest
 
 from ouroboros.boundary import admission as admission_module
 from ouroboros.boundary.admission import verify_candidate
+from ouroboros.boundary.check_env import CheckCommand
 from ouroboros.boundary.oracle_run import parse_frame, valid_entry
 from ouroboros.boundary.receipts import CandidateVerdict, CheckStatus
 from tests.unit.boundary.test_oracle import BUGGY, FIXED, _oracle_result, _package, _repo, _seed
@@ -197,13 +199,14 @@ async def test_the_comparison_runs_in_the_controller_with_modules_loaded_before_
     )
     launched: list[list[str]] = []
     modules: dict[str, set[str]] = {}
-    real_exec = asyncio.create_subprocess_exec
+    # Every subprocess an event loop starts goes through ``subprocess_exec``.
+    real_exec = asyncio.base_events.BaseEventLoop.subprocess_exec
 
-    async def recording_exec(*argv: Any, **kwargs: Any) -> Any:
+    async def recording_exec(self: Any, factory: Any, *argv: Any, **kwargs: Any) -> Any:
         if not launched:
             modules["before"] = set(sys.modules)
         launched.append([str(item) for item in argv])
-        return await real_exec(*argv, **kwargs)
+        return await real_exec(self, factory, *argv, **kwargs)
 
     real_run = admission_module.run_oracle_check
 
@@ -213,7 +216,7 @@ async def test_the_comparison_runs_in_the_controller_with_modules_loaded_before_
         return outcome
 
     json_module = sys.modules["json"]
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_exec)
+    monkeypatch.setattr(asyncio.base_events.BaseEventLoop, "subprocess_exec", recording_exec)
     monkeypatch.setattr(admission_module, "run_oracle_check", run_and_snapshot)
     package = _package(_seed(), base)
     candidate = _repo(tmp_path / "cand", {"mathutils.py": tamper + BUGGY})
@@ -244,11 +247,18 @@ async def test_a_target_s_children_are_killed_after_the_target_exits(tmp_path: P
         "subprocess.Popen([sys.executable, '-c', 'import sys, time; time.sleep(1.5); "
         'open(sys.argv[1], "a").write("alive")\', sys.argv[1]])\n'
     )
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", child, str(marker), start_new_session=True
+    process = await oracle_run.spawn_check_process(
+        CheckCommand((sys.executable, "-c", child, str(marker)), dict(os.environ), str(tmp_path)),
+        stdin=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    await process.wait()  # the leader is gone; its child is not
-    await oracle_run._reap(process)
+    # The leader is gone; its child (holding the leader's stdout) is not.
+    while process.returncode is None:
+        await asyncio.sleep(0.05)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await oracle_run.reap_check_process(process, started)
+    assert loop.time() - started <= oracle_run.REAP_MARGIN_SECONDS + 0.5
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         await asyncio.sleep(0.25)

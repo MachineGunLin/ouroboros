@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -365,3 +366,69 @@ async def test_a_selection_outside_the_package_runs_nothing_and_never_passes(
 
     assert result.verdict is CandidateVerdict.INDETERMINATE
     assert result.checks == ()
+
+
+# --------------------------------------------------------------------------
+# Layout preflight: every entry type at a package path is classified first
+
+
+def _occupy_with_directory(root: Path, kind: str) -> None:
+    """A directory at the exact package-file path that the file-only manifest does not list."""
+    occupied = root / "probe" / "test_add.py"
+    occupied.mkdir(parents=True)
+    if kind == "unprotected_only":
+        (occupied / "__pycache__").mkdir()
+        (occupied / "__pycache__" / "x.pyc").write_bytes(b"\0")
+
+
+@pytest.mark.parametrize("kind", ["empty", "unprotected_only"])
+async def test_a_base_directory_at_a_package_file_path_is_a_collision(
+    tmp_path: Path, base_checkout, package, kind: str
+) -> None:
+    _occupy_with_directory(base_checkout, kind)
+
+    result = await admit_check_package(package, base_checkout, work_dir=tmp_path / "w")
+
+    assert result.verdict is PackageVerdict.INDETERMINATE
+    assert "package_path_collision:probe/test_add.py" in result.reasons
+    assert result.checks == ()
+
+
+@pytest.mark.parametrize("kind", ["empty", "unprotected_only"])
+async def test_a_candidate_directory_at_a_package_file_path_is_a_layout_fault_per_check(
+    tmp_path: Path, fixed_checkout, package, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The worker controls the candidate tree: the path it occupied decides
+    # nothing, check by check, and is classified before anything is copied.
+    _occupy_with_directory(fixed_checkout, kind)
+    copied: list[Path] = []
+    real_copy = admission.copy_checkout
+    monkeypatch.setattr(
+        admission, "copy_checkout", lambda src, dst: (copied.append(dst), real_copy(src, dst))
+    )
+
+    result = await verify_candidate(package, fixed_checkout, work_dir=tmp_path / "w")
+
+    assert result.verdict is CandidateVerdict.INDETERMINATE
+    assert not any(reason.startswith("package_path_collision") for reason in result.reasons)
+    assert {check.check_id for check in result.checks} == {"repro-add", "preserve-zero"}
+    assert {check.status for check in result.checks} == {CheckStatus.INDETERMINATE}
+    assert {check.reason for check in result.checks} == {admission.CANDIDATE_LAYOUT}
+    assert copied == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX named pipes")
+@pytest.mark.parametrize("where", ["probe/test_add.py", "probe"], ids=["exact", "ancestor"])
+async def test_a_candidate_special_file_at_a_package_path_is_unreadable_per_check(
+    tmp_path: Path, fixed_checkout, package, where: str
+) -> None:
+    (fixed_checkout / where).parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(fixed_checkout / where)
+
+    result = await verify_candidate(package, fixed_checkout, work_dir=tmp_path / "w")
+
+    assert result.verdict is CandidateVerdict.INDETERMINATE
+    assert not any(reason.startswith("package_path_collision") for reason in result.reasons)
+    assert {check.check_id for check in result.checks} == {"repro-add", "preserve-zero"}
+    assert {check.status for check in result.checks} == {CheckStatus.INDETERMINATE}
+    assert {check.reason for check in result.checks} == {admission.CANDIDATE_UNREADABLE}

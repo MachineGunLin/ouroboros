@@ -43,15 +43,14 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import signal
 import stat
-import sys
 import tempfile
 import time
 from typing import Literal
 
 from ouroboros.boundary.binding import Binding, CheckTier
 from ouroboros.boundary.check_env import (
+    CheckCommand,
     CheckInterpreter,
     CheckUnavailable,
     check_command,
@@ -59,7 +58,13 @@ from ouroboros.boundary.check_env import (
     default_interpreter,
 )
 from ouroboros.boundary.oracle import OracleResult, is_oracle_file
-from ouroboros.boundary.oracle_run import CappedOutput, run_oracle_check
+from ouroboros.boundary.oracle_run import (
+    CappedOutput,
+    kill_check_group,
+    reap_check_process,
+    run_oracle_check,
+    spawn_check_process,
+)
 from ouroboros.boundary.package import (
     CheckPackage,
     CheckRole,
@@ -78,6 +83,7 @@ from ouroboros.boundary.receipts import (
 )
 from ouroboros.boundary.tree import (
     DEFAULT_UNPROTECTED_NAMES,
+    UNREADABLE,
     added_paths,
     changed_paths,
     copy_checkout,
@@ -90,9 +96,6 @@ ADMISSION_TIMEOUT_SECONDS = 120
 _OUTPUT_TAIL_CHARS = 2000
 # Per stream of a script check; more is ``output_oversized``.
 _SCRIPT_OUTPUT_LIMIT = 8 * 1024 * 1024
-# How long a killed check may take to release its pipes before the controller
-# stops waiting (a descendant that left the process group can hold them).
-_REAP_GRACE_SECONDS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,26 +146,24 @@ async def _run_argv(
         )
         if isinstance(command, CheckUnavailable):
             return _Completed(None, b"", b"", False, None, 0.0, unavailable=command.reason)
-        return await _run_in_environment(command.argv, Path(command.cwd), timeout, command.env)
+        return await _run_in_environment(command, timeout)
 
 
-async def _run_in_environment(
-    argv: Sequence[str],
-    cwd: Path,
-    timeout: int,
-    child_env: Mapping[str, str],
-) -> _Completed:
+async def _run_in_environment(command: CheckCommand, timeout: int) -> _Completed:
+    """Run ``command`` until it exits or its deadline passes, then end its process group.
+
+    One absolute deadline, taken before the launch, bounds reading the
+    output, killing the whole process group (whether or not its leader has
+    exited) and reaping it (``oracle_run.reap_check_process``, at most
+    ``REAP_MARGIN_SECONDS`` past the deadline). A run that ends past its
+    deadline is a timeout.
+    """
+    loop = asyncio.get_running_loop()
     started = time.monotonic()
-    posix = sys.platform != "win32"
+    deadline = loop.time() + timeout
     try:
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=cwd,
-            env=dict(child_env),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=posix,
+        process = await spawn_check_process(
+            command, stdin=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
     except OSError as exc:
         return _Completed(None, b"", b"", False, f"{type(exc).__name__}: {exc}", 0.0)
@@ -173,63 +174,30 @@ async def _run_in_environment(
     async def read(output: CappedOutput, reader: asyncio.StreamReader | None) -> None:
         await output.fill(reader)
         if output.overflow:
-            _kill(process, posix)
+            kill_check_group(process)
 
     async def drain() -> None:
         await asyncio.gather(read(out, process.stdout), read(err, process.stderr))
         await process.wait()
 
+    timed_out = False
     try:
-        await asyncio.wait_for(drain(), timeout=timeout)
+        await asyncio.wait_for(drain(), timeout=max(deadline - loop.time(), 0))
     except TimeoutError:
-        _kill(process, posix)
-        try:
-            # A descendant that left the process group can keep the pipes open;
-            # never let draining them outlive the command budget.
-            await asyncio.wait_for(drain(), timeout=_REAP_GRACE_SECONDS)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-        # An overflow that ended in the timeout is still an overflow.
-        return _Completed(
-            process.returncode,
-            out.data,
-            err.data,
-            True,
-            None,
-            time.monotonic() - started,
-            out.overflow or err.overflow,
-        )
-    except asyncio.CancelledError:
-        _kill(process, posix)
-        # Bounded like the timeout path: a descendant holding a pipe must not
-        # hang a cancelled run.
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_REAP_GRACE_SECONDS)
-        except TimeoutError:
-            process.kill()
-        raise
+        timed_out = True
+    finally:
+        # Also on cancellation (Ctrl-C, MCP cancel): nothing outlives the run.
+        await reap_check_process(process, deadline)
+    # An overflow that ended in the timeout is still an overflow.
     return _Completed(
         process.returncode,
         out.data,
         err.data,
-        False,
+        timed_out or loop.time() > deadline,
         None,
         time.monotonic() - started,
         out.overflow or err.overflow,
     )
-
-
-def _kill(process: asyncio.subprocess.Process, posix: bool) -> None:
-    if process.returncode is not None:
-        return
-    try:
-        if posix:
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-    except ProcessLookupError:
-        pass
 
 
 def _is_under(path: str, root: str) -> bool:
@@ -241,20 +209,28 @@ def _ancestors(path: str) -> list[str]:
     return ["/".join(parts[:end]) for end in range(1, len(parts))]
 
 
-def _package_preconditions(package: CheckPackage, manifest: Mapping[str, str]) -> list[str]:
+def _package_preconditions(
+    package: CheckPackage, manifest: Mapping[str, str], occupied: Sequence[str] = ()
+) -> list[str]:
     """Return reasons the package cannot be run faithfully on this checkout.
 
     A package path collides with the checkout when the checkout has that
     path, anything beneath it, or any of its ancestors as a file or a
-    symbolic link (a manifest entry): materializing it there would replace a
-    checkout file or follow a link out of the copy.
+    symbolic link (a readable manifest entry), or has a directory at that
+    path (``occupied``): materializing it there would replace a checkout
+    file or follow a link out of the copy. An entry that cannot be read (a
+    named pipe, a socket, a device, an unreadable directory) is not a
+    collision: the checkout cannot be copied faithfully, which is decided
+    per check (``candidate_unreadable``).
     """
+    usable = {path for path, value in manifest.items() if value != UNREADABLE}
     reasons: list[str] = []
     for item in package.files:
         if (
-            item.path in manifest
-            or any(_is_under(p, item.path) for p in manifest)
-            or any(ancestor in manifest for ancestor in _ancestors(item.path))
+            item.path in usable
+            or any(_is_under(p, item.path) for p in usable)
+            or any(ancestor in usable for ancestor in _ancestors(item.path))
+            or item.path in occupied
         ):
             reasons.append(f"package_path_collision:{item.path}")
     for scratch in package.scratch_paths:
@@ -342,6 +318,13 @@ def _directory_inside(root: Path, relative: str) -> Path | None:
         if not stat.S_ISDIR(mode):
             return None
     return current
+
+
+def _occupied_paths(package: CheckPackage, source: Path) -> tuple[str, ...]:
+    """Package-file paths where ``source`` has a directory (the file manifest lists none)."""
+    return tuple(
+        item.path for item in package.files if _directory_inside(source, item.path) is not None
+    )
 
 
 def _safe_name(check_id: str) -> str:
@@ -598,8 +581,12 @@ async def _run_package(
     unreadable = unreadable_paths(source_manifest)
     if unreadable and on_base:
         raise PermissionError(f"base checkout has unreadable paths: {', '.join(unreadable[:5])}")
+    # A directory at a package-file path: on the base the package cannot
+    # exist in this repository (a collision); on a candidate the worker put
+    # it there, and it decides nothing, check by check (``candidate_layout``).
+    occupied = _occupied_paths(package, source)
     preconditions = (
-        *_package_preconditions(package, source_manifest),
+        *_package_preconditions(package, source_manifest, occupied if on_base else ()),
         *extra_preconditions,
     )
     owned_work_dir = work_dir is None
@@ -619,6 +606,16 @@ async def _run_package(
                     executions.append(
                         _unreadable_execution(
                             check, (check_tiers or {}).get(check.check_id), unreadable[0]
+                        )
+                    )
+                    continue
+                if occupied:
+                    executions.append(
+                        _unreadable_execution(
+                            check,
+                            (check_tiers or {}).get(check.check_id),
+                            occupied[0],
+                            reason=CANDIDATE_LAYOUT,
                         )
                     )
                     continue

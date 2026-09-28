@@ -205,7 +205,10 @@ async def check_references(
 ) -> tuple[CheckPackage, ReferenceCheck]:
     """The package with inconsistent cases excluded and untrusted oracles uncovered.
 
-    An unchanged package is returned as is. Script checks are untouched.
+    Outcomes are aggregated per criterion: an untrusted oracle is dropped,
+    and its criterion is uncovered (in the package and in the report alike)
+    only when no other check of the package still covers it. An unchanged
+    package is returned as is. Script checks are untouched.
     """
     kept: list[tuple[OracleSpec, Any]] = []
     excluded: dict[str, tuple[str, ...]] = {}
@@ -242,10 +245,18 @@ async def check_references(
             excluded[spec.check_id] = tuple(disagree)
             spec = OracleSpec.model_validate({**spec.model_dump(), "cases": cases})
         kept.append((spec, roles[spec.check_id]))
-    report = ReferenceCheck(excluded=excluded, uncovered=uncovered)
-    if not excluded and not uncovered:
-        return package, report
     oracle_ids = {spec.check_id for spec in package.oracles}
+    # A criterion stays covered while any kept check still links it (the
+    # same rule ``assemble_package`` applies to the rebuilt package).
+    covered = {spec.criterion_key for spec, _role in kept} | {
+        link.criterion_key
+        for check in _script_checks(package, oracle_ids)
+        for link in check.assertions
+    }
+    uncovered = {key: reason for key, reason in uncovered.items() if key not in covered}
+    report = ReferenceCheck(excluded=excluded, uncovered=uncovered)
+    if not excluded and len(kept) == len(package.oracles):
+        return package, report
     rebuilt = assemble_package(
         seed,
         input_digest=package.input_digest,

@@ -260,3 +260,36 @@ async def test_a_command_reference_runs_as_a_script(repo: Path) -> None:
     assert report.uncovered == {}
     assert report.excluded == {"oracle_1": ("c3",)}  # held_slip
     assert [case.case_id for case in package.oracles[0].cases] == ["c1", "c2"]
+
+
+def _two_oracles(first: str | None, second: str | None) -> dict[str, Any]:
+    """Two oracles of the same criterion, with the given references."""
+    (one,) = _reply(first)["oracles"]
+    (two,) = _reply(second)["oracles"]
+    two = {**two, "check_id": "c1_clamp_again"}
+    return {"oracles": [one, two], "checks": [], "files": [], "uncovered": []}
+
+
+async def test_a_criterion_stays_covered_while_one_of_its_oracles_is_valid(repo: Path) -> None:
+    # One valid reference and one missing: the criterion keeps its valid
+    # oracle, so it is covered in the package and in the report alike.
+    package, report = await _check(_two_oracles(REFERENCE, None), repo)
+    assert [spec.check_id for spec in package.oracles] == ["oracle_1"]
+    assert [check.check_id for check in package.checks] == ["oracle_1"]
+    assert package.uncovered == ()
+    assert report.uncovered == {}
+    assert report.payload()["uncovered"] == []
+    assert report.counts()[REFERENCE_UNAVAILABLE] == 0
+
+
+async def test_a_criterion_is_uncovered_once_none_of_its_oracles_is_valid(repo: Path) -> None:
+    package, report = await _check(_two_oracles(None, PROJECT_REFERENCE), repo)
+    key = seed_criterion_keys(_seed())[0]
+    assert package.oracles == () and package.checks == ()
+    assert [(item.criterion_key, item.reason) for item in package.uncovered] == [
+        (key, REFERENCE_UNAVAILABLE)
+    ]
+    assert report.uncovered == {key: REFERENCE_UNAVAILABLE}
+    assert report.payload()["uncovered"] == [
+        {"criterion_key": key, "reason": REFERENCE_UNAVAILABLE}
+    ]

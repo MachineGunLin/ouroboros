@@ -43,7 +43,11 @@ One oracle check runs as follows:
    own output goes to stderr, which is discarded. A CLI oracle's target is the
    bound command itself. When the case is over, the controller kills the
    target's whole process group (on Linux also every process still in its
-   session) and waits, bounded, for the group to be empty.
+   session), closes its own ends of the pipes, and waits, bounded, for the
+   group to be empty. One absolute deadline, taken before anything starts,
+   bounds every launch, read, write, kill and reap of the check; reaping may
+   take at most ``REAP_MARGIN_SECONDS`` past it, and a case still running at
+   its deadline is a timeout.
 2. **Comparison**, in the controller process itself, with the comparison
    functions of the harness module (``boundary/harness.py``), imported with
    this module before any target runs. The controller parses each
@@ -127,7 +131,11 @@ _MAX_NAME_CHARS = 200
 _MAX_DEPTH = 64
 _MAX_NODES = 1_000_000
 _MAX_INT_DIGITS = 1000
-_GROUP_GRACE_SECONDS = 1.0
+REAP_MARGIN_SECONDS = 1.0
+"""How long past its deadline a killed check process may take to be reaped.
+
+The only time a check spends beyond its timeout: killing is immediate, so
+this is waiting for the kernel to report what was already killed."""
 _POSIX = sys.platform != "win32"
 _LINUX = sys.platform.startswith("linux")
 _OBSERVED = frozenset({"returned", "raised"})
@@ -277,7 +285,43 @@ def _session_members(leader: int) -> list[int]:
     return members
 
 
-def _kill_group(process: asyncio.subprocess.Process) -> None:
+class CheckProcess(asyncio.subprocess.Process):
+    """A check process that keeps its transport, so the controller can close its pipe ends."""
+
+    def __init__(
+        self,
+        transport: asyncio.SubprocessTransport,
+        protocol: asyncio.subprocess.SubprocessStreamProtocol,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        super().__init__(transport, protocol, loop)
+        self.transport = transport
+
+
+async def spawn_check_process(
+    command: CheckCommand, *, stdin: int, stderr: int, limit: int = _READ_CHUNK
+) -> CheckProcess:
+    """Start ``command`` in its own session and process group, its stdout on a pipe.
+
+    ``command`` comes from ``check_env.check_command``; ``stdin`` and
+    ``stderr`` are ``PIPE`` or ``DEVNULL``. Raises ``OSError`` when it
+    cannot be started.
+    """
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.subprocess_exec(
+        lambda: asyncio.subprocess.SubprocessStreamProtocol(limit=limit, loop=loop),
+        *command.argv,
+        cwd=command.cwd,
+        env=dict(command.env),
+        stdin=stdin,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=stderr,
+        start_new_session=_POSIX,
+    )
+    return CheckProcess(transport, protocol, loop)
+
+
+def kill_check_group(process: asyncio.subprocess.Process) -> None:
     """SIGKILL the target's process group (and, on Linux, its session)."""
     if not _POSIX:
         if process.returncode is None:
@@ -299,35 +343,35 @@ def _kill_group(process: asyncio.subprocess.Process) -> None:
             continue
 
 
-async def _discard(reader: asyncio.StreamReader | None) -> None:
-    while reader is not None and await reader.read(_READ_CHUNK):
-        pass
+async def reap_check_process(process: CheckProcess, deadline: float) -> int | None:
+    """Kill the process group, close the controller's pipe ends, and reap the leader.
 
-
-async def _reap(process: asyncio.subprocess.Process) -> int | None:
-    """Kill the target's group, reap the leader, and wait (bounded) for the group to empty.
-
-    Unread output left in the pipe is discarded chunk by chunk: asyncio
-    reports the exit only once the pipe reaches end of file, so a reader
-    stopped at the output cap would otherwise stall the reap.
+    The group is killed whether or not its leader has already exited: it
+    outlives the leader while any member is alive. The controller's pipe ends
+    are closed, so a process that left the group (a double fork plus
+    ``setsid``) and still holds the other ends cannot delay the reap (asyncio
+    reports an exit only once every pipe is closed). Waiting for the leader
+    and for the group to be empty ends by ``deadline`` (event loop time) plus
+    ``REAP_MARGIN_SECONDS``. Returns the leader's exit status, ``None`` when
+    it was not reported by then.
     """
-    _kill_group(process)
+    kill_check_group(process)
+    process.transport.close()
+    loop = asyncio.get_running_loop()
+    limit = deadline + REAP_MARGIN_SECONDS
     try:
-        await asyncio.wait_for(asyncio.gather(_discard(process.stdout), process.wait()), timeout=10)
+        await asyncio.wait_for(process.wait(), timeout=max(limit - loop.time(), 0))
     except TimeoutError:
-        code = None
-    else:
-        code = process.returncode
+        pass
     if _POSIX:
-        deadline = time.monotonic() + _GROUP_GRACE_SECONDS
-        while time.monotonic() < deadline:
+        while loop.time() < limit:
             try:
                 os.killpg(process.pid, 0)
             except (ProcessLookupError, PermissionError):
                 break
-            _kill_group(process)
+            kill_check_group(process)
             await asyncio.sleep(0.02)
-    return code
+    return process.returncode
 
 
 async def _next_frame(
@@ -406,87 +450,105 @@ class _Case:
     timed_out: bool = False
 
 
+def _timeout_case(case_id: str, *, observed: bool) -> _Case:
+    """The case at its deadline: before (setup) or after its inputs were sent."""
+    if observed:
+        return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
+    return _Case(
+        "setup",
+        entry={"case_id": case_id, "outcome": "timeout"},
+        resolve="setup_timeout",
+        timed_out=True,
+    )
+
+
 async def _python_case(
     command: CheckCommand,
     nonce: str,
     call: dict[str, Any],
-    budget: float,
+    deadline: float,
 ) -> _Case:
+    """One target process, from launch to reap, within ``deadline`` (event loop time)."""
     case_id = call["case_id"]
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(budget, 0.01)
+    if loop.time() >= deadline:
+        return _timeout_case(case_id, observed=False)
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command.argv,
-            cwd=command.cwd,
-            env=dict(command.env),
+        process = await spawn_check_process(
+            command,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=_POSIX,
             limit=_FRAME_LIMIT,
         )
     except OSError as exc:
         return _Case("launch_error", resolve="launch_failed", detail=f"{type(exc).__name__}: {exc}")
     try:
-        status, frame = await _next_frame(process, nonce, deadline)
-        if status == "timeout":
-            return _Case(
-                "setup",
-                entry={"case_id": case_id, "outcome": "timeout"},
-                resolve="setup_timeout",
-                timed_out=True,
-            )
-        if status == "eof":
-            code = await _reap(process)
-            return _Case(
-                "setup",
-                entry={"case_id": case_id, "outcome": "crashed", "exit": code},
-                resolve="setup_failed",
-                detail="no resolved frame",
-            )
-        resolve = (frame or {}).get("resolve")
-        if (frame or {}).get("phase") != "resolved" or resolve not in (
-            "ok",
-            "missing",
-            "import_error",
-        ):
-            return _Case(
-                "setup",
-                entry={"case_id": case_id, "outcome": "malformed"},
-                resolve="frame_malformed",
-            )
-        detail = (frame or {}).get("detail")
-        if resolve != "ok":
-            return _Case(
-                "resolve",
-                resolve=str(resolve),
-                detail=(detail if isinstance(detail, str) else "")[:500],
-            )
-        assert process.stdin is not None
-        try:
-            # Bounded like everything else in the case: a target that
-            # never reads its stdin cannot stall the controller.
-            process.stdin.write((json.dumps(call) + "\n").encode("utf-8"))
-            await asyncio.wait_for(process.stdin.drain(), timeout=max(deadline - loop.time(), 0.01))
-            process.stdin.close()
-        except TimeoutError:
-            return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        status, frame = await _next_frame(process, nonce, deadline)
-        if status == "timeout":
-            return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
-        if status == "eof":
-            code = await _reap(process)
-            return _Case("observed", entry={"case_id": case_id, "outcome": "crashed", "exit": code})
-        entry = (frame or {}).get("entry")
-        if (frame or {}).get("phase") != "result" or not valid_entry(entry, case_id):
-            return _Case("observed", entry={"case_id": case_id, "outcome": "malformed"})
-        assert isinstance(entry, dict)
-        return _Case("observed", entry=entry)
+        outcome = await _python_exchange(process, nonce, call, deadline)
     finally:
-        await _reap(process)
+        await reap_check_process(process, deadline)
+    if loop.time() > deadline and (outcome.entry or {}).get("outcome") != "timeout":
+        # Its reap ran past the deadline: nothing it reported stands.
+        return _timeout_case(case_id, observed=outcome.kind == "observed")
+    return outcome
+
+
+async def _python_exchange(
+    process: CheckProcess, nonce: str, call: dict[str, Any], deadline: float
+) -> _Case:
+    """Read the ``resolved`` frame, send the case's inputs, read the ``result`` frame."""
+    case_id = call["case_id"]
+    loop = asyncio.get_running_loop()
+    status, frame = await _next_frame(process, nonce, deadline)
+    if status == "timeout":
+        return _timeout_case(case_id, observed=False)
+    if status == "eof":
+        code = await reap_check_process(process, deadline)
+        return _Case(
+            "setup",
+            entry={"case_id": case_id, "outcome": "crashed", "exit": code},
+            resolve="setup_failed",
+            detail="no resolved frame",
+        )
+    resolve = (frame or {}).get("resolve")
+    if (frame or {}).get("phase") != "resolved" or resolve not in (
+        "ok",
+        "missing",
+        "import_error",
+    ):
+        return _Case(
+            "setup",
+            entry={"case_id": case_id, "outcome": "malformed"},
+            resolve="frame_malformed",
+        )
+    detail = (frame or {}).get("detail")
+    if resolve != "ok":
+        return _Case(
+            "resolve",
+            resolve=str(resolve),
+            detail=(detail if isinstance(detail, str) else "")[:500],
+        )
+    assert process.stdin is not None
+    try:
+        # Bounded like everything else in the case: a target that
+        # never reads its stdin cannot stall the controller.
+        process.stdin.write((json.dumps(call) + "\n").encode("utf-8"))
+        await asyncio.wait_for(process.stdin.drain(), timeout=max(deadline - loop.time(), 0.01))
+        process.stdin.close()
+    except TimeoutError:
+        return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    status, frame = await _next_frame(process, nonce, deadline)
+    if status == "timeout":
+        return _Case("observed", entry={"case_id": case_id, "outcome": "timeout"})
+    if status == "eof":
+        code = await reap_check_process(process, deadline)
+        return _Case("observed", entry={"case_id": case_id, "outcome": "crashed", "exit": code})
+    entry = (frame or {}).get("entry")
+    if (frame or {}).get("phase") != "result" or not valid_entry(entry, case_id):
+        return _Case("observed", entry={"case_id": case_id, "outcome": "malformed"})
+    assert isinstance(entry, dict)
+    return _Case("observed", entry=entry)
 
 
 async def _feed(process: asyncio.subprocess.Process, data: bytes) -> None:
@@ -503,25 +565,22 @@ async def _feed(process: asyncio.subprocess.Process, data: bytes) -> None:
             pass
 
 
-async def _cli_case(command: CheckCommand, stdin: str, budget: float, call_text: str) -> _Case:
-    """One CLI call; its stdout is read under ``_CLI_OUTPUT_LIMIT`` while it streams.
+async def _cli_case(command: CheckCommand, stdin: str, deadline: float, call_text: str) -> _Case:
+    """One CLI call, from launch to reap, within ``deadline`` (event loop time).
 
-    More output than the limit is an oversized observation (this case fails
-    on a candidate, the base is undecided): the process group is killed at
-    the first byte past the limit, so a target cannot make the controller
-    buffer its output. The stdin write shares the case deadline.
+    Its stdout is read under ``_CLI_OUTPUT_LIMIT`` while it streams. More
+    output than the limit is an oversized observation (this case fails on a
+    candidate, the base is undecided): the process group is killed at the
+    first byte past the limit, so a target cannot make the controller buffer
+    its output. The stdin write shares the case deadline.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(budget, 0.01)
+    timeout = _Case("observed", entry={"outcome": "timeout", "call": call_text})
+    if loop.time() >= deadline:
+        return timeout
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command.argv,
-            cwd=command.cwd,
-            env=dict(command.env),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=_POSIX,
+        process = await spawn_check_process(
+            command, stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
         )
     except OSError as exc:
         return _Case("resolve", resolve="missing", detail=f"{call_text}: {exc}")
@@ -535,9 +594,12 @@ async def _cli_case(command: CheckCommand, stdin: str, budget: float, call_text:
             return _Case("observed", entry={"outcome": "malformed", "call": call_text})
         await asyncio.wait_for(process.wait(), timeout=max(deadline - loop.time(), 0.01))
     except TimeoutError:
-        return _Case("observed", entry={"outcome": "timeout", "call": call_text})
+        return timeout
     finally:
-        await _reap(process)
+        await reap_check_process(process, deadline)
+    if loop.time() > deadline:
+        # Its reap ran past the deadline: nothing it reported stands.
+        return timeout
     return _Case(
         "observed",
         entry={
@@ -557,20 +619,22 @@ async def _observe(
     cwd: Path,
     prepare: _Prepare,
     python: str,
-    budget: float,
+    deadline: float,
     *,
     on_base: bool,
 ) -> tuple[str, str, dict[str, dict[str, Any]], bool]:
-    """Run ``cases``; return ``(resolve, detail, observations, timed_out)``.
+    """Run ``cases`` by ``deadline``; return ``(resolve, detail, observations, timed_out)``.
 
-    Raises ``_Unavailable`` when the entry point refuses a process.
+    Each case gets an equal share of the time left before ``deadline``
+    (event loop time). Raises ``_Unavailable`` when the entry point refuses
+    a process.
     """
     arg_map = dict(binding.arg_map)
     observations: dict[str, dict[str, Any]] = {}
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
     for position, case in enumerate(cases):
         share = (deadline - loop.time()) / (len(cases) - position)
+        case_deadline = loop.time() + share
         if oracle.call_kind is CallKind.CLI:
             argv = harness_module.cli_argv(
                 python, str(cwd), binding.symbol, list(oracle.params), arg_map, case.args
@@ -579,7 +643,9 @@ async def _observe(
             script = binding.symbol
             if not script.startswith("-m ") and not (cwd / script).is_file():
                 return "missing", f"{script} not found", {}, False
-            outcome = await _cli_case(_prepared(prepare, argv), case.stdin or "", share, call_text)
+            outcome = await _cli_case(
+                _prepared(prepare, argv), case.stdin or "", case_deadline, call_text
+            )
         else:
             args, kwargs = harness_module.split_args(list(oracle.params), arg_map, case.args)
             nonce = secrets.token_hex(16)
@@ -595,7 +661,7 @@ async def _observe(
                 binding.symbol,
             ]
             call = {"case_id": case.case_id, "args": args, "kwargs": kwargs, "init": case.init}
-            outcome = await _python_case(_prepared(prepare, argv), nonce, call, share)
+            outcome = await _python_case(_prepared(prepare, argv), nonce, call, case_deadline)
         entry = dict(outcome.entry or {})
         if on_base:
             # A base run never counts an accident as the intended failure
@@ -709,6 +775,8 @@ async def run_oracle_check(
     never a verdict and never a reason to fall back to another verifier.
     """
     started = time.monotonic()
+    # The one deadline of this check: every target's launch, I/O and reap.
+    deadline = asyncio.get_running_loop().time() + max(0.1, timeout_seconds)
     harness = package_files.get(ORACLE_HARNESS_PATH)
     data_text = package_files.get(ORACLE_DATA_PATH)
     source = "declared" if binding is not None else "default"
@@ -750,7 +818,7 @@ async def run_oracle_check(
                 cwd,
                 prepare,
                 pinned.path,
-                max(0.1, timeout_seconds),
+                deadline,
                 on_base=on_base,
             )
         result: dict[str, Any] | None = None
@@ -798,10 +866,15 @@ def _selected_data(data: dict[str, Any], check_id: str, cases: Sequence[Any]) ->
 
 
 __all__ = [
+    "REAP_MARGIN_SECONDS",
     "CappedOutput",
+    "CheckProcess",
     "OracleRun",
+    "kill_check_group",
     "parse_frame",
     "NO_VISIBLE_CASE",
+    "reap_check_process",
     "run_oracle_check",
+    "spawn_check_process",
     "valid_entry",
 ]
