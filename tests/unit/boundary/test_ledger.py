@@ -845,6 +845,34 @@ def test_a_frozen_record_the_product_could_not_write_is_refused(edit: Any) -> No
         frozen_manifest(frozen)
 
 
+def _scripts(*checks: tuple[str, tuple[str, ...]]) -> dict[str, Any]:
+    """A manifest of script checks only (check id, linked criteria), keys k1..k3."""
+    return _manifest_event_data(
+        [_check(check_id, "reproduction", *keys) for check_id, keys in checks],
+        [],
+        keys=("k1", "k2", "k3"),
+    )
+
+
+def test_manifest_ids_are_the_dense_sequence_the_package_mints() -> None:
+    # Numbered by the criterion a check first links, counted 1, 2, ... per
+    # criterion in package order; a check linking two criteria matches one.
+    genuine = _scripts(
+        ("script_1_1", ("k1",)), ("script_1_2", ("k1", "k2")), ("script_3_1", ("k3",))
+    )
+    for data in (genuine, _scripts(("script_2_1", ("k1", "k2")), ("script_3_1", ("k3",)))):
+        data["manifest"].pop("binding_grammar")
+        data["manifest"].pop("oracles")
+        frozen_manifest(data)
+    for forged in (
+        _scripts(("script_1_2", ("k1",)), ("script_3_1", ("k2", "k3"))),  # a gap
+        _scripts(("script_1_1", ("k1",)), ("script_1_1", ("k1", "k2")), ("script_3_1", ("k3",))),
+        _scripts(("script_2_1", ("k1",)), ("script_3_1", ("k2", "k3"))),  # an unlinked number
+    ):
+        with pytest.raises(BoundaryOrderError):
+            frozen_manifest(forged)
+
+
 # --------------------------------------------------------------------------
 # The recovery projection (``resume`` consumes it; ``test_resume`` covers the
 # end to end journal matrix).

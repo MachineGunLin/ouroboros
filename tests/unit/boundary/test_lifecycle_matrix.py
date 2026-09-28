@@ -118,7 +118,7 @@ class _Records:
             )
         if kind == REFERENCE_CHECKED:
             payload = ReferenceCheckPayload(
-                schema_version="x", counts={}, excluded_cases=(), uncovered=()
+                schema_version="ouroboros.reference_check.v2", excluded_cases=(), uncovered=()
             )
             return reference_checked_event(BOUNDARY, package_id=str(package_id), payload=payload)
         if kind == ADMISSION_COMPLETED:

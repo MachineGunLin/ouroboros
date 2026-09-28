@@ -119,18 +119,13 @@ from ouroboros.boundary.events import (
     validate_record,
     validate_run_record,
 )
-from ouroboros.boundary.oracle import (
-    case_position,
-    oracle_check_id,
-    oracle_ordinal,
-    positive_ordinal,
-)
+from ouroboros.boundary.oracle import case_id_for
 from ouroboros.boundary.package import (
     CheckPackage,
     CheckRole,
     find_workspace_leaks,
+    mint_check_ids,
     script_assertion_id,
-    script_check_id,
     validate_package_for_seed,
 )
 from ouroboros.boundary.per_check import (
@@ -297,52 +292,59 @@ def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
         oracle_ids.add(check.check_id)
         if count:
             held.add(check.check_id)
-    specs = {spec["check_id"]: spec for spec in oracles}
-    if not all(_minted(item, specs.get(item["check_id"]), keys) for item in raw_checks):
+    if not _minted(raw_checks, oracles, keys):
         raise BoundaryOrderError(
             "the frozen manifest names a check by an id the product never mints"
         )
     return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids))
 
 
-def _minted(item: Mapping[str, Any], spec: Mapping[str, Any] | None, keys: Sequence[str]) -> bool:
-    """The check's ids are the ones the product mints for it (``package``, ``oracle``).
+def _minted(
+    checks: Sequence[Mapping[str, Any]], oracles: Sequence[Mapping[str, Any]], keys: Sequence[str]
+) -> bool:
+    """Every id is the one ``package.mint_check_ids`` gives the manifest's structure.
 
-    An oracle check is ``oracle_check_id`` of its criterion's position, with
-    one assertion per case (``<check id>.<case id>``, increasing positions);
-    a script check is ``script_check_id`` of the position of a criterion it
-    links, with assertions ``script_assertion_id`` 1..m.
+    Oracles in their order, by the position of their criterion; script
+    checks in package order, by the position of the criterion they first
+    link. The manifest lists a check's links as a set, so a script check
+    linking several criteria is matched against the id the mint gives each
+    of them (at most one can match). Each oracle check links only its
+    criterion with one assertion per case (``<id>.c1..c<n>``); each script
+    check's assertions are ``<id>.a1..a<m>``.
     """
-    check_id, ids, linked = item["check_id"], list(item["assertion_ids"]), item["criterion_keys"]
-    if spec is not None:
-        ordinal = oracle_ordinal(check_id)
-        key = spec.get("criterion_key")
-        prefix = f"{check_id}."
-        positions = [
-            (case_position(value[len(prefix) :]) if value.startswith(prefix) else None) or 0
-            for value in ids
+    numbers = {key: number for number, key in enumerate(keys, start=1)}
+    specs = {spec["check_id"]: spec for spec in oracles}
+    oracle_numbers = [numbers.get(spec.get("criterion_key"), 0) for spec in oracles]
+    if 0 in oracle_numbers:
+        return False
+    expected_oracles, _ = mint_check_ids(oracle_numbers, [])
+    if [spec["check_id"] for spec in oracles] != expected_oracles:
+        return False
+    script_numbers: list[int] = []
+    for item in checks:
+        check_id, ids = item["check_id"], list(item["assertion_ids"])
+        spec = specs.get(check_id)
+        if spec is not None:
+            count = spec.get("case_count")
+            if type(count) is not int:
+                return False
+            cases = [f"{check_id}.{case_id_for(n)}" for n in range(1, count + 1)]
+            if list(item["criterion_keys"]) != [spec["criterion_key"]] or ids != cases:
+                return False
+            continue
+        linked = sorted(numbers[key] for key in item["criterion_keys"])
+        chosen = [
+            number
+            for number in linked
+            if mint_check_ids([], [*script_numbers, number])[1][-1] == check_id
         ]
-        return (
-            ordinal is not None
-            and key in keys
-            and check_id == oracle_check_id(keys.index(key) + 1, ordinal)
-            and list(linked) == [key]
-            and 0 not in positions
-            and positions == sorted(set(positions))
-            and len(positions) == spec.get("case_count")
-        )
-    number_text, sep, ordinal_text = check_id.removeprefix("script_").partition("_")
-    number, ordinal = positive_ordinal(number_text), positive_ordinal(ordinal_text)
-    return (
-        check_id.startswith("script_")
-        and bool(sep)
-        and number is not None
-        and ordinal is not None
-        and number <= len(keys)
-        and keys[number - 1] in linked
-        and check_id == script_check_id(number, ordinal)
-        and ids == [script_assertion_id(check_id, n) for n in range(1, len(ids) + 1)]
-    )
+        if len(chosen) != 1:
+            return False
+        script_numbers.append(chosen[0])
+        if ids != [script_assertion_id(check_id, n) for n in range(1, len(ids) + 1)]:
+            return False
+    scripts = [item["check_id"] for item in checks if item["check_id"] not in specs]
+    return mint_check_ids(oracle_numbers, script_numbers) == (expected_oracles, scripts)
 
 
 def _not_discriminating(manifest: FrozenManifest, check_id: str, item: Mapping[str, Any]) -> bool:
@@ -543,9 +545,14 @@ def _seal_failed(
 def _reference_checked(
     state: VersionState, _event: BaseEvent, record: ReferenceCheckedRecord
 ) -> VersionState:
-    assert state.manifest is not None
-    if not {item.check_id for item in record.excluded_cases} <= state.manifest.oracle_checks:
+    manifest = state.manifest
+    assert manifest is not None
+    if not {item.check_id for item in record.excluded_cases} <= manifest.oracle_checks:
         raise BoundaryOrderError("a reference check excludes cases of a check that is no oracle")
+    linked = {link.criterion_key for check in manifest.checks for link in check.assertions}
+    if any(item.criterion_key in linked for item in record.uncovered):
+        # A criterion whose oracles were all dropped has no check in the frozen package.
+        raise BoundaryOrderError("a reference check uncovers a criterion the frozen package covers")
     return state
 
 

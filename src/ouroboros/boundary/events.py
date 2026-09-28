@@ -350,28 +350,55 @@ class ResumedPayload(ReconciliationPayload):
     reason: str | None = None
 
 
+REFERENCE_CHECK_SCHEMA = "ouroboros.reference_check.v2"
+
+ReferenceUncoveredReason = Literal[
+    "oracle_inconsistent",
+    "reference_contradicts_stated_case",
+    "reference_unavailable",
+    "reference_check_left_no_checks",
+]
+"""Why the reference check left a criterion uncovered (``reference_check``)."""
+
+
 class ExcludedCasesRecord(_Payload):
-    """Case ids of one oracle that the reference check excluded (ids, never values)."""
+    """A kept oracle of the frozen package and how many of its cases the reference check excluded.
+
+    Named by its frozen (re-minted) check id and a count: case ids from before
+    the rebuild name nothing in the frozen package, and values never appear.
+    """
 
     check_id: str
-    case_ids: tuple[str, ...]
-    reason: str
+    excluded_count: int = Field(ge=1)
+    reason: Literal["oracle_inconsistent"]
 
 
 class UncoveredRecord(_Payload):
-    """A criterion left uncovered, with its reason."""
+    """A criterion the reference check left uncovered (a wholly dropped oracle), with its reason."""
 
     criterion_key: str
-    reason: str
+    reason: ReferenceUncoveredReason
 
 
 class ReferenceCheckPayload(_Payload):
-    """``boundary.oracle.reference_checked``: what the reference check excluded."""
+    """``boundary.oracle.reference_checked``: what the reference check excluded.
 
-    schema_version: str
-    counts: dict[str, int]
+    Expressed against the frozen package: each kept oracle once, by check id
+    with its excluded-case count; each criterion whose oracles were all
+    dropped once, as uncovered with its reason (no check id).
+    """
+
+    schema_version: Literal["ouroboros.reference_check.v2"]
     excluded_cases: tuple[ExcludedCasesRecord, ...]
     uncovered: tuple[UncoveredRecord, ...]
+
+    @model_validator(mode="after")
+    def _once(self) -> ReferenceCheckPayload:
+        checks = [item.check_id for item in self.excluded_cases]
+        keys = [item.criterion_key for item in self.uncovered]
+        if len(set(checks)) != len(checks) or len(set(keys)) != len(keys):
+            raise ValueError("a reference check names each oracle and each criterion once")
+        return self
 
 
 def _require(payload: object, model: type[_Payload]) -> None:

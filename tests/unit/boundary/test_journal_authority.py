@@ -669,25 +669,68 @@ async def test_an_a_prime_binding_without_its_valid_declaration_is_refused(
     await ledger.record_bindings(B, package_id=package.package_id, payload=genuine)
 
 
+def _reference(excluded: list[dict[str, Any]], uncovered: list[dict[str, Any]]) -> Any:
+    from ouroboros.boundary.events import ReferenceCheckPayload
+
+    return ReferenceCheckPayload.model_validate(
+        {
+            "schema_version": "ouroboros.reference_check.v2",
+            "excluded_cases": excluded,
+            "uncovered": uncovered,
+        }
+    )
+
+
+async def test_a_reference_check_is_expressed_against_the_frozen_package(store) -> None:
+    # A frozen package with one oracle (criterion 1) and scripts for the rest;
+    # criterion 3 is uncovered (as when the reference check dropped its oracle).
+    from pydantic import ValidationError
+
+    package = seal_package(held_out_package())
+    (key,) = package.criterion_keys
+    ledger = BoundaryLedger(store)
+    await ledger.record_package_frozen(B, package)
+    kept = {"check_id": "oracle_1", "excluded_count": 1, "reason": "oracle_inconsistent"}
+    for shape in (
+        # Pre-rebuild case ids name nothing in the frozen package.
+        {**{k: v for k, v in kept.items() if k != "excluded_count"}, "case_ids": ["c2"]},
+        {**kept, "excluded_count": 0},
+        {**kept, "reason": "because"},
+    ):
+        with pytest.raises(ValidationError):
+            _reference([shape], [])
+    with pytest.raises(ValidationError):
+        _reference([kept, kept], [])
+    # A kept oracle's criterion is covered: it cannot also be uncovered.
+    covered = [{"criterion_key": key, "reason": "reference_unavailable"}]
+    with pytest.raises(BoundaryOrderError, match="covers"):
+        await ledger.record_reference_checked(
+            B, package_id=package.package_id, payload=_reference([kept], covered)
+        )
+    await ledger.record_reference_checked(
+        B, package_id=package.package_id, payload=_reference([kept], [])
+    )
+
+
 async def test_a_reference_check_excluding_cases_of_a_script_check_is_refused(
     store, package
 ) -> None:
-    from ouroboros.boundary.events import ReferenceCheckPayload
-
     ledger = BoundaryLedger(store)
     await ledger.record_package_frozen(B, package)
-    payload = ReferenceCheckPayload.model_validate(
-        {
-            "schema_version": "x",
-            "counts": {},
-            "excluded_cases": [
-                {"check_id": package.checks[0].check_id, "case_ids": ["c1"], "reason": "r"}
-            ],
-            "uncovered": [],
-        }
-    )
+    script = {
+        "check_id": package.checks[0].check_id,
+        "excluded_count": 1,
+        "reason": "oracle_inconsistent",
+    }
     with pytest.raises(BoundaryOrderError):
-        await ledger.record_reference_checked(B, package_id=package.package_id, payload=payload)
+        await ledger.record_reference_checked(
+            B, package_id=package.package_id, payload=_reference([script], [])
+        )
+    # A criterion with no check left (its oracle dropped) is uncovered with its reason.
+    uncovered = [{"criterion_key": package.criterion_keys[2], "reason": "reference_unavailable"}]
+    await ledger.record_reference_checked(
+        B, package_id=package.package_id, payload=_reference([], uncovered)
+    )
 
 
 def test_an_existing_acceptance_of_a_failed_outcome_is_not_journaled() -> None:
