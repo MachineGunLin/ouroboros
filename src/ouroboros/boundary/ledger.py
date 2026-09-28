@@ -1,0 +1,1152 @@
+"""EventStore-backed ordering guard for the check-package boundary.
+
+A boundary is one (Seed, verifier source) slot, for example one task and one
+check variant. Its lifecycle is one reducer (``advance``), applied at write
+time to the event about to be appended and at replay time by
+``verify_boundary_order``:
+
+1. exactly one seal: ``record_package_frozen`` (the sealed package's opaque
+   id and Seed digest persisted, ``package.seal_package``) or
+   ``record_construction_failed``; a second package for the same boundary is
+   refused, so admission feedback can never produce a regenerated package;
+2. for a frozen package, exactly one ``record_admission`` whose receipt names
+   the frozen package id and Seed digest, recorded before any actor starts;
+   the frozen manifest must be one the product writes (``frozen_manifest``)
+   and an ``admitted`` receipt one admission can write
+   (``admitted_exclusions``: a tier and one result per check, exclusions only
+   for a role violation on the base);
+3. ``record_actor_started`` refuses to start a worker until every boundary it
+   binds is sealed (and, with a package, admitted) and not superseded, and
+   starts at most one worker per version; a
+   version of a run binds only that run's worker; with a workspace it
+   refuses one that contains a generated check file (scanned with the live
+   sealed packages, so a renamed copy of the oracle data file is found);
+4. every later record (bindings, candidate verification, acceptance) must
+   cite the frozen package id (a candidate verification also its Seed
+   digest), and a superseded version accepts none;
+5. a version is superseded only by a later version of the same run.
+
+A boundary version of a run (``events.boundary_version_id``) is sealed only
+after the run's ``record_check_package_enabled``, and that record is refused
+once a version of the run exists, so it is always the run's first record.
+
+Recovery. ``recovery_projection`` is the one thing a resumed run relies on:
+the run's records replayed through the same reducer, reduced to off, no
+package, a bound admitted package (coverage, held-out checks, run contract,
+interpreter pin), or undecidable for anything the product could not have
+written.
+
+Regeneration policy. The seal rule above is per boundary id and never
+changes. The product run path gives each attempt its own boundary version id
+and calls ``record_superseded`` on the old version once the new one is
+sealed; the old package stays in the journal, marked superseded. The ledger
+assumes one writer per boundary.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from ouroboros.boundary.events import (
+    ACCEPTANCE_RECONCILED,
+    ACCEPTANCE_RESUMED,
+    ACTOR_STARTED,
+    ADMISSION_COMPLETED,
+    BINDING_RECORDED,
+    BOUNDARY_AGGREGATE_TYPE,
+    CANDIDATE_VERIFIED,
+    CHECK_PACKAGE_ENABLED,
+    CONSTRUCTION_FAILED,
+    PACKAGE_FROZEN,
+    REFERENCE_CHECKED,
+    SUPERSEDED,
+    BindingsPayload,
+    ReconciliationPayload,
+    ReferenceCheckPayload,
+    ResumedPayload,
+    RunContract,
+    acceptance_reconciled_event,
+    acceptance_resumed_event,
+    actor_started_event,
+    admission_completed_event,
+    binding_recorded_event,
+    boundary_version_id,
+    candidate_verified_event,
+    check_package_enabled_event,
+    construction_failed_event,
+    enabled_contract,
+    package_frozen_event,
+    parse_boundary_version,
+    reference_checked_event,
+    superseded_event,
+)
+from ouroboros.boundary.package import (
+    CheckPackage,
+    CheckRole,
+    find_workspace_leaks,
+    validate_package_for_seed,
+)
+from ouroboros.boundary.per_check import (
+    EXCLUSION_REASONS,
+    criteria_without_admitted_check,
+    exclusion_reason_for_role,
+)
+from ouroboros.boundary.receipts import AdmissionResult, CandidateVerification
+from ouroboros.core.errors import OuroborosError
+from ouroboros.core.seed import Seed
+from ouroboros.events.base import BaseEvent
+from ouroboros.persistence.event_store import EventStore
+
+
+class BoundaryOrderError(OuroborosError):
+    """A boundary write would violate the seal, admission, or actor ordering."""
+
+
+class BoundaryLeakError(BoundaryOrderError):
+    """A worker workspace contains generated check files."""
+
+
+def _utc(value: datetime) -> datetime:
+    """Replayed SQLite timestamps are naive UTC; compare everything as aware UTC."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _first(events: Sequence[BaseEvent], event_type: str) -> BaseEvent | None:
+    return next((event for event in events if event.type == event_type), None)
+
+
+def _ref(event: BaseEvent | None) -> str | None:
+    """The package id an event cites."""
+    return None if event is None else event.data.get("package_id")
+
+
+# --------------------------------------------------------------------------
+# The frozen manifest and the admission record, as the reducer reads them.
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestLink:
+    criterion_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestCheck:
+    """One check of the frozen manifest: its id, role and linked criteria."""
+
+    check_id: str
+    role: CheckRole
+    assertions: tuple[ManifestLink, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenManifest:
+    """What the frozen event recorded before any worker started (``manifest_summary``).
+
+    Shaped like a package for the coverage rule
+    (``per_check.criteria_without_admitted_check``).
+    """
+
+    criterion_keys: tuple[str, ...]
+    checks: tuple[ManifestCheck, ...]
+    held_out_checks: frozenset[str]
+    """Oracle checks that had at least one held-out case."""
+    oracle_checks: frozenset[str] = frozenset()
+    """Checks that run an oracle (every other check is a model-written script)."""
+
+
+def _strings(value: object, what: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise BoundaryOrderError(f"the frozen manifest's {what} are malformed")
+    return tuple(value)
+
+
+def _is_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
+    """The manifest a frozen event carries; ``BoundaryOrderError`` unless the product could write it.
+
+    The product writes it from a sealed package (``package_frozen_event``):
+    every criterion is linked to a check or uncovered, never both; every
+    oracle belongs to one of its checks and names one of that check's
+    criteria; and the record digest (``record_sha256``) is present.
+    """
+    manifest = data.get("manifest")
+    if not isinstance(manifest, Mapping):
+        raise BoundaryOrderError("the frozen event has no manifest")
+    if not _is_digest(data.get("record_sha256")):
+        raise BoundaryOrderError("the frozen event has no record digest")
+    if manifest.get("package_id") != data.get("package_id") or manifest.get(
+        "seed_digest"
+    ) != data.get("seed_digest"):
+        raise BoundaryOrderError("the frozen manifest names another package or Seed")
+    keys = _strings(manifest.get("criterion_keys"), "criterion keys")
+    raw_checks = manifest.get("checks")
+    if not isinstance(raw_checks, list):
+        raise BoundaryOrderError("the frozen manifest's checks are malformed")
+    checks: list[ManifestCheck] = []
+    for item in raw_checks:
+        if not isinstance(item, Mapping) or not isinstance(item.get("check_id"), str):
+            raise BoundaryOrderError("the frozen manifest's checks are malformed")
+        linked = _strings(item.get("criterion_keys"), "check links")
+        _strings(item.get("assertion_ids"), "assertion ids")
+        try:
+            role = CheckRole(item.get("role"))
+        except ValueError as exc:
+            raise BoundaryOrderError("the frozen manifest names an unknown role") from exc
+        if not item["check_id"] or not set(linked) <= set(keys):
+            raise BoundaryOrderError("the frozen manifest links an unknown criterion")
+        checks.append(
+            ManifestCheck(item["check_id"], role, tuple(ManifestLink(key) for key in linked))
+        )
+    by_id = {check.check_id: check for check in checks}
+    if len(by_id) != len(checks):
+        raise BoundaryOrderError("the frozen manifest repeats a check id")
+    uncovered_raw = manifest.get("uncovered")
+    if not isinstance(uncovered_raw, list) or not all(
+        isinstance(item, Mapping) for item in uncovered_raw
+    ):
+        raise BoundaryOrderError("the frozen manifest's uncovered criteria are malformed")
+    uncovered = [item.get("criterion_key") for item in uncovered_raw]
+    linked_keys = {link.criterion_key for check in checks for link in check.assertions}
+    if (
+        len(set(uncovered)) != len(uncovered)
+        or linked_keys & set(uncovered)
+        or linked_keys | set(uncovered) != set(keys)
+    ):
+        raise BoundaryOrderError("the frozen manifest does not link or uncover every criterion")
+    oracles = manifest.get("oracles", [])
+    if not isinstance(oracles, list):
+        raise BoundaryOrderError("the frozen manifest's oracles are malformed")
+    held: set[str] = set()
+    oracle_ids: set[str] = set()
+    for spec in oracles:
+        check = by_id.get(spec.get("check_id")) if isinstance(spec, Mapping) else None
+        count = spec.get("held_out_count") if isinstance(spec, Mapping) else None
+        if (
+            check is None
+            or spec.get("criterion_key") not in {link.criterion_key for link in check.assertions}
+            or type(count) is not int
+            or count < 0
+        ):
+            raise BoundaryOrderError("the frozen manifest names a malformed oracle")
+        if check.check_id in oracle_ids:
+            raise BoundaryOrderError("the frozen manifest names an oracle twice")
+        oracle_ids.add(check.check_id)
+        if count:
+            held.add(check.check_id)
+    return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids))
+
+
+# Tiers admission records (``admission.base_run_tiers``): an oracle check is
+# ``A`` or ``U`` from its base run, a script check ``S``, and any check ``C``
+# when ``per_check`` excluded it.
+_ORACLE_TIERS = frozenset({"A", "U"})
+_SCRIPT_TIERS = frozenset({"S"})
+
+
+def admitted_exclusions(manifest: FrozenManifest, data: Mapping[str, Any]) -> frozenset[str]:
+    """The excluded checks of an ``admitted`` record; ``BoundaryOrderError`` unless admission wrote it.
+
+    ``admission.admit_check_package`` followed by ``per_check.per_check_admission``
+    records an admitted package only as: no protected-byte mutation and an
+    unchanged base; a tier for every check of the frozen manifest (``A`` or
+    ``U`` for an oracle check, ``S`` for a script check, ``C`` for either when
+    excluded); one result per check with the manifest's role; every
+    excluded check (tier ``C``) exactly an ``excluded_checks`` entry,
+    ``violated`` for the one base reason its role allows and carrying that
+    role's exclusion reason; every other check ``expected``; and at least one
+    check not excluded.
+    """
+    by_id = {check.check_id: check for check in manifest.checks}
+    if data.get("protected_bytes_mutated") is not False or data.get("base_tree_digest") != data.get(
+        "base_tree_digest_after"
+    ):
+        raise BoundaryOrderError("an admitted package's base changed during admission")
+    tiers = data.get("check_tiers")
+    if not isinstance(tiers, Mapping) or set(tiers) != set(by_id):
+        raise BoundaryOrderError("an admission record's tiers do not cover the frozen checks")
+    for check_id, tier in tiers.items():
+        allowed = _ORACLE_TIERS if check_id in manifest.oracle_checks else _SCRIPT_TIERS
+        if tier != "C" and tier not in allowed:
+            raise BoundaryOrderError(
+                "an admission record gives a check a tier its kind cannot have"
+            )
+    excluded = frozenset(check_id for check_id, tier in tiers.items() if tier == "C")
+    recorded = data.get("excluded_checks") or {}
+    if not isinstance(recorded, Mapping) or set(recorded) != excluded:
+        raise BoundaryOrderError("an admission record's exclusions disagree with its tiers")
+    if excluded == set(by_id):
+        raise BoundaryOrderError("an admitted package excludes every check")
+    results = data.get("checks")
+    if not isinstance(results, list) or not all(isinstance(item, Mapping) for item in results):
+        raise BoundaryOrderError("an admission record's check results are malformed")
+    ids = [item.get("check_id") for item in results]
+    if len(set(ids)) != len(ids) or set(ids) != set(by_id):
+        raise BoundaryOrderError("an admission record does not hold one result per check")
+    for item in results:
+        check = by_id[item["check_id"]]
+        if item.get("role") != check.role.value:
+            raise BoundaryOrderError("an admission result names another role")
+        if check.check_id in excluded:
+            allowed = exclusion_reason_for_role(check.role)
+            if (
+                item.get("status") != "violated"
+                or EXCLUSION_REASONS.get(str(item.get("reason"))) != allowed
+                or recorded[check.check_id] != allowed
+            ):
+                raise BoundaryOrderError("an excluded check was not excluded for its role")
+        elif item.get("status") != "expected":
+            raise BoundaryOrderError("an admitted package holds a check that did not meet its role")
+    return excluded
+
+
+# --------------------------------------------------------------------------
+# The transition reducer: the one definition of a valid boundary journal.
+# Every write path advances the replayed state with the event it is about to
+# append, and ``verify_boundary_order`` advances it over replayed events; so a
+# record the ledger would refuse is exactly a record replay flags.
+
+
+class Phase(StrEnum):
+    """Where one boundary version's lifecycle stands (``TRANSITIONS``)."""
+
+    NONE = "none"
+    """Nothing recorded yet."""
+    NO_PACKAGE = "no_package"
+    """Sealed as ``construction_failed``: a worker may start, the legacy verifier decides."""
+    FROZEN = "frozen"
+    """A sealed package, not yet admitted."""
+    REJECTED = "rejected"
+    """Admission ran and did not admit the package: no worker may start on it."""
+    ADMITTED = "admitted"
+    STARTED = "started"
+    """A worker started on the version (with a package, or after ``construction_failed``)."""
+    VERIFIED = "verified"
+    """The candidate was verified against the frozen package."""
+    DECIDED = "decided"
+    """The acceptance decision was recorded."""
+    SUPERSEDED = "superseded"
+    """A later version of the run replaced this one; nothing more is recorded on it."""
+
+
+@dataclass(frozen=True, slots=True)
+class VersionState:
+    """What one boundary version's journal has established so far."""
+
+    phase: Phase = Phase.NONE
+    package_id: str | None = None
+    seed_digest: str | None = None
+    manifest: FrozenManifest | None = None
+    """What the frozen event says the package links (checked when the seal is recorded)."""
+    gate_time: datetime | None = None
+    """When the latest seal or admission record was written (an actor starts after it)."""
+    excluded: frozenset[str] = frozenset()
+    """Checks the admission excluded (tier ``C``)."""
+    interpreter_sha256: str | None = None
+    interpreter_realpath_sha256: str | None = None
+    final_bindings: bool = False
+    runnable: bool = False
+    """The final bindings put at least one check on a runnable tier (``A``, ``A_prime``, ``S``)."""
+
+    @property
+    def seal(self) -> str | None:
+        """``PACKAGE_FROZEN``, ``CONSTRUCTION_FAILED``, or ``None`` (not sealed)."""
+        if self.phase is Phase.NONE:
+            return None
+        return CONSTRUCTION_FAILED if self.manifest is None else PACKAGE_FROZEN
+
+    @property
+    def frozen(self) -> bool:
+        return self.seal == PACKAGE_FROZEN
+
+    @property
+    def started(self) -> bool:
+        return self.phase in (Phase.STARTED, Phase.VERIFIED, Phase.DECIDED)
+
+    @property
+    def superseded(self) -> bool:
+        return self.phase is Phase.SUPERSEDED
+
+
+Transition = Callable[[VersionState, BaseEvent], VersionState]
+
+
+def _cites(state: VersionState, event: BaseEvent) -> bool:
+    return _ref(event) == state.package_id
+
+
+def _seal_frozen(state: VersionState, event: BaseEvent) -> VersionState:
+    return replace(
+        state,
+        phase=Phase.FROZEN,
+        package_id=_ref(event),
+        seed_digest=event.data.get("seed_digest"),
+        manifest=frozen_manifest(event.data),
+        gate_time=_utc(event.timestamp),
+    )
+
+
+def _seal_failed(state: VersionState, event: BaseEvent) -> VersionState:
+    return replace(
+        state,
+        phase=Phase.NO_PACKAGE,
+        seed_digest=event.data.get("seed_digest"),
+        gate_time=_utc(event.timestamp),
+    )
+
+
+def _reference_checked(state: VersionState, event: BaseEvent) -> VersionState:
+    if not _cites(state, event):
+        raise BoundaryOrderError("a reference check must cite the boundary's frozen package")
+    return state
+
+
+def _admission(state: VersionState, event: BaseEvent) -> VersionState:
+    if not _cites(state, event):
+        raise BoundaryOrderError("admission receipt names a different package")
+    if event.data.get("seed_digest") != state.seed_digest:
+        raise BoundaryOrderError("admission receipt names a different Seed than the frozen package")
+    time = _utc(event.timestamp)
+    if event.data.get("verdict") != "admitted":
+        # Recorded, but not an admission: the version can only be superseded.
+        return replace(state, phase=Phase.REJECTED, gate_time=time)
+    assert state.manifest is not None  # set with every frozen seal
+    return replace(
+        state,
+        phase=Phase.ADMITTED,
+        excluded=admitted_exclusions(state.manifest, event.data),
+        interpreter_sha256=event.data.get("interpreter_sha256"),
+        interpreter_realpath_sha256=event.data.get("interpreter_realpath_sha256"),
+        gate_time=time,
+    )
+
+
+def _actor_started(state: VersionState, event: BaseEvent) -> VersionState:
+    run = parse_boundary_version(event.aggregate_id)
+    if run is not None and event.data.get("actor_id") != run[0]:
+        raise BoundaryOrderError("a boundary version of a run binds only that run's worker")
+    if not _cites(state, event):
+        raise BoundaryOrderError("actor start does not cite the sealed package")
+    if state.gate_time is not None and _utc(event.timestamp) <= state.gate_time:
+        raise BoundaryOrderError("actor start timestamp does not follow the boundary seal")
+    return replace(state, phase=Phase.STARTED)
+
+
+def _superseded(state: VersionState, event: BaseEvent) -> VersionState:
+    _require_successor(event.aggregate_id, event.data.get("superseded_by"))
+    if not _cites(state, event):
+        raise BoundaryOrderError("a supersession must cite the sealed package")
+    return replace(state, phase=Phase.SUPERSEDED)
+
+
+def _bindings(state: VersionState, event: BaseEvent) -> VersionState:
+    if not state.frozen or not _cites(state, event):
+        raise BoundaryOrderError("bindings must cite the boundary's frozen package")
+    if event.data.get("phase") != "final":
+        return state
+    if state.final_bindings:
+        raise BoundaryOrderError("final bindings already recorded")
+    runnable = any(check.get("tier") in _RUNNABLE_TIERS for check in event.data.get("checks") or ())
+    return replace(state, final_bindings=True, runnable=runnable)
+
+
+def _candidate_verified(state: VersionState, event: BaseEvent) -> VersionState:
+    if not state.frozen:
+        raise BoundaryOrderError("candidate verification requires a frozen, admitted package")
+    if not _cites(state, event):
+        raise BoundaryOrderError("verification ran a package other than the frozen one")
+    if event.data.get("seed_digest") != state.seed_digest:
+        raise BoundaryOrderError(
+            "candidate verification names a different Seed than the frozen package"
+        )
+    if not state.final_bindings:
+        raise BoundaryOrderError("a candidate verification follows the final bindings it ran")
+    return replace(state, phase=Phase.VERIFIED)
+
+
+def _reconciled(state: VersionState, event: BaseEvent) -> VersionState:
+    _require_consistent_decision(event)
+    if state.frozen:
+        if not _cites(state, event):
+            raise BoundaryOrderError("acceptance must cite the boundary's frozen package")
+        if state.phase is not Phase.VERIFIED:
+            _require_unverified_decision(state, event)
+    elif _ref(event) is not None:
+        raise BoundaryOrderError(
+            "a package-less decision needs a construction_failed seal and a worker"
+        )
+    return replace(state, phase=Phase.DECIDED)
+
+
+def _resumed(state: VersionState, event: BaseEvent) -> VersionState:
+    _require_consistent_decision(event)
+    if not state.frozen or not _cites(state, event):
+        raise BoundaryOrderError("a resumed decision must cite the boundary's frozen package")
+    return state
+
+
+TRANSITIONS: Mapping[tuple[Phase, str], Transition] = {
+    (Phase.NONE, PACKAGE_FROZEN): _seal_frozen,
+    (Phase.NONE, CONSTRUCTION_FAILED): _seal_failed,
+    (Phase.FROZEN, REFERENCE_CHECKED): _reference_checked,
+    (Phase.FROZEN, ADMISSION_COMPLETED): _admission,
+    (Phase.FROZEN, SUPERSEDED): _superseded,
+    (Phase.REJECTED, SUPERSEDED): _superseded,
+    (Phase.ADMITTED, SUPERSEDED): _superseded,
+    (Phase.NO_PACKAGE, SUPERSEDED): _superseded,
+    (Phase.ADMITTED, ACTOR_STARTED): _actor_started,
+    (Phase.NO_PACKAGE, ACTOR_STARTED): _actor_started,
+    (Phase.STARTED, BINDING_RECORDED): _bindings,
+    (Phase.STARTED, CANDIDATE_VERIFIED): _candidate_verified,
+    (Phase.VERIFIED, CANDIDATE_VERIFIED): _candidate_verified,
+    (Phase.STARTED, ACCEPTANCE_RECONCILED): _reconciled,
+    (Phase.VERIFIED, ACCEPTANCE_RECONCILED): _reconciled,
+    (Phase.STARTED, ACCEPTANCE_RESUMED): _resumed,
+    (Phase.VERIFIED, ACCEPTANCE_RESUMED): _resumed,
+    (Phase.DECIDED, ACCEPTANCE_RESUMED): _resumed,
+}
+"""Every allowed (phase, record) pair of a boundary version and what it does.
+
+A pair not in the table is refused: the version's journal cannot hold that
+record in that phase. The transition then checks what the record says
+(citations, Seed, verdict, the decision's statuses) and may still refuse.
+"""
+VERSION_RECORDS: tuple[str, ...] = (
+    PACKAGE_FROZEN,
+    CONSTRUCTION_FAILED,
+    REFERENCE_CHECKED,
+    ADMISSION_COMPLETED,
+    ACTOR_STARTED,
+    SUPERSEDED,
+    BINDING_RECORDED,
+    CANDIDATE_VERIFIED,
+    ACCEPTANCE_RECONCILED,
+    ACCEPTANCE_RESUMED,
+)
+"""Every record a boundary version's journal can hold."""
+
+
+def _refusal(state: VersionState, kind: str) -> str:
+    """Why ``kind`` is refused in ``state.phase`` (the table has no such pair)."""
+    phase = state.phase
+    if kind not in VERSION_RECORDS:
+        return f"{kind} is not a boundary version record"
+    if phase is Phase.SUPERSEDED:
+        if kind == SUPERSEDED:
+            return "boundary version already superseded"
+        return f"{kind} recorded on a superseded boundary version"
+    if kind in (PACKAGE_FROZEN, CONSTRUCTION_FAILED):
+        return "boundary already sealed; a package cannot be regenerated or replaced"
+    if phase is Phase.NONE:
+        return {
+            ACTOR_STARTED: "actor started before the seal (the boundary is not sealed)",
+            ADMISSION_COMPLETED: "admission recorded before the seal (no frozen package)",
+        }.get(kind, f"{kind} recorded before the seal")
+    return {
+        ADMISSION_COMPLETED: {
+            Phase.NO_PACKAGE: "admission recorded without a frozen package",
+            Phase.ADMITTED: "admission already recorded",
+            Phase.REJECTED: "admission already recorded",
+        }.get(phase, "admission must be recorded before any actor starts"),
+        REFERENCE_CHECKED: "the reference check follows the seal and precedes admission",
+        ACTOR_STARTED: {
+            Phase.FROZEN: "actor started before admission",
+            Phase.REJECTED: "actor started on a package admission did not admit",
+        }.get(phase, "a worker already started on this boundary version"),
+        SUPERSEDED: "a boundary version bound to a worker cannot be superseded",
+        BINDING_RECORDED: "bindings are recorded only after admission and the worker start",
+        CANDIDATE_VERIFIED: (
+            "candidate verification requires a frozen, admitted package and a started worker"
+        ),
+        ACCEPTANCE_RECONCILED: (
+            "acceptance already reconciled"
+            if phase is Phase.DECIDED
+            else "acceptance is decided only after the worker start"
+        ),
+        ACCEPTANCE_RESUMED: "a resumed decision needs an admitted package and a started worker",
+    }[kind]
+
+
+def advance(state: VersionState, event: BaseEvent) -> VersionState:
+    """The state after ``event``; ``BoundaryOrderError`` when the journal forbids it."""
+    transition = TRANSITIONS.get((state.phase, event.type))
+    if transition is None:
+        raise BoundaryOrderError(_refusal(state, event.type))
+    return transition(state, event)
+
+
+_RUNNABLE_TIERS = frozenset({"A", "A_prime", "S"})
+_PAGE = 500
+# Statuses a decision may carry without a candidate verification: when the
+# final bindings left no check runnable, the checks were not run (unverified or
+# indeterminate); when the package could not decide at all, every covered
+# criterion is indeterminate and the rest are uncovered.
+_UNRUN_STATUSES = frozenset({"unverified", "uncovered", "indeterminate"})
+_UNDECIDED_STATUSES = frozenset({"uncovered", "indeterminate"})
+
+
+def _require_consistent_decision(event: BaseEvent) -> None:
+    """A recorded decision is one the reconciliation rule can produce.
+
+    The payload model checks every acceptance bit against the status and the
+    signal that decided it (``ReconciliationPayload``); replay applies the same
+    check to what the journal holds, so a decision edited in place is flagged.
+    """
+    model = ResumedPayload if event.type == ACCEPTANCE_RESUMED else ReconciliationPayload
+    data = {key: value for key, value in (event.data or {}).items() if key != "package_id"}
+    try:
+        model.model_validate(data)
+    except ValueError as exc:
+        raise BoundaryOrderError(
+            "a recorded decision disagrees with the statuses that decided it"
+        ) from exc
+
+
+def _require_unverified_decision(state: VersionState, event: BaseEvent) -> None:
+    """A decision recorded without a candidate verification claims nothing a run would show.
+
+    Allowed only when the final bindings left no check runnable, or when the
+    decision says the package could not decide (``undecided_reason``) after
+    the worker started; either way no criterion is a pass or a fail.
+    """
+    if state.final_bindings and not state.runnable:
+        allowed = _UNRUN_STATUSES
+    elif event.data.get("undecided_reason") and state.frozen and state.started:
+        allowed = _UNDECIDED_STATUSES
+    else:
+        raise BoundaryOrderError("acceptance must cite a verification of the frozen package")
+    statuses = {item.get("package_status") for item in event.data.get("criteria") or ()}
+    if not statuses <= allowed:
+        raise BoundaryOrderError(
+            "a decision recorded without a candidate verification claims a verified status"
+        )
+
+
+def _require_successor(boundary_id: str, successor: object) -> None:
+    """A version is superseded only by a later version of the same run."""
+    old = parse_boundary_version(boundary_id)
+    new = parse_boundary_version(successor) if isinstance(successor, str) else None
+    if old is None or new is None:
+        raise BoundaryOrderError("only a boundary version of a run can supersede another")
+    if new[0] != old[0]:
+        raise BoundaryOrderError("a boundary version is superseded only within its own run")
+    if new[1] <= old[1]:
+        raise BoundaryOrderError("a boundary version is superseded only by a later version")
+
+
+def version_state(events: Iterable[BaseEvent]) -> VersionState:
+    """Advance over a boundary version's replayed events; raises on the first violation."""
+    state = VersionState()
+    for event in events:
+        state = advance(state, event)
+    return state
+
+
+class BoundaryLedger:
+    """Write-time ordering guard over an initialized ``EventStore``.
+
+    Every write replays the boundary version's journal, advances the reducer
+    (``advance``) with the event it is about to append, and appends only when
+    that succeeds; a journal that is already inconsistent refuses every write.
+    """
+
+    def __init__(self, store: EventStore) -> None:
+        self._store = store
+
+    async def events(self, boundary_id: str) -> list[BaseEvent]:
+        """Replay one boundary's events in journal order."""
+        return await self._store.replay(BOUNDARY_AGGREGATE_TYPE, boundary_id)
+
+    async def _state(self, boundary_id: str) -> VersionState:
+        state = version_state(await self.events(boundary_id))
+        return state
+
+    async def _append(self, boundary_id: str, event: BaseEvent) -> BaseEvent:
+        advance(await self._state(boundary_id), event)
+        await self._store.append(event)
+        return event
+
+    async def record_check_package_enabled(
+        self, execution_id: str, contract: RunContract
+    ) -> BaseEvent:
+        """Record, once and before anything else, that the check package is on for a run.
+
+        ``contract`` holds the settings that decide anything after the worker
+        starts; a resumed run uses them instead of the live config
+        (``run_contract``).
+
+        Refused once any boundary version of the run exists: the record must
+        come first. A resumed run reads it back
+        (``resume.load_resumed_boundary``): with this record present, a
+        missing or malformed boundary makes the resumed decision undecided
+        instead of letting the legacy verifier decide the criteria the package
+        may cover.
+        """
+        if not execution_id:
+            raise BoundaryOrderError("the check package needs the run's execution id")
+        if await self.check_package_enabled(execution_id):
+            raise BoundaryOrderError(
+                "the check package was already enabled for this run",
+                details={"execution_id": execution_id},
+            )
+        if await self.run_versions(execution_id):
+            raise BoundaryOrderError(
+                "the enabled record must precede every boundary version of the run",
+                details={"execution_id": execution_id},
+            )
+        event = check_package_enabled_event(execution_id, contract)
+        await self._store.append(event)
+        return event
+
+    async def run_versions(self, execution_id: str) -> dict[int, list[BaseEvent]]:
+        """Every boundary version of the run in the journal, by version number.
+
+        Found by what the journal holds, not by counting up from ``v1``: a
+        version recorded without its predecessors (for example written into
+        the store directly) is found too, so a run-level rule cannot be
+        passed by a gap.
+        """
+        found: dict[int, str] = {}
+        offset = 0
+        while True:
+            page = await self._store.query_events(
+                aggregate_type=BOUNDARY_AGGREGATE_TYPE, limit=_PAGE, offset=offset
+            )
+            for event in page:
+                run = parse_boundary_version(event.aggregate_id)
+                if run is not None and run[0] == execution_id:
+                    found[run[1]] = event.aggregate_id
+            if len(page) < _PAGE:
+                break
+            offset += _PAGE
+        return {version: await self.events(found[version]) for version in sorted(found)}
+
+    async def check_package_enabled(self, execution_id: str) -> bool:
+        """Whether ``record_check_package_enabled`` ran for ``execution_id``."""
+        return _first(await self.events(execution_id), CHECK_PACKAGE_ENABLED) is not None
+
+    async def run_contract(self, execution_id: str) -> RunContract | None:
+        """The run contract recorded for ``execution_id``; ``None`` when the run was never on.
+
+        Raises ``BoundaryOrderError`` when the enabled record exists but its
+        contract is missing or malformed: the settings the run started with
+        are then unknown.
+        """
+        event = _first(await self.events(execution_id), CHECK_PACKAGE_ENABLED)
+        if event is None:
+            return None
+        try:
+            return enabled_contract(event.data)
+        except ValueError as exc:
+            raise BoundaryOrderError(
+                "the run's check package contract is malformed",
+                details={"execution_id": execution_id},
+            ) from exc
+
+    async def _require_run_enabled(self, boundary_id: str) -> None:
+        run = parse_boundary_version(boundary_id)
+        if run is not None and not await self.check_package_enabled(run[0]):
+            raise BoundaryOrderError(
+                "a boundary version of a run is sealed only after the run's enabled record",
+                details={"boundary_id": boundary_id},
+            )
+
+    async def record_package_frozen(
+        self,
+        boundary_id: str,
+        package: CheckPackage,
+        *,
+        seed: Seed | None = None,
+    ) -> BaseEvent:
+        """Persist the package id, Seed digest and manifest; the boundary's only seal.
+
+        The package id (``package.seal_package``) is what I2 orders before any
+        worker start. Every later receipt and event must cite the same one.
+        """
+        if seed is not None:
+            validate_package_for_seed(package, seed)
+        await self._require_run_enabled(boundary_id)
+        return await self._append(boundary_id, package_frozen_event(boundary_id, package))
+
+    async def record_construction_failed(
+        self,
+        boundary_id: str,
+        *,
+        seed_digest: str,
+        input_digest: str,
+        reason: str,
+    ) -> BaseEvent:
+        """Seal a boundary whose generation produced no valid package."""
+        await self._require_run_enabled(boundary_id)
+        event = construction_failed_event(
+            boundary_id, seed_digest=seed_digest, input_digest=input_digest, reason=reason
+        )
+        return await self._append(boundary_id, event)
+
+    async def record_admission(self, boundary_id: str, result: AdmissionResult) -> BaseEvent:
+        """Persist the single admission receipt (same package id and Seed as the seal)."""
+        return await self._append(boundary_id, admission_completed_event(boundary_id, result))
+
+    async def record_actor_started(
+        self,
+        actor_id: str,
+        boundary_ids: Sequence[str],
+        *,
+        workspace: Path | None = None,
+        runtime: str | None = None,
+        packages: Sequence[CheckPackage] = (),
+    ) -> list[BaseEvent]:
+        """Record a worker start on every boundary it is bound to.
+
+        Raises ``BoundaryOrderError`` unless each boundary is sealed, not
+        superseded and, when it holds a package, admitted. With
+        ``workspace``, every frozen boundary's live sealed package must be in
+        ``packages`` (the one whose id the seal cites), and
+        ``BoundaryLeakError`` is raised when the workspace contains a
+        generated check file, by path or by the in-memory digest of any
+        package file, the oracle data file included (the journal manifest
+        cannot find a renamed copy of it). Call this before launching the
+        worker; launch only on success.
+        """
+        if not boundary_ids:
+            raise BoundaryOrderError("an actor must be bound to at least one boundary")
+        started: list[BaseEvent] = []
+        live: list[CheckPackage] = []
+        by_id = {package.package_id: package for package in packages}
+        for boundary_id in boundary_ids:
+            events = await self.events(boundary_id)
+            state = version_state(events)
+            event = actor_started_event(
+                boundary_id, actor_id=actor_id, package_id=state.package_id, runtime=runtime
+            )
+            try:
+                advance(state, event)
+            except BoundaryOrderError as exc:
+                raise BoundaryOrderError(
+                    f"actor cannot start: {exc.message}",
+                    details={"boundary_id": boundary_id, "actor_id": actor_id},
+                ) from exc
+            if state.frozen and workspace is not None:
+                package = by_id.get(state.package_id or "")
+                if package is None:
+                    raise BoundaryOrderError(
+                        "actor cannot start: the leak scan needs the boundary's sealed package",
+                        details={"boundary_id": boundary_id, "actor_id": actor_id},
+                    )
+                live.append(package)
+            started.append(event)
+        if workspace is not None:
+            leaks = find_workspace_leaks(workspace, live)
+            if leaks:
+                raise BoundaryLeakError(
+                    "worker workspace contains generated check files",
+                    details={"actor_id": actor_id, "paths": list(leaks)},
+                )
+        await self._store.append_batch(started)
+        return started
+
+    async def record_superseded(
+        self,
+        boundary_id: str,
+        *,
+        superseded_by: str,
+        reason: str,
+    ) -> BaseEvent:
+        """Mark ``boundary_id`` as replaced by the sealed version ``superseded_by``.
+
+        Refused unless both ids are versions of the same run and
+        ``superseded_by`` is a later version, both versions are sealed, the old version
+        is not already superseded, and no actor was ever bound to the old
+        version (a worker's verdict must cite the package it was bound to).
+        A superseded version accepts no later record, an actor start included.
+        """
+        try:
+            _require_successor(boundary_id, superseded_by)
+        except BoundaryOrderError as exc:
+            raise BoundaryOrderError(
+                exc.message, details={"boundary_id": boundary_id, "superseded_by": superseded_by}
+            ) from exc
+        old = await self._state(boundary_id)
+        new = await self._state(superseded_by)
+        if old.seal is None or new.seal is None:
+            raise BoundaryOrderError(
+                "both boundary versions must be sealed before one supersedes the other",
+                details={"boundary_id": boundary_id, "superseded_by": superseded_by},
+            )
+        event = superseded_event(
+            boundary_id,
+            superseded_by=superseded_by,
+            package_id=old.package_id,
+            successor_package_id=new.package_id,
+            reason=reason,
+        )
+        return await self._append(boundary_id, event)
+
+    async def record_bindings(
+        self, boundary_id: str, *, package_id: str, payload: BindingsPayload
+    ) -> BaseEvent:
+        """Record every check's tier and binding once the worker has stopped.
+
+        ``package_id`` is the sealed package id (``CheckPackage.package_id``).
+        Refused unless the frozen, admitted package is cited and the worker
+        started on this boundary. A ``final`` record is single and must precede
+        the candidate verification it governs; ``repair`` records may repeat.
+        """
+        event = binding_recorded_event(boundary_id, package_id=package_id, payload=payload)
+        return await self._append(boundary_id, event)
+
+    async def record_candidate_verification(
+        self, boundary_id: str, verification: CandidateVerification
+    ) -> BaseEvent:
+        """Persist a candidate run of the frozen, admitted package."""
+        return await self._append(boundary_id, candidate_verified_event(boundary_id, verification))
+
+    async def record_acceptance_reconciled(
+        self, boundary_id: str, *, package_id: str | None, reconciliation: ReconciliationPayload
+    ) -> BaseEvent:
+        """Persist the per-criterion acceptance decision once, after verification.
+
+        With a package it must follow a candidate verification of the frozen
+        package; without one it may only record a decision that claims no
+        verified status: after final bindings that left no check runnable, or
+        a decision the package could not make (``undecided_reason``, every
+        covered criterion indeterminate). Without a package (``package_id`` is ``None``) the boundary
+        must be sealed as ``construction_failed`` and a worker must have
+        started on it.
+        """
+        event = acceptance_reconciled_event(
+            boundary_id, package_id=package_id, reconciliation=reconciliation
+        )
+        return await self._append(boundary_id, event)
+
+    async def record_reference_checked(
+        self, boundary_id: str, *, package_id: str, payload: ReferenceCheckPayload
+    ) -> BaseEvent:
+        """Record what the reference check excluded, after the seal and before admission."""
+        event = reference_checked_event(boundary_id, package_id=package_id, payload=payload)
+        return await self._append(boundary_id, event)
+
+    async def record_acceptance_resumed(
+        self, boundary_id: str, *, package_id: str, payload: ResumedPayload
+    ) -> BaseEvent:
+        """Record a resumed run's recomputed package decision (one per resume).
+
+        Refused unless the frozen, admitted package is cited and a worker was
+        started on this boundary. It cites the frozen package id instead of
+        recording a second candidate verification: the frozen boundary's
+        single-shot records are not written again.
+        """
+        event = acceptance_resumed_event(boundary_id, package_id=package_id, payload=payload)
+        return await self._append(boundary_id, event)
+
+    async def record_resumed_undecided(
+        self, execution_id: str, *, payload: ResumedPayload
+    ) -> BaseEvent:
+        """Record a resumed decision made without a usable boundary (no package cited).
+
+        Written on the run's own aggregate (``execution_id``), next to the
+        record that the check package was on, because no boundary version
+        can be cited.
+        """
+        if not execution_id or parse_boundary_version(execution_id) is not None:
+            raise BoundaryOrderError("a resumed decision needs the run's execution id")
+        if not await self.check_package_enabled(execution_id) and not await self.run_versions(
+            execution_id
+        ):
+            # The enabled record, or any boundary version of the run, shows the
+            # package was on; a run with neither was off and has nothing to record.
+            raise BoundaryOrderError(
+                "an undecided resume is recorded only for a run whose check package was on",
+                details={"execution_id": execution_id},
+            )
+        event = acceptance_resumed_event(execution_id, package_id=None, payload=payload)
+        await self._store.append(event)
+        return event
+
+
+def verify_boundary_order(
+    events: Sequence[BaseEvent], *, run_events: Sequence[BaseEvent] | None = None
+) -> tuple[str, ...]:
+    """Return ordering violations in one boundary version's replayed events.
+
+    The same reducer (``advance``) as every write path decides each event; an
+    event it refuses is reported and skipped. An empty result means: one
+    seal, the seal precedes admission, admission precedes every actor start,
+    no record follows a supersession, and every receipt cites the frozen
+    package id. With ``run_events`` (the run aggregate's events) the run's
+    enabled record must also precede the version's first record.
+    """
+    violations: list[str] = []
+    state = VersionState()
+    for event in events:
+        try:
+            state = advance(state, event)
+        except BoundaryOrderError as exc:
+            violations.append(exc.message)
+    seals = [e for e in events if e.type in {PACKAGE_FROZEN, CONSTRUCTION_FAILED}]
+    if len(seals) != 1:
+        violations.append(f"expected exactly one seal, found {len(seals)}")
+    if state.frozen and not state.superseded:
+        admissions = [e for e in events if e.type == ADMISSION_COMPLETED]
+        if len(admissions) != 1:
+            violations.append(f"expected exactly one admission, found {len(admissions)}")
+    if any(key.endswith("package_sha256") for event in events for key in event.data):
+        # An unkeyed digest of the full package would let a reader confirm
+        # guessed held-out values; events cite the opaque package id only.
+        violations.append("a boundary event records an unkeyed package digest")
+    if run_events is not None and events:
+        enabled = _first(run_events, CHECK_PACKAGE_ENABLED)
+        if enabled is None:
+            violations.append("the run has no enabled record")
+        elif _utc(enabled.timestamp) > _utc(events[0].timestamp):
+            violations.append("a boundary version was recorded before the run's enabled record")
+    return tuple(violations)
+
+
+# --------------------------------------------------------------------------
+# The recovery projection: what a resumed run may rely on, from the journal.
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryOff:
+    """No record of the run: the check package was off, the legacy verifier decides."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryNoPackage:
+    """The worker was bound to a version sealed without a package: the legacy verifier decides."""
+
+    boundary_id: str
+    contract: RunContract
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryBound:
+    """The worker was bound to an admitted package; everything here was validated by the reducer."""
+
+    execution_id: str
+    boundary_id: str
+    package_id: str
+    seed_digest: str
+    contract: RunContract
+    interpreter_sha256: str
+    interpreter_realpath_sha256: str
+    criterion_keys: tuple[str, ...]
+    covered: frozenset[str]
+    """Criteria an admitted check covers, under the live coverage rule."""
+    held_out_checks: frozenset[str]
+    """Admitted checks that had held-out cases."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryUndecidable:
+    """The journal says the package was on but is not one the product could write."""
+
+    reason: str
+    boundary_id: str = ""
+
+
+RecoveryProjection = RecoveryOff | RecoveryNoPackage | RecoveryBound | RecoveryUndecidable
+
+
+def recovery_projection(
+    execution_id: str,
+    run_events: Sequence[BaseEvent],
+    versions: Mapping[int, Sequence[BaseEvent]],
+) -> RecoveryProjection:
+    """The one recovery authority of a resumed run, computed from the journal alone.
+
+    ``run_events`` are the run aggregate's events and ``versions`` every
+    boundary version of the run (``BoundaryLedger.run_versions``). Every
+    version is replayed through the same reducer as every write
+    (``verify_boundary_order``); the run's records must be exactly what the
+    product writes. Anything else (a lifecycle violation, a duplicate, a
+    conflict, a gap, a missing required field) is ``RecoveryUndecidable``.
+    """
+    try:
+        return _project(execution_id, run_events, versions)
+    except BoundaryOrderError as exc:
+        return RecoveryUndecidable(exc.message)
+
+
+def _project(
+    execution_id: str,
+    run_events: Sequence[BaseEvent],
+    versions: Mapping[int, Sequence[BaseEvent]],
+) -> RecoveryProjection:
+    enabled = [event for event in run_events if event.type == CHECK_PACKAGE_ENABLED]
+    if any(event.type not in (CHECK_PACKAGE_ENABLED, ACCEPTANCE_RESUMED) for event in run_events):
+        raise BoundaryOrderError(
+            "the run aggregate holds a record the product does not write there"
+        )
+    if not enabled:
+        if versions or run_events:
+            raise BoundaryOrderError("boundary records exist without the run's enabled record")
+        return RecoveryOff()
+    if len(enabled) != 1:
+        raise BoundaryOrderError("the run's enabled record is repeated")
+    try:
+        contract = enabled_contract(enabled[0].data)
+    except ValueError as exc:
+        raise BoundaryOrderError("the run's check package contract is malformed") from exc
+    if list(versions) != list(range(1, len(versions) + 1)):
+        raise BoundaryOrderError("the run's boundary versions are not v1, v2, ... in order")
+    states: dict[int, VersionState] = {}
+    for number, events in versions.items():
+        problems = verify_boundary_order(events, run_events=run_events)
+        if problems:
+            raise BoundaryOrderError(problems[0])
+        states[number] = version_state(events)
+        for event in events:
+            if event.type == SUPERSEDED:
+                successor = parse_boundary_version(str(event.data.get("superseded_by")))
+                if successor is None or successor[1] not in versions:
+                    raise BoundaryOrderError("a version is superseded by one the journal lacks")
+    started = [number for number, state in states.items() if state.started]
+    if len(started) != 1:
+        raise BoundaryOrderError("the run's worker is not bound to exactly one version")
+    state = states[started[0]]
+    boundary_id = boundary_version_id(execution_id, started[0])
+    if state.seal == CONSTRUCTION_FAILED:
+        return RecoveryNoPackage(boundary_id, contract)
+    manifest = state.manifest
+    if manifest is None or state.package_id is None or state.seed_digest is None:
+        raise BoundaryOrderError("the bound version has no frozen package")
+    if not _is_digest(state.interpreter_sha256) or not _is_digest(
+        state.interpreter_realpath_sha256
+    ):
+        raise BoundaryOrderError("the bound version's admission has no interpreter pin")
+    assert state.interpreter_sha256 is not None and state.interpreter_realpath_sha256 is not None
+    lost = criteria_without_admitted_check(manifest, state.excluded)
+    admitted = [check for check in manifest.checks if check.check_id not in state.excluded]
+    covered = {link.criterion_key for check in admitted for link in check.assertions} - set(lost)
+    return RecoveryBound(
+        execution_id=execution_id,
+        boundary_id=boundary_id,
+        package_id=state.package_id,
+        seed_digest=state.seed_digest,
+        contract=contract,
+        interpreter_sha256=state.interpreter_sha256,
+        interpreter_realpath_sha256=state.interpreter_realpath_sha256,
+        criterion_keys=manifest.criterion_keys,
+        covered=frozenset(covered),
+        held_out_checks=frozenset(
+            check.check_id for check in admitted if check.check_id in manifest.held_out_checks
+        ),
+    )
