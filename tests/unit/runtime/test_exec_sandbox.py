@@ -77,7 +77,9 @@ class TestRealBackend:
             "open('inside.txt', 'w').write('ok')\n"
             "os.mkdir('made'); os.rename('inside.txt', 'made/moved.txt')\n"
             "fd, name = tempfile.mkstemp(); os.write(fd, b'tmp'); os.close(fd)\n"
-            "open(os.devnull, 'w').write('discarded')\n"
+            # An AppContainer cannot open NUL (test_exec_sandbox_windows.py).
+            "if os.name != 'nt':\n"
+            "    open(os.devnull, 'w').write('discarded')\n"
             "try:\n"
             "    open(os.path.join(sys.argv[1], 'escaped.txt'), 'w').write('no')\n"
             "except OSError:\n"
@@ -102,7 +104,7 @@ class TestRealBackend:
 
         assert result.returncode == 0, result.stderr
         assert (copy / "made" / "moved.txt").read_text(encoding="utf-8") == "ok"
-        assert len(list(layout["temp"].iterdir())) == 1
+        assert len([path for path in layout["temp"].rglob("*") if path.is_file()]) == 1
         assert not (outside / "escaped.txt").exists()
 
     @_POSIX_ONLY
@@ -384,7 +386,6 @@ class TestRealBackend:
 
         assert result.returncode == 0, result.stderr
 
-    @pytest.mark.skipif(_WINDOWS, reason="an AppContainer never reaches loopback")
     def test_loopback_stays_available_when_network_is_denied(self, layout: dict[str, Path]) -> None:
         _require_backend(deny_network=True)
         code = (
@@ -403,7 +404,6 @@ class TestRealBackend:
             deny_network=True,
         )
         assert isinstance(command, ConfinedCommand) and command.network_denied
-        assert command.loopback_available
 
         result = _run(command)
 
@@ -433,8 +433,14 @@ class TestRealBackend:
         env.pop("__CF_USER_TEXT_ENCODING", None)
         env.pop("__PYVENV_LAUNCHER__", None)
         temp = os.path.realpath(layout["temp"])
-        assert env["TMPDIR"] == env["TMP"] == env["TEMP"] == temp
-        assert all(env[name] == temp for name in exec_sandbox._HOME_VARIABLES)
+        # On Windows, process creation moves these into the container's
+        # directories beneath LOCALAPPDATA, which is the temp directory.
+        moved = {"TMP", "TEMP", "LOCALAPPDATA"} if _WINDOWS else set()
+        for name in ("TMPDIR", "TMP", "TEMP", *exec_sandbox._HOME_VARIABLES):
+            if name in moved:
+                assert Path(env[name]).is_relative_to(temp), (name, env[name])
+            else:
+                assert env[name] == temp, name
         assert env["LANG"] == "C.UTF-8" and env["EXTRA"] == "1"
         assert "OUROBOROS_TEST_SECRET" not in env
         allowed = {

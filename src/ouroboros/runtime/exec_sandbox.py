@@ -17,9 +17,10 @@ a check package exchanges frames over stdin and stdout). Under confinement:
 
 - **Writes** are allowed only beneath the writable roots the caller names
   (the copy) and the per-run temp directory, plus a few character devices
-  (``/dev/null`` and friends). Everything else, including the live
-  workspace, the user's home directory and the system temp directory, is
-  read-only. Reading and executing are not restricted.
+  (``/dev/null`` and friends; on Windows none: an AppContainer cannot open
+  the ``NUL`` device at all, so a command that redirects to it fails).
+  Everything else, including the live workspace, the user's home directory
+  and the system temp directory, is read-only.
   Each root is claimed by identity: ``confine`` records its real path,
   device and inode, and the helper opens it without following a symlink and
   refuses to run the command unless it is still that directory (on Linux the
@@ -44,14 +45,18 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   grants to the Ouroboros read capability (see the Windows backend). A
   command that reads anything else fails, which fails closed.
 - **Network** (``deny_network=True``, reported as ``network_denied``):
-  non-loopback IP traffic is denied. On macOS and Linux, loopback
-  (``localhost``) and Unix-domain sockets stay available for local IPC. On
-  Windows an AppContainer cannot reach loopback at all, with or without
-  ``deny_network``, unless an administrator has exempted it
-  (``CheckNetIsolation``), which a per-run container never is;
-  ``ConfinedCommand.loopback_available`` reports it, so a caller can tell a
-  check that failed because it could not start or reach a local server from
-  one that failed on its merits.
+  non-loopback IP traffic is denied, and loopback (``localhost``) and
+  Unix-domain sockets stay available for local IPC. How far loopback
+  reaches differs: under ``sandbox-exec`` and in a container's own
+  loopback-only namespace it reaches every local process; in a new Linux
+  namespace and in a Windows AppContainer it reaches only the command's own
+  processes. An AppContainer never reaches a loopback server outside it,
+  even with ``deny_network=False``, unless an administrator has exempted it
+  (``CheckNetIsolation LoopbackExempt``), which a per-run container never
+  is. That is not reported separately: with the network denied (the
+  replay's only mode) a Windows command reaches what it reaches in a new
+  Linux namespace, and a check that needs a service outside the sandbox
+  cannot be verified by either.
 - **Other processes' environments** (``ConfinedCommand.isolates_process_environments``):
   under Landlock a confined process cannot read ``/proc/<pid>/environ``,
   ``mem`` or ``maps`` of any process outside its domain, the controller and
@@ -76,7 +81,11 @@ a check package exchanges frames over stdin and stdout). Under confinement:
   and so does ``HOME`` unless the caller passes it through (on Windows also
   ``USERPROFILE``, ``APPDATA`` and ``LOCALAPPDATA``, and ``SYSTEMROOT`` is
   set to the Windows directory, without which Winsock cannot start);
-  ``env_set`` values are applied last. That environment (``ConfinedCommand.command_env``)
+  ``env_set`` values are applied last. On Windows, creating an AppContainer
+  process then rewrites ``LOCALAPPDATA`` to ``<LOCALAPPDATA>\\Packages\\<name>\\AC``
+  and ``TEMP`` and ``TMP`` to its ``Temp`` subdirectory; ``LOCALAPPDATA``
+  must lie inside a writable root (it is the temp directory unless the
+  caller changes it), so all three stay inside the temp directory. That environment (``ConfinedCommand.command_env``)
   takes effect only when the command itself is exec'd, inside the sandbox:
   every launcher (``sandbox-exec``, ``unshare``, the helper) starts with a
   fixed bootstrap environment (``ConfinedCommand.env``), so a loader control
@@ -113,10 +122,12 @@ Backends:
   ``_confine_windows.py``, which stays outside the container, starts the
   command inside it and waits for it (an AppContainer is applied when a
   process is created, not by the process itself). Each ``confine`` call
-  names a fresh AppContainer (a random name; its SID is derived, and no
-  profile is created, so the container has no profile folder or registry
-  hive to write to). Concurrent commands therefore never share a principal:
-  one command's grants cannot reach another's copy. The launcher grants that
+  names a fresh AppContainer (a random name). Concurrent commands therefore
+  never share a principal: one command's grants cannot reach another's copy.
+  ``CreateProcessW`` requires a registered profile, so the launcher creates
+  one and deletes it after creating the command's process and before
+  resuming it: the profile folder, which grants the container full control,
+  and its registry storage are gone before the command runs anything. The launcher grants that
   SID modify on the writable roots, through the handles it verified,
   creates the command suspended with ``PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES``
   (no network capability when the network is denied; the client and server
@@ -274,7 +285,7 @@ class NetworkPlan(StrEnum):
     CURRENT_NAMESPACE = "current_namespace"
     """Linux: this process's namespace had only ``lo`` when ``confine`` ran."""
     NO_CAPABILITY = "no_capability"
-    """Windows: the AppContainer holds no network capability (loopback included)."""
+    """Windows: the AppContainer holds no network capability (its own loopback stays)."""
 
 
 class SandboxUnavailableReason(StrEnum):
@@ -328,8 +339,6 @@ class ConfinedCommand:
     network_denied: bool
     isolates_process_environments: bool
     """Whether the command cannot read other processes' environments (Landlock, AppContainer)."""
-    loopback_available: bool = True
-    """Whether the command can reach loopback (``localhost``); False in an AppContainer."""
 
 
 def _darwin_profile(root_count: int, *, deny_network: bool) -> str:
@@ -608,7 +617,8 @@ def _probe_matrix(argv_prefix: Sequence[str] | None, root: Path) -> dict[str, An
     try:
         result = subprocess.run(  # noqa: S603 - fixed argv, no shell
             argv,
-            env=_bootstrap_environment({"PATH": os.defpath}),
+            # The probe command gets the environment a real command would.
+            env=_bootstrap_environment(build_environment(str(inside), source={"PATH": os.defpath})),
             capture_output=True,
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,
@@ -863,7 +873,6 @@ def confine(
         network_denied=network is not NetworkPlan.ALLOW,
         isolates_process_environments=backend
         in (SandboxBackend.LANDLOCK, SandboxBackend.APPCONTAINER),
-        loopback_available=backend is not SandboxBackend.APPCONTAINER,
     )
 
 

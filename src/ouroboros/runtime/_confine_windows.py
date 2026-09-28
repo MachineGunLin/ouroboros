@@ -20,9 +20,12 @@ process. In order:
    volume and file id), or nothing runs. The handles stay open, without
    delete sharing, until the launcher exits, so no root can be renamed or
    replaced while the command runs.
-2. The AppContainer SID is derived from ``NAME``, a fresh random name per
-   run (no profile is created, so there is no profile folder or registry
-   hive the container could write to).
+2. An AppContainer profile named ``NAME`` (a fresh random name per run) is
+   created: ``CreateProcessW`` refuses an AppContainer SID without one
+   (``ERROR_FILE_NOT_FOUND``). The profile exists only until the command's
+   process has been created: it is deleted before the process is resumed,
+   so its folder (which grants the container full control) and its
+   registry storage are gone before the command runs anything.
 3. Each ``--read`` path the container cannot already read is granted read
    and execute for the Ouroboros read capability (``READ_CAPABILITY``), a
    stable capability SID every run's container holds. That grant is
@@ -35,8 +38,13 @@ process. In order:
 6. The command is created suspended in the AppContainer with no network
    capability (``--network`` adds the client and server capabilities),
    inheriting exactly the launcher's standard handles, then assigned to a
-   Job Object that kills every process in it when its last handle closes,
-   then resumed.
+   Job Object that kills every process in it when its last handle closes;
+   the profile is deleted, and the command resumed. Process creation
+   rewrites ``LOCALAPPDATA`` to ``<LOCALAPPDATA>\\Packages\\NAME\\AC`` and
+   ``TEMP``/``TMP`` to its ``Temp`` subdirectory, computed from the
+   ``LOCALAPPDATA`` the command's environment names; that must lie inside a
+   writable root (``confine`` points it at the temp directory), and the
+   launcher creates the two directories there first.
 7. When the command exits, the rest of its process tree is terminated and
    the per-run grants are revoked (on every path this launcher controls:
    normal exit, failure of the command, failure of any step above). If the
@@ -115,6 +123,7 @@ _STD_HANDLES = (-10, -11, -12)  # input, output, error
 _INFINITE = 0xFFFFFFFF
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_PROFILE_DESCRIPTION = "Ouroboros execution sandbox: one confined command"
 
 
 class SandboxError(Exception):
@@ -143,150 +152,83 @@ class _Win32:
         self.advapi32 = ctypes.WinDLL(os.path.join(system, "advapi32.dll"), use_last_error=True)
         self.userenv = ctypes.WinDLL(os.path.join(system, "userenv.dll"), use_last_error=True)
         self.kernelbase = ctypes.WinDLL(os.path.join(system, "kernelbase.dll"), use_last_error=True)
-        k, a = self.kernel32, self.advapi32
-        k.CreateFileW.restype = wintypes.HANDLE
-        k.CreateFileW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ]
-        k.CloseHandle.argtypes = [wintypes.HANDLE]
-        k.GetFileInformationByHandleEx.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        k.GetStdHandle.restype = wintypes.HANDLE
-        k.GetStdHandle.argtypes = [wintypes.DWORD]
-        k.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
-        k.CreateJobObjectW.restype = wintypes.HANDLE
-        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        k.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        k.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        k.ResumeThread.restype = wintypes.DWORD
-        k.ResumeThread.argtypes = [wintypes.HANDLE]
-        k.WaitForSingleObject.restype = wintypes.DWORD
-        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        k.InitializeProcThreadAttributeList.argtypes = [
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_size_t),
-        ]
-        k.UpdateProcThreadAttribute.argtypes = [
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.c_size_t,
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        k.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
-        k.CreateProcessW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.LPWSTR,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            wintypes.BOOL,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.LPCWSTR,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        k.LocalFree.restype = ctypes.c_void_p
-        k.LocalFree.argtypes = [ctypes.c_void_p]
-        a.GetSecurityInfo.restype = wintypes.DWORD
-        a.GetSecurityInfo.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        a.SetSecurityInfo.restype = wintypes.DWORD
-        a.SetSecurityInfo.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        a.GetNamedSecurityInfoW.restype = wintypes.DWORD
-        a.GetNamedSecurityInfoW.argtypes = [
-            wintypes.LPCWSTR,
-            ctypes.c_int,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        a.SetNamedSecurityInfoW.restype = wintypes.DWORD
-        a.SetNamedSecurityInfoW.argtypes = [
-            wintypes.LPWSTR,
-            ctypes.c_int,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        a.SetEntriesInAclW.restype = wintypes.DWORD
-        a.SetEntriesInAclW.argtypes = [
-            wintypes.ULONG,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        a.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-        a.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        a.IsValidSid.argtypes = [ctypes.c_void_p]
-        a.GetLengthSid.restype = wintypes.DWORD
-        a.GetLengthSid.argtypes = [ctypes.c_void_p]
-        a.FreeSid.restype = ctypes.c_void_p
-        a.FreeSid.argtypes = [ctypes.c_void_p]
-        a.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
-        a.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-        a.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_wchar_p),
-            ctypes.c_void_p,
-        ]
-        self.userenv.DeriveAppContainerSidFromAppContainerName.restype = ctypes.c_long
-        self.userenv.DeriveAppContainerSidFromAppContainerName.argtypes = [
-            wintypes.LPCWSTR,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        self.kernelbase.DeriveCapabilitySidsFromName.argtypes = [
-            wintypes.LPCWSTR,
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
-            ctypes.POINTER(wintypes.DWORD),
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
-            ctypes.POINTER(wintypes.DWORD),
-        ]
+        # restype, then argtypes, for every function called; ``bool`` stands
+        # for a BOOL result checked for zero.
+        h, d, p, w = wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR
+        pp, ps = ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)
+        sids = ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        signatures: dict[Any, dict[str, tuple[Any, ...]]] = {
+            self.kernel32: {
+                "CreateFileW": (h, w, d, d, p, d, d, h),
+                "CloseHandle": (bool, h),
+                "GetFileInformationByHandleEx": (bool, h, ctypes.c_int, p, d),
+                "GetStdHandle": (h, d),
+                "SetHandleInformation": (bool, h, d, d),
+                "CreateJobObjectW": (h, p, w),
+                "SetInformationJobObject": (bool, h, ctypes.c_int, p, d),
+                "AssignProcessToJobObject": (bool, h, h),
+                "TerminateJobObject": (bool, h, wintypes.UINT),
+                "TerminateProcess": (bool, h, wintypes.UINT),
+                "ResumeThread": (d, h),
+                "WaitForSingleObject": (d, h, d),
+                "GetExitCodeProcess": (bool, h, ctypes.POINTER(d)),
+                "InitializeProcThreadAttributeList": (bool, p, d, d, ps),
+                "UpdateProcThreadAttribute": (
+                    bool,
+                    p,
+                    d,
+                    ctypes.c_size_t,
+                    p,
+                    ctypes.c_size_t,
+                    p,
+                    p,
+                ),
+                "DeleteProcThreadAttributeList": (None, p),
+                "CreateProcessW": (bool, w, wintypes.LPWSTR, p, p, wintypes.BOOL, d, p, w, p, p),
+                "LocalFree": (p, p),
+            },
+            self.advapi32: {
+                "GetSecurityInfo": (d, h, ctypes.c_int, d, p, p, pp, p, pp),
+                "SetSecurityInfo": (d, h, ctypes.c_int, d, p, p, p, p),
+                "GetNamedSecurityInfoW": (d, w, ctypes.c_int, d, p, p, pp, p, pp),
+                "SetNamedSecurityInfoW": (d, wintypes.LPWSTR, ctypes.c_int, d, p, p, p, p),
+                "SetEntriesInAclW": (d, wintypes.ULONG, p, p, pp),
+                "GetAce": (bool, p, d, pp),
+                "EqualSid": (bool, p, p),
+                "GetLengthSid": (d, p),
+                "FreeSid": (p, p),
+                "ConvertSidToStringSidW": (bool, p, ctypes.POINTER(ctypes.c_wchar_p)),
+                "ConvertStringSidToSidW": (bool, w, pp),
+                "ConvertSecurityDescriptorToStringSecurityDescriptorW": (
+                    bool,
+                    p,
+                    d,
+                    d,
+                    ctypes.POINTER(ctypes.c_wchar_p),
+                    p,
+                ),
+            },
+            self.userenv: {
+                "CreateAppContainerProfile": (ctypes.c_long, w, w, w, p, d, pp),
+                "DeleteAppContainerProfile": (ctypes.c_long, w),
+                "DeriveAppContainerSidFromAppContainerName": (ctypes.c_long, w, pp),
+            },
+            self.kernelbase: {
+                "DeriveCapabilitySidsFromName": (
+                    bool,
+                    w,
+                    sids,
+                    ctypes.POINTER(d),
+                    sids,
+                    ctypes.POINTER(d),
+                ),
+            },
+        }
+        for dll, functions in signatures.items():
+            for name, (restype, *argtypes) in functions.items():
+                function = getattr(dll, name)
+                function.restype = wintypes.BOOL if restype is bool else restype
+                function.argtypes = argtypes
 
     @staticmethod
     def error(what: str, code: int | None = None) -> SandboxError:
@@ -336,6 +278,31 @@ def appcontainer_sid(api: _Win32, name: str) -> Sid:
         return Sid(api, pointer.value)
     finally:
         api.advapi32.FreeSid(pointer)
+
+
+def create_profile(api: _Win32, name: str) -> Sid:
+    """Create the AppContainer profile ``name`` and return its SID.
+
+    A profile that already exists is refused: it was not created for this
+    run, so nothing about who else holds its SID is known.
+    """
+    pointer = ctypes.c_void_p()
+    result = api.userenv.CreateAppContainerProfile(
+        name, name, _PROFILE_DESCRIPTION, None, 0, ctypes.byref(pointer)
+    )
+    if result != 0 or not pointer.value:
+        raise api.error(f"CreateAppContainerProfile({name!r})", result & 0xFFFF)
+    try:
+        return Sid(api, pointer.value)
+    finally:
+        api.advapi32.FreeSid(pointer)
+
+
+def delete_profile(api: _Win32, name: str) -> None:
+    """Delete the AppContainer profile ``name`` (its folder and registry storage)."""
+    result = api.userenv.DeleteAppContainerProfile(name)
+    if result != 0:
+        raise api.error(f"DeleteAppContainerProfile({name!r})", result & 0xFFFF)
 
 
 def capability_sid(api: _Win32, name: str = READ_CAPABILITY) -> Sid:
@@ -857,10 +824,10 @@ def launch(
     capabilities: list[Sid],
     job: int,
 ) -> tuple[int, int]:
-    """Create ``argv`` suspended in the AppContainer, put it in ``job``, resume it.
+    """Create ``argv`` suspended in the AppContainer and put it in ``job``.
 
-    Returns the process and thread handles. It inherits exactly the
-    launcher's standard handles (``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``).
+    Returns the process and (suspended) thread handles. It inherits exactly
+    the launcher's standard handles (``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``).
     """
     api = _api()
     entries = (_SidAndAttributes * max(len(capabilities), 1))()
@@ -937,13 +904,38 @@ def launch(
         api.kernel32.CloseHandle(info.hThread)
         api.kernel32.CloseHandle(info.hProcess)
         raise error
-    if api.kernel32.ResumeThread(info.hThread) == 0xFFFFFFFF:
-        error = api.error("ResumeThread")
-        api.kernel32.TerminateProcess(info.hProcess, EXIT_SANDBOX_FAILED)
-        api.kernel32.CloseHandle(info.hThread)
-        api.kernel32.CloseHandle(info.hProcess)
-        raise error
     return int(info.hProcess), int(info.hThread)
+
+
+def _variable(env: dict[str, str], name: str) -> str | None:
+    return next((value for key, value in env.items() if key.upper() == name), None)
+
+
+def prepare_profile_directories(env: dict[str, str], name: str, roots: list[Root]) -> None:
+    """Create the directories process creation will point ``LOCALAPPDATA``,
+    ``TEMP`` and ``TMP`` at, under the command's ``LOCALAPPDATA``, which must
+    lie inside a writable root (this launcher is not confined: it must not
+    create anything outside the roots)."""
+    base = _variable(env, "LOCALAPPDATA")
+    if not base or not os.path.isabs(base):
+        raise SandboxError("LOCALAPPDATA must name a directory inside a writable root")
+    real = os.path.normcase(os.path.realpath(base))
+    inside = any(
+        os.path.commonpath((real, os.path.normcase(root.path))) == os.path.normcase(root.path)
+        for root in roots
+        if os.path.splitdrive(real)[0].lower() == os.path.splitdrive(root.path)[0].lower()
+    )
+    if not inside:
+        raise SandboxError(f"LOCALAPPDATA {base} is not inside a writable root")
+    os.makedirs(os.path.join(real, "Packages", name, "AC", "Temp"), exist_ok=True)
+
+
+def resume(thread: int, process: int) -> None:
+    api = _api()
+    if api.kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+        error = api.error("ResumeThread")
+        api.kernel32.TerminateProcess(process, EXIT_SANDBOX_FAILED)
+        raise error
 
 
 def wait(process: int) -> int:
@@ -1023,6 +1015,7 @@ def main(arguments: list[str]) -> int:
     roots: list[Root] = []
     granted: list[Root] = []
     container: Sid | None = None
+    profile: str | None = None
     job: int | None = None
     try:
         try:
@@ -1031,7 +1024,9 @@ def main(arguments: list[str]) -> int:
             api = _api()
             for path, device, inode in parsed["roots"]:
                 roots.append(Root(path, device, inode))
-            container = appcontainer_sid(api, parsed["appcontainer"])
+            prepare_profile_directories(env, parsed["appcontainer"], roots)
+            container = create_profile(api, parsed["appcontainer"])
+            profile = parsed["appcontainer"]
             reader = capability_sid(api)
             grant_read(parsed["read"], parsed["manifest"], reader)
             for root in roots:
@@ -1059,6 +1054,18 @@ def main(arguments: list[str]) -> int:
             sys.stderr.write(f"ouroboros exec sandbox: {command[0]}: {exc.strerror}\n")
             return EXIT_NOT_EXECUTABLE
         try:
+            # The profile folder grants the container full control: it must be
+            # gone before the command runs anything.
+            delete_profile(api, profile)
+            profile = None
+            resume(thread, process)
+        except SandboxError as exc:
+            api.kernel32.TerminateProcess(process, EXIT_SANDBOX_FAILED)
+            api.kernel32.CloseHandle(thread)
+            api.kernel32.CloseHandle(process)
+            sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
+            return EXIT_SANDBOX_FAILED
+        try:
             return wait(process)
         finally:
             # The command has exited: end whatever it left running before
@@ -1067,6 +1074,11 @@ def main(arguments: list[str]) -> int:
             api.kernel32.CloseHandle(thread)
             api.kernel32.CloseHandle(process)
     finally:
+        if profile is not None:
+            try:
+                delete_profile(_api(), profile)
+            except SandboxError as exc:
+                sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
         for root in granted:
             try:
                 root.update(container, _REVOKE_ACCESS, 0)  # type: ignore[arg-type]

@@ -210,10 +210,11 @@ command text a second way. The rules:
   (with its loopback interface brought up, so loopback stays available),
   or not at all when the Linux process already has only a loopback interface
   (a container started with `--network none`). Unix-domain sockets stay
-  available. On Windows the AppContainer holds no network capability, which
-  denies loopback too (an AppContainer reaches loopback only through an
-  administrator's exemption); the confined command reports
-  `loopback_available: false`. Where none of these works, nothing is replayed and the
+  available. On Windows the AppContainer holds no network capability; as in
+  a new Linux namespace, loopback connects only the command's own processes
+  (an AppContainer never reaches a loopback server outside it without an
+  administrator's exemption). An AppContainer cannot open the `NUL` device,
+  so a replayed command that redirects to it fails. Where none of these works, nothing is replayed and the
   observation records `replay_skipped: network_isolation_unavailable`.
 - **Live paths.** The copy reaches live paths through its links: the linked
   dependency trees and the targets of copied symlinks. They are outside the

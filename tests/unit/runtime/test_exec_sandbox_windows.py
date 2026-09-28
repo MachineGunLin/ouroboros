@@ -76,6 +76,16 @@ def _confine(layout: dict[str, Path], argv: tuple[str, ...], **kwargs: object) -
     return command
 
 
+def _aces(path: Path | str) -> str:
+    """The ACEs of ``path``'s DACL in SDDL, without the control flags (``P``, ``AI``).
+
+    Rewriting a DACL through the security API sets the auto-inherited flag;
+    what a grant or revocation changes is the entries.
+    """
+    sddl = launcher.dacl_sddl(str(path))
+    return sddl[sddl.index("(") :] if "(" in sddl else ""
+
+
 def _container_sid(command: ConfinedCommand) -> str:
     name = command.argv[command.argv.index("--appcontainer") + 1]
     return str(launcher.appcontainer_sid(launcher._api(), name))
@@ -173,6 +183,58 @@ class TestWrites:
         assert _container_sid(command) not in before
 
 
+class TestProfile:
+    def test_the_profile_folder_is_gone_before_the_command_runs(
+        self, layout: dict[str, Path]
+    ) -> None:
+        """The profile folder grants the container full control: it must not exist."""
+        _require_backend()
+        code = (
+            "import os, sys\n"
+            "folder = sys.argv[1]\n"
+            "try:\n"
+            "    os.makedirs(folder, exist_ok=True)\n"
+            "    open(os.path.join(folder, 'escaped.txt'), 'w').write('x')\n"
+            "except OSError:\n"
+            "    sys.exit(0 if not os.path.exists(folder) else 5)\n"
+            "sys.exit(3)\n"
+        )
+        command = _confine(layout, ("placeholder",))
+        name = command.argv[command.argv.index("--appcontainer") + 1]
+        folder = Path(os.environ["LOCALAPPDATA"]) / "Packages" / name / "AC"
+        argv = (*command.argv[: command.argv.index("--") + 1], *_python(code, str(folder)))
+
+        result = subprocess.run(  # noqa: S603 - the confined argv with another command
+            list(argv),
+            cwd=command.cwd,
+            env=dict(command.env),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert not folder.parent.exists()
+
+    def test_temp_and_localappdata_stay_inside_the_temp_directory(
+        self, layout: dict[str, Path]
+    ) -> None:
+        _require_backend()
+        code = "import json, os; print(json.dumps(dict(os.environ)))"
+        command = _confine(layout, _python(code))
+
+        result = _run(command)
+
+        assert result.returncode == 0, result.stderr
+        env = json.loads(result.stdout)
+        temp = layout["temp"]
+        for name in ("TMP", "TEMP", "LOCALAPPDATA"):
+            assert Path(env[name]).is_relative_to(temp), (name, env[name])
+            assert Path(env[name]).is_dir()
+
+
 class TestNetwork:
     _CONNECT = (
         "import socket, sys\n"
@@ -182,17 +244,17 @@ class TestNetwork:
         "    sys.exit(0)\n"
         "sys.exit(1)\n"
     )
-    _LOOPBACK = (
-        "import socket, sys\n"
-        "try:\n"
-        "    server = socket.create_server(('127.0.0.1', 0))\n"
-        "    client = socket.create_connection(server.getsockname(), timeout=5)\n"
-        "    peer, _ = server.accept()\n"
-        "    client.sendall(b'ping')\n"
-        "    reached = peer.recv(4) == b'ping'\n"
-        "except OSError:\n"
-        "    reached = False\n"
-        "sys.exit(1 if reached else 0)\n"
+    # A server in this process, a client in a second process of the container.
+    _OWN_LOOPBACK = (
+        "import socket, subprocess, sys\n"
+        "server = socket.create_server(('127.0.0.1', 0))\n"
+        "server.settimeout(10)\n"
+        "port = server.getsockname()[1]\n"
+        "client = ('import socket; socket.create_connection((\"127.0.0.1\", %d), '\n"
+        "          'timeout=5).sendall(b\"ping\")' % port)\n"
+        "subprocess.run([sys.executable, '-I', '-c', client], check=True, timeout=30)\n"
+        "peer, _ = server.accept()\n"
+        "sys.exit(0 if peer.recv(4) == b'ping' else 1)\n"
     )
 
     def test_network_is_denied(self, layout: dict[str, Path]) -> None:
@@ -211,14 +273,43 @@ class TestNetwork:
         assert _run(allowed).returncode == 1
 
     @pytest.mark.parametrize("deny_network", [True, False])
-    def test_loopback_is_unavailable_and_reported(
+    def test_loopback_connects_only_the_commands_own_processes(
         self, layout: dict[str, Path], deny_network: bool
     ) -> None:
+        """As in a new Linux namespace: the command's processes reach each other
+        over loopback; a loopback server outside the container is unreachable."""
         _require_backend()
-        command = _confine(layout, _python(self._LOOPBACK), deny_network=deny_network)
+        outside = socket.create_server(("127.0.0.1", 0))
+        outside.settimeout(0.5)
+        try:
+            port = str(outside.getsockname()[1])
+            own = _confine(layout, _python(self._OWN_LOOPBACK), deny_network=deny_network)
+            out = _confine(
+                layout, _python(self._CONNECT, "127.0.0.1", port), deny_network=deny_network
+            )
 
-        assert command.loopback_available is False
-        assert _run(command).returncode == 0
+            own_result, out_result = _run(own), _run(out)
+
+            with pytest.raises(TimeoutError):
+                outside.accept()
+        finally:
+            outside.close()
+        assert own_result.returncode == 0, own_result.stderr
+        assert out_result.returncode == 0, "a loopback server outside the container was reached"
+
+    def test_the_null_device_is_unavailable(self, layout: dict[str, Path]) -> None:
+        """Documented in the contract: an AppContainer cannot open NUL."""
+        _require_backend()
+        code = (
+            "import os, sys\n"
+            "try:\n"
+            "    open(os.devnull, 'w').close()\n"
+            "except PermissionError:\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+
+        assert _run(_confine(layout, _python(code))).returncode == 0
 
 
 def _process_alive(pid: int) -> bool:
@@ -234,10 +325,13 @@ def _process_alive(pid: int) -> bool:
 
 
 class TestTimeout:
+    # The grandchild records its pid, then writes ``late.txt`` after a delay
+    # that outlasts every timeout below: it must never get there.
     _TREE = (
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-I', '-c',\n"
-        '    \'import time; time.sleep(4); open("late.txt", "w").write("x")\'])\n'
+        '    \'import os, time; open("started.txt", "w").write(str(os.getpid())); \'\n'
+        '    \'time.sleep(12); open("late.txt", "w").write("x")\'])\n'
         "print(child.pid, flush=True)\n"
         "time.sleep(120)\n"
     )
@@ -266,7 +360,7 @@ class TestTimeout:
         while _process_alive(grandchild) and time.monotonic() < deadline:
             time.sleep(0.1)
         assert not _process_alive(grandchild)
-        time.sleep(5)
+        time.sleep(13)
         assert not (layout["copy"] / "late.txt").exists()
 
     def test_the_callers_timeout_path_leaves_nothing_behind(self, tmp_path: Path) -> None:
@@ -284,11 +378,14 @@ class TestTimeout:
         sid = _container_sid(command)
 
         run = asyncio.run(
-            _run_process(command.argv, cwd=command.cwd, env=command.env, timeout_seconds=5)
+            _run_process(command.argv, cwd=command.cwd, env=command.env, timeout_seconds=8)
         )
 
         assert run.timed_out
-        time.sleep(5)
+        started = layout["copy"] / "started.txt"
+        assert started.exists(), "the tree never started: the timeout proves nothing"
+        assert not _process_alive(int(started.read_text(encoding="utf-8")))
+        time.sleep(13)
         assert not (layout["copy"] / "late.txt").exists()
         # The caller deletes its roots; the per-run grants go with them.
         shutil.rmtree(scratch)
@@ -304,7 +401,7 @@ class TestGrants:
         (copy / "sub").mkdir()
         (copy / "sub" / "file.txt").write_text("x", encoding="utf-8")
         watched = [copy, copy / "sub", copy / "sub" / "file.txt", temp]
-        before = {path: launcher.dacl_sddl(str(path)) for path in watched}
+        before = {path: _aces(path) for path in watched}
         commands = {
             "succeeds": (_python("open('made.txt', 'w').write('x')"), 0),
             "fails": (_python("import sys; sys.exit(3)"), 3),
@@ -317,7 +414,7 @@ class TestGrants:
             result = _run(command)
 
             assert result.returncode == status, (label, result.stderr)
-            after = {path: launcher.dacl_sddl(str(path)) for path in watched}
+            after = {path: _aces(path) for path in watched}
             assert after == before, label
             if (copy / "made.txt").exists():
                 assert sid not in launcher.dacl_sddl(str(copy / "made.txt")), label
@@ -331,7 +428,7 @@ class TestGrants:
         deps = tmp_path.resolve() / "deps"
         deps.mkdir()
         (deps / "module.txt").write_text("dependency", encoding="utf-8")
-        original = launcher.dacl_sddl(str(deps))
+        original = _aces(deps)
         _winapi.CreateJunction(str(deps), str(layout["copy"] / "deps"))
         read = _python("import sys; sys.exit(0 if open('deps/module.txt').read() else 1)")
 
@@ -347,7 +444,7 @@ class TestGrants:
         removed = exec_sandbox.remove_persistent_read_grants()
 
         assert removed == (str(deps),)
-        assert launcher.dacl_sddl(str(deps)) == original
+        assert _aces(deps) == original
         assert capability not in launcher.dacl_sddl(str(deps / "module.txt"))
         assert not manifest.exists()
         # Without the grant the container cannot read it; the next run grants it again.
@@ -363,13 +460,14 @@ class TestUnavailable:
         """A failing AppContainer setup makes the probe fail: nothing runs, ever."""
 
         def refuse(api: object, name: str) -> object:
-            raise launcher.SandboxError(f"DeriveAppContainerSidFromAppContainerName({name!r})")
+            raise launcher.SandboxError(f"CreateAppContainerProfile({name!r}) failed")
 
         marker = layout["copy"] / "ran.txt"
-        before = launcher.dacl_sddl(str(layout["copy"]))
+        before = _aces(layout["copy"])
         status = os.stat(layout["copy"])
-        monkeypatch.setenv(launcher.COMMAND_ENV_VARIABLE, json.dumps({"PATH": os.defpath}))
-        monkeypatch.setattr(launcher, "appcontainer_sid", refuse)
+        env = {"PATH": os.defpath, "LOCALAPPDATA": str(layout["copy"])}
+        monkeypatch.setenv(launcher.COMMAND_ENV_VARIABLE, json.dumps(env))
+        monkeypatch.setattr(launcher, "create_profile", refuse)
         argv = [
             "--appcontainer",
             "ouroboros.sandbox.test",
@@ -388,7 +486,7 @@ class TestUnavailable:
 
         assert launcher.main(argv) == launcher.EXIT_SANDBOX_FAILED
         assert not marker.exists()
-        assert launcher.dacl_sddl(str(layout["copy"])) == before
+        assert _aces(layout["copy"]) == before
 
     def test_an_invalid_appcontainer_name_reports_the_sandbox_unavailable(
         self, layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
