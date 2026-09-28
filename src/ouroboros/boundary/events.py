@@ -27,13 +27,20 @@ receipts are stored separately (``package.write_package_record``,
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ouroboros.boundary.binding import Binding, BindingSource, CheckTier
 from ouroboros.boundary.package import CheckPackage, package_record_bytes, sha256_bytes
-from ouroboros.boundary.receipts import AdmissionResult, CandidateVerification
+from ouroboros.boundary.receipts import (
+    AdmissionJournal,
+    AdmissionResult,
+    CandidateVerification,
+    VerificationJournal,
+)
 from ouroboros.events.base import BaseEvent
 
 BOUNDARY_AGGREGATE_TYPE = "boundary"
@@ -146,7 +153,12 @@ class BindingsPayload(_Payload):
 
 
 class CriterionDecisionRecord(_Payload):
-    """One criterion's final acceptance and the signals behind it."""
+    """One criterion's final acceptance and the signals behind it.
+
+    ``tier`` is for display only (the weakest tier over the passing checks)
+    and has no authority: an A' oracle plus an advisory script shows ``S``.
+    What decided a pass is ``declared_binding_pass``.
+    """
 
     root_ac_index: int
     criterion_key: str
@@ -160,6 +172,13 @@ class CriterionDecisionRecord(_Payload):
     existing_accepted: bool
     accepted: bool
     governed_by: str
+    declared_binding_pass: bool
+    """The criterion's package ``pass`` depends on a worker-declared binding (tier A').
+
+    Such a pass only corroborates: it is decided by the existing verifier
+    when that verifier rejected the attempt, and it never accepts a criterion
+    the existing verifier rejected. ``False`` for every status but ``pass``.
+    """
 
 
 _DECISION_STATUSES = frozenset({"pass", "fail", "indeterminate", "unverified", "uncovered"})
@@ -196,23 +215,28 @@ class ReconciliationPayload(_Payload):
         (``acceptance.reconcile_acceptance``): the package accepts exactly its
         pass, unverified and uncovered criteria and never a fail or an
         indeterminate one; a criterion nobody attempted is never accepted; the
-        existing verifier's decision is its own verdict; the run is accepted
-        exactly when every criterion is. An undecided decision has no pass
-        and no fail.
+        existing verifier's decision is its own verdict, and of the package's
+        passes it decides only one that rests on a worker-declared binding
+        (``declared_binding_pass``; the display ``tier`` decides nothing); such
+        a pass never accepts over the existing verifier's rejection; the run
+        is accepted exactly when every criterion is. An undecided decision
+        has no pass and no fail.
         """
         for item in self.criteria:
             status, governor = item.package_status, item.governed_by
             if status not in _DECISION_STATUSES or governor not in _GOVERNORS:
                 raise ValueError("a decision names an unknown status or governor")
+            if item.declared_binding_pass and status != "pass":
+                raise ValueError("only a pass can rest on a worker-declared binding")
+            if item.declared_binding_pass and item.accepted and not item.existing_accepted:
+                raise ValueError("a declared-binding pass never overrules the existing verifier")
             if governor == "check_package":
                 expected = status in _PACKAGE_ACCEPTS
             elif governor == "execution":
                 expected = False
             else:
                 expected = item.existing_accepted
-                if status not in _EXISTING_DECIDES and not (
-                    status == "pass" and item.tier is CheckTier.A_PRIME
-                ):
+                if status not in _EXISTING_DECIDES and not item.declared_binding_pass:
                     raise ValueError("the existing verifier decides only what the package did not")
             if item.accepted != expected:
                 raise ValueError("a criterion's acceptance disagrees with what decided it")
@@ -411,3 +435,283 @@ def acceptance_resumed_event(
     """The package decision a resumed run recomputed (statuses and reasons, no case values)."""
     _require(payload, ResumedPayload)
     return _event(boundary_id, ACCEPTANCE_RESUMED, {**payload.journal_data(), **cite(package_id)})
+
+
+# --------------------------------------------------------------------------
+# The journal gateway. Every record the ledger appends, and every record replay
+# (``ledger.advance``) or the recovery projection reads, passes
+# ``validate_record`` first: the envelope, the record's exact closed schema
+# (what its factory above writes, no field missing or added), and, once a
+# boundary version is sealed, the identities the seal fixed. A record that
+# fails is refused on write and flagged on replay, so a record the product
+# could not have written reaches no transition and no projection.
+
+
+class JournalRecordError(ValueError):
+    """A journal record is not one the product writes (envelope, schema, or identity)."""
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenIdentity:
+    """What a boundary version's seal fixed; every later record must agree with it."""
+
+    package_id: str | None
+    seed_digest: str | None
+    criterion_keys: frozenset[str] | None
+    """The frozen manifest's criterion keys; ``None`` when the version has no manifest."""
+    check_ids: frozenset[str]
+    """The frozen package's check ids (none without a package)."""
+
+
+RUN_IDENTITY = FrozenIdentity(
+    package_id=None, seed_digest=None, criterion_keys=None, check_ids=frozenset()
+)
+"""A run aggregate's records cite no package, no Seed and no check."""
+
+
+@dataclass(frozen=True, slots=True)
+class Cited:
+    """The identities one record names, compared with the ``FrozenIdentity``."""
+
+    package_id: str | None
+    seed_digest: str | None = None
+    """Set only by records that carry a Seed digest."""
+    criterion_keys: tuple[str, ...] = ()
+    check_ids: tuple[str, ...] = ()
+    decided: tuple[str, ...] | None = None
+    """A decision's criteria: exactly the frozen manifest's, each once."""
+
+
+class _Citing(Protocol):
+    def cited(self) -> Cited: ...
+
+
+class EnabledRecord(_Payload):
+    """``boundary.check_package.enabled`` as journaled."""
+
+    execution_id: str
+    contract: RunContract
+
+    def cited(self) -> Cited:
+        return Cited(None)
+
+
+class FrozenRecord(_Payload):
+    """``boundary.check_package.frozen`` as journaled.
+
+    ``manifest`` is the package's own summary (``CheckPackage.manifest_summary``);
+    ``ledger.frozen_manifest`` validates the identities it holds.
+    """
+
+    package_id: str
+    seed_digest: str
+    record_sha256: str
+    manifest: dict[str, Any]
+
+    def cited(self) -> Cited:
+        return Cited(self.package_id, self.seed_digest)
+
+
+class ConstructionFailedRecord(_Payload):
+    """``boundary.check_package.construction_failed`` as journaled."""
+
+    seed_digest: str
+    input_digest: str
+    reason: str
+
+    def cited(self) -> Cited:
+        return Cited(None, self.seed_digest)
+
+
+class ReferenceCheckedRecord(ReferenceCheckPayload):
+    """``boundary.oracle.reference_checked`` as journaled."""
+
+    package_id: str
+
+    def cited(self) -> Cited:
+        return Cited(
+            self.package_id,
+            criterion_keys=tuple(item.criterion_key for item in self.uncovered),
+            check_ids=tuple(item.check_id for item in self.excluded_cases),
+        )
+
+
+class AdmissionRecord(AdmissionJournal):
+    """``boundary.check_package.admission_completed`` as journaled."""
+
+    def cited(self) -> Cited:
+        return Cited(self.package_id, self.seed_digest, check_ids=self.check_ids())
+
+
+class ActorStartedRecord(_Payload):
+    """``boundary.actor.started`` as journaled."""
+
+    actor_id: str
+    package_id: str | None
+    runtime: str | None
+
+    def cited(self) -> Cited:
+        return Cited(self.package_id)
+
+
+class SupersededRecord(_Payload):
+    """``boundary.check_package.superseded`` as journaled."""
+
+    superseded_by: str
+    package_id: str | None
+    successor_package_id: str | None
+    reason: str
+
+    def cited(self) -> Cited:
+        return Cited(self.package_id)
+
+
+class BindingsRecord(BindingsPayload):
+    """``boundary.binding.recorded`` as journaled."""
+
+    package_id: str
+
+    def cited(self) -> Cited:
+        declared = [item.declared for item in self.checks if item.declared is not None]
+        return Cited(
+            self.package_id,
+            criterion_keys=(
+                *(item.criterion_key for item in self.checks),
+                *(item.criterion_key for item in declared),
+            ),
+            check_ids=tuple(item.check_id for item in self.checks),
+        )
+
+
+class VerificationRecord(VerificationJournal):
+    """``boundary.candidate.verified`` as journaled."""
+
+    def cited(self) -> Cited:
+        return Cited(self.package_id, self.seed_digest, check_ids=self.check_ids())
+
+
+def _decision_cited(package_id: str | None, criteria: tuple[CriterionDecisionRecord, ...]) -> Cited:
+    keys = tuple(item.criterion_key for item in criteria)
+    return Cited(package_id, criterion_keys=keys, decided=keys)
+
+
+class ReconciledRecord(ReconciliationPayload):
+    """``boundary.acceptance.reconciled`` as journaled."""
+
+    package_id: str | None
+
+    def cited(self) -> Cited:
+        return _decision_cited(self.package_id, self.criteria)
+
+
+class ResumedRecord(ResumedPayload):
+    """``boundary.acceptance.resumed`` as journaled (on a version or on the run)."""
+
+    package_id: str | None
+
+    def cited(self) -> Cited:
+        cited = _decision_cited(self.package_id, self.criteria)
+        return replace(cited, check_ids=self.held_out_checks)
+
+
+JOURNAL_RECORDS: Mapping[str, type[BaseModel]] = {
+    CHECK_PACKAGE_ENABLED: EnabledRecord,
+    PACKAGE_FROZEN: FrozenRecord,
+    CONSTRUCTION_FAILED: ConstructionFailedRecord,
+    REFERENCE_CHECKED: ReferenceCheckedRecord,
+    ADMISSION_COMPLETED: AdmissionRecord,
+    ACTOR_STARTED: ActorStartedRecord,
+    SUPERSEDED: SupersededRecord,
+    BINDING_RECORDED: BindingsRecord,
+    CANDIDATE_VERIFIED: VerificationRecord,
+    ACCEPTANCE_RECONCILED: ReconciledRecord,
+    ACCEPTANCE_RESUMED: ResumedRecord,
+}
+"""The one closed schema of every boundary record, by event type."""
+
+_LABELS = {
+    CHECK_PACKAGE_ENABLED: "the run's enabled record",
+    PACKAGE_FROZEN: "the frozen record",
+    CONSTRUCTION_FAILED: "the construction_failed record",
+    REFERENCE_CHECKED: "a reference check",
+    ADMISSION_COMPLETED: "admission receipt",
+    ACTOR_STARTED: "actor start",
+    SUPERSEDED: "a supersession",
+    BINDING_RECORDED: "bindings",
+    CANDIDATE_VERIFIED: "candidate verification",
+    ACCEPTANCE_RECONCILED: "acceptance",
+    ACCEPTANCE_RESUMED: "a resumed decision",
+}
+_DECISIONS = frozenset({ACCEPTANCE_RECONCILED, ACCEPTANCE_RESUMED})
+
+
+def validate_record(event: BaseEvent, frozen: FrozenIdentity | None) -> Any:
+    """The typed record ``event`` holds; ``JournalRecordError`` unless the product wrote it.
+
+    Checks the envelope (a boundary aggregate, a known record type), the
+    record's exact closed schema (``JOURNAL_RECORDS``), and, with ``frozen``
+    (the identities of a sealed version, or ``RUN_IDENTITY``), that the record
+    cites the sealed package and Seed and names only the frozen checks and
+    criteria, a decision exactly the frozen criteria.
+    """
+    model = JOURNAL_RECORDS.get(event.type)
+    if event.aggregate_type != BOUNDARY_AGGREGATE_TYPE or not event.aggregate_id or model is None:
+        raise JournalRecordError(f"{event.type} is not a boundary record")
+    try:
+        record = model.model_validate(event.data)
+    except ValidationError as exc:
+        if event.type in _DECISIONS:
+            raise JournalRecordError(
+                "a recorded decision disagrees with the statuses that decided it"
+            ) from exc
+        raise JournalRecordError(
+            f"{_LABELS[event.type]} is not a record the product writes"
+        ) from exc
+    if frozen is not None:
+        _bind(_LABELS[event.type], cast(_Citing, record).cited(), frozen)
+    return record
+
+
+def _bind(label: str, cited: Cited, frozen: FrozenIdentity) -> None:
+    if cited.package_id != frozen.package_id:
+        raise JournalRecordError(f"{label} names a different package than the boundary's seal")
+    if cited.seed_digest is not None and cited.seed_digest != frozen.seed_digest:
+        raise JournalRecordError(f"{label} names a different Seed than the frozen package")
+    if not set(cited.check_ids) <= frozen.check_ids:
+        raise JournalRecordError(f"{label} names a check the frozen package does not hold")
+    if frozen.criterion_keys is None:
+        return
+    if not set(cited.criterion_keys) <= frozen.criterion_keys:
+        raise JournalRecordError(f"{label} names a criterion the frozen manifest does not hold")
+    decided = cited.decided
+    if decided is not None and (
+        len(set(decided)) != len(decided) or set(decided) != frozen.criterion_keys
+    ):
+        raise JournalRecordError(f"{label} does not decide exactly the frozen manifest's criteria")
+
+
+def validate_run_record(event: BaseEvent, execution_id: str) -> EnabledRecord | ResumedRecord:
+    """A record of the run's own aggregate; ``JournalRecordError`` unless the product wrote it.
+
+    The product writes there only the enabled record of this run
+    (``check_package_enabled_event``) and a resumed decision made without a
+    usable boundary (``BoundaryLedger.record_resumed_undecided``): it cites no
+    package and no check, states why, and decides nothing (every criterion
+    indeterminate or uncovered).
+    """
+    if event.aggregate_id != execution_id or event.type not in (
+        CHECK_PACKAGE_ENABLED,
+        ACCEPTANCE_RESUMED,
+    ):
+        raise JournalRecordError(
+            "the run aggregate holds a record the product does not write there"
+        )
+    record = validate_record(event, RUN_IDENTITY)
+    if isinstance(record, EnabledRecord) and record.execution_id != execution_id:
+        raise JournalRecordError("the run's enabled record names another run")
+    if isinstance(record, ResumedRecord) and (
+        not record.reason
+        or any(item.package_status not in _UNDECIDED_STATUSES for item in record.criteria)
+    ):
+        raise JournalRecordError("a run-level resumed decision must be undecided and say why")
+    return cast(EnabledRecord | ResumedRecord, record)

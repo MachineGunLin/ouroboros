@@ -22,8 +22,11 @@ time to the event about to be appended and at replay time by
    refuses one that contains a generated check file (scanned with the live
    sealed packages, so a renamed copy of the oracle data file is found);
 4. every later record (bindings, candidate verification, acceptance) must
-   cite the frozen package id (a candidate verification also its Seed
-   digest), and a superseded version accepts none;
+   cite the frozen package id (a receipt also its Seed digest) and name only
+   the frozen checks and criteria (a decision exactly the frozen criteria),
+   and a superseded version accepts none; before any transition reads a
+   record, the journal gateway (``events.validate_record``) validates its
+   envelope, its exact closed schema, and these identities;
 5. a version is superseded only by a later version of the same run.
 
 A boundary version of a run (``events.boundary_version_id``) is sealed only
@@ -52,6 +55,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from ouroboros.boundary.binding import CheckTier
 from ouroboros.boundary.events import (
     ACCEPTANCE_RECONCILED,
     ACCEPTANCE_RESUMED,
@@ -65,11 +69,24 @@ from ouroboros.boundary.events import (
     PACKAGE_FROZEN,
     REFERENCE_CHECKED,
     SUPERSEDED,
+    ActorStartedRecord,
+    AdmissionRecord,
     BindingsPayload,
+    BindingsRecord,
+    ConstructionFailedRecord,
+    EnabledRecord,
+    FrozenIdentity,
+    FrozenRecord,
+    JournalRecordError,
+    ReconciledRecord,
     ReconciliationPayload,
+    ReferenceCheckedRecord,
     ReferenceCheckPayload,
     ResumedPayload,
+    ResumedRecord,
     RunContract,
+    SupersededRecord,
+    VerificationRecord,
     acceptance_reconciled_event,
     acceptance_resumed_event,
     actor_started_event,
@@ -84,6 +101,8 @@ from ouroboros.boundary.events import (
     parse_boundary_version,
     reference_checked_event,
     superseded_event,
+    validate_record,
+    validate_run_record,
 )
 from ouroboros.boundary.package import (
     CheckPackage,
@@ -118,11 +137,6 @@ def _utc(value: datetime) -> datetime:
 
 def _first(events: Sequence[BaseEvent], event_type: str) -> BaseEvent | None:
     return next((event for event in events if event.type == event_type), None)
-
-
-def _ref(event: BaseEvent | None) -> str | None:
-    """The package id an event cites."""
-    return None if event is None else event.data.get("package_id")
 
 
 # --------------------------------------------------------------------------
@@ -383,47 +397,55 @@ class VersionState:
     def superseded(self) -> bool:
         return self.phase is Phase.SUPERSEDED
 
+    @property
+    def identity(self) -> FrozenIdentity | None:
+        """What the seal fixed for every later record (``None`` before the seal)."""
+        if self.phase is Phase.NONE:
+            return None
+        manifest = self.manifest
+        return FrozenIdentity(
+            package_id=self.package_id,
+            seed_digest=self.seed_digest,
+            criterion_keys=None if manifest is None else frozenset(manifest.criterion_keys),
+            check_ids=frozenset(() if manifest is None else (c.check_id for c in manifest.checks)),
+        )
 
-Transition = Callable[[VersionState, BaseEvent], VersionState]
+
+Transition = Callable[[VersionState, BaseEvent, Any], VersionState]
+"""A transition reads the record the journal gateway validated (``events.validate_record``)."""
 
 
-def _cites(state: VersionState, event: BaseEvent) -> bool:
-    return _ref(event) == state.package_id
-
-
-def _seal_frozen(state: VersionState, event: BaseEvent) -> VersionState:
+def _seal_frozen(state: VersionState, event: BaseEvent, record: FrozenRecord) -> VersionState:
     return replace(
         state,
         phase=Phase.FROZEN,
-        package_id=_ref(event),
-        seed_digest=event.data.get("seed_digest"),
+        package_id=record.package_id,
+        seed_digest=record.seed_digest,
         manifest=frozen_manifest(event.data),
         gate_time=_utc(event.timestamp),
     )
 
 
-def _seal_failed(state: VersionState, event: BaseEvent) -> VersionState:
+def _seal_failed(
+    state: VersionState, event: BaseEvent, record: ConstructionFailedRecord
+) -> VersionState:
     return replace(
         state,
         phase=Phase.NO_PACKAGE,
-        seed_digest=event.data.get("seed_digest"),
+        seed_digest=record.seed_digest,
         gate_time=_utc(event.timestamp),
     )
 
 
-def _reference_checked(state: VersionState, event: BaseEvent) -> VersionState:
-    if not _cites(state, event):
-        raise BoundaryOrderError("a reference check must cite the boundary's frozen package")
+def _reference_checked(
+    state: VersionState, _event: BaseEvent, _record: ReferenceCheckedRecord
+) -> VersionState:
     return state
 
 
-def _admission(state: VersionState, event: BaseEvent) -> VersionState:
-    if not _cites(state, event):
-        raise BoundaryOrderError("admission receipt names a different package")
-    if event.data.get("seed_digest") != state.seed_digest:
-        raise BoundaryOrderError("admission receipt names a different Seed than the frozen package")
+def _admission(state: VersionState, event: BaseEvent, record: AdmissionRecord) -> VersionState:
     time = _utc(event.timestamp)
-    if event.data.get("verdict") != "admitted":
+    if record.verdict != "admitted":
         # Recorded, but not an admission: the version can only be superseded.
         return replace(state, phase=Phase.REJECTED, gate_time=time)
     assert state.manifest is not None  # set with every frozen seal
@@ -431,72 +453,57 @@ def _admission(state: VersionState, event: BaseEvent) -> VersionState:
         state,
         phase=Phase.ADMITTED,
         excluded=admitted_exclusions(state.manifest, event.data),
-        interpreter_sha256=event.data.get("interpreter_sha256"),
-        interpreter_realpath_sha256=event.data.get("interpreter_realpath_sha256"),
+        interpreter_sha256=record.interpreter_sha256,
+        interpreter_realpath_sha256=record.interpreter_realpath_sha256,
         gate_time=time,
     )
 
 
-def _actor_started(state: VersionState, event: BaseEvent) -> VersionState:
+def _actor_started(
+    state: VersionState, event: BaseEvent, record: ActorStartedRecord
+) -> VersionState:
     run = parse_boundary_version(event.aggregate_id)
-    if run is not None and event.data.get("actor_id") != run[0]:
+    if run is not None and record.actor_id != run[0]:
         raise BoundaryOrderError("a boundary version of a run binds only that run's worker")
-    if not _cites(state, event):
-        raise BoundaryOrderError("actor start does not cite the sealed package")
     if state.gate_time is not None and _utc(event.timestamp) <= state.gate_time:
         raise BoundaryOrderError("actor start timestamp does not follow the boundary seal")
     return replace(state, phase=Phase.STARTED)
 
 
-def _superseded(state: VersionState, event: BaseEvent) -> VersionState:
-    _require_successor(event.aggregate_id, event.data.get("superseded_by"))
-    if not _cites(state, event):
-        raise BoundaryOrderError("a supersession must cite the sealed package")
+def _superseded(state: VersionState, event: BaseEvent, record: SupersededRecord) -> VersionState:
+    _require_successor(event.aggregate_id, record.superseded_by)
     return replace(state, phase=Phase.SUPERSEDED)
 
 
-def _bindings(state: VersionState, event: BaseEvent) -> VersionState:
-    if not state.frozen or not _cites(state, event):
+def _bindings(state: VersionState, _event: BaseEvent, record: BindingsRecord) -> VersionState:
+    if not state.frozen:
         raise BoundaryOrderError("bindings must cite the boundary's frozen package")
-    if event.data.get("phase") != "final":
+    if record.phase != "final":
         return state
     if state.final_bindings:
         raise BoundaryOrderError("final bindings already recorded")
-    runnable = any(check.get("tier") in _RUNNABLE_TIERS for check in event.data.get("checks") or ())
+    runnable = any(check.tier in _RUNNABLE_TIERS for check in record.checks)
     return replace(state, final_bindings=True, runnable=runnable)
 
 
-def _candidate_verified(state: VersionState, event: BaseEvent) -> VersionState:
+def _candidate_verified(
+    state: VersionState, _event: BaseEvent, _record: VerificationRecord
+) -> VersionState:
     if not state.frozen:
         raise BoundaryOrderError("candidate verification requires a frozen, admitted package")
-    if not _cites(state, event):
-        raise BoundaryOrderError("verification ran a package other than the frozen one")
-    if event.data.get("seed_digest") != state.seed_digest:
-        raise BoundaryOrderError(
-            "candidate verification names a different Seed than the frozen package"
-        )
     if not state.final_bindings:
         raise BoundaryOrderError("a candidate verification follows the final bindings it ran")
     return replace(state, phase=Phase.VERIFIED)
 
 
-def _reconciled(state: VersionState, event: BaseEvent) -> VersionState:
-    _require_consistent_decision(event)
-    if state.frozen:
-        if not _cites(state, event):
-            raise BoundaryOrderError("acceptance must cite the boundary's frozen package")
-        if state.phase is not Phase.VERIFIED:
-            _require_unverified_decision(state, event)
-    elif _ref(event) is not None:
-        raise BoundaryOrderError(
-            "a package-less decision needs a construction_failed seal and a worker"
-        )
+def _reconciled(state: VersionState, _event: BaseEvent, record: ReconciledRecord) -> VersionState:
+    if state.frozen and state.phase is not Phase.VERIFIED:
+        _require_unverified_decision(state, record)
     return replace(state, phase=Phase.DECIDED)
 
 
-def _resumed(state: VersionState, event: BaseEvent) -> VersionState:
-    _require_consistent_decision(event)
-    if not state.frozen or not _cites(state, event):
+def _resumed(state: VersionState, _event: BaseEvent, _record: ResumedRecord) -> VersionState:
+    if not state.frozen:
         raise BoundaryOrderError("a resumed decision must cite the boundary's frozen package")
     return state
 
@@ -584,14 +591,23 @@ def _refusal(state: VersionState, kind: str) -> str:
 
 
 def advance(state: VersionState, event: BaseEvent) -> VersionState:
-    """The state after ``event``; ``BoundaryOrderError`` when the journal forbids it."""
+    """The state after ``event``; ``BoundaryOrderError`` when the journal forbids it.
+
+    The lifecycle table decides whether the record may follow; the journal
+    gateway (``events.validate_record``) then validates its envelope, exact
+    schema and the identities the seal fixed, before the transition reads it.
+    """
     transition = TRANSITIONS.get((state.phase, event.type))
     if transition is None:
         raise BoundaryOrderError(_refusal(state, event.type))
-    return transition(state, event)
+    try:
+        record = validate_record(event, state.identity)
+    except JournalRecordError as exc:
+        raise BoundaryOrderError(str(exc)) from exc
+    return transition(state, event, record)
 
 
-_RUNNABLE_TIERS = frozenset({"A", "A_prime", "S"})
+_RUNNABLE_TIERS = frozenset({CheckTier.A, CheckTier.A_PRIME, CheckTier.S})
 _PAGE = 500
 # Statuses a decision may carry without a candidate verification: when the
 # final bindings left no check runnable, the checks were not run (unverified or
@@ -601,24 +617,7 @@ _UNRUN_STATUSES = frozenset({"unverified", "uncovered", "indeterminate"})
 _UNDECIDED_STATUSES = frozenset({"uncovered", "indeterminate"})
 
 
-def _require_consistent_decision(event: BaseEvent) -> None:
-    """A recorded decision is one the reconciliation rule can produce.
-
-    The payload model checks every acceptance bit against the status and the
-    signal that decided it (``ReconciliationPayload``); replay applies the same
-    check to what the journal holds, so a decision edited in place is flagged.
-    """
-    model = ResumedPayload if event.type == ACCEPTANCE_RESUMED else ReconciliationPayload
-    data = {key: value for key, value in (event.data or {}).items() if key != "package_id"}
-    try:
-        model.model_validate(data)
-    except ValueError as exc:
-        raise BoundaryOrderError(
-            "a recorded decision disagrees with the statuses that decided it"
-        ) from exc
-
-
-def _require_unverified_decision(state: VersionState, event: BaseEvent) -> None:
+def _require_unverified_decision(state: VersionState, record: ReconciledRecord) -> None:
     """A decision recorded without a candidate verification claims nothing a run would show.
 
     Allowed only when the final bindings left no check runnable, or when the
@@ -627,11 +626,11 @@ def _require_unverified_decision(state: VersionState, event: BaseEvent) -> None:
     """
     if state.final_bindings and not state.runnable:
         allowed = _UNRUN_STATUSES
-    elif event.data.get("undecided_reason") and state.frozen and state.started:
+    elif record.undecided_reason and state.frozen and state.started:
         allowed = _UNDECIDED_STATUSES
     else:
         raise BoundaryOrderError("acceptance must cite a verification of the frozen package")
-    statuses = {item.get("package_status") for item in event.data.get("criteria") or ()}
+    statuses = {item.package_status for item in record.criteria}
     if not statuses <= allowed:
         raise BoundaryOrderError(
             "a decision recorded without a candidate verification claims a verified status"
@@ -711,6 +710,7 @@ class BoundaryLedger:
                 details={"execution_id": execution_id},
             )
         event = check_package_enabled_event(execution_id, contract)
+        _run_record(event, execution_id)
         await self._store.append(event)
         return event
 
@@ -829,14 +829,18 @@ class BoundaryLedger:
         started: list[BaseEvent] = []
         live: list[CheckPackage] = []
         by_id = {package.package_id: package for package in packages}
+        # The whole batch is validated against tentative state before the one
+        # append, so a boundary named twice is refused, not written twice.
+        tentative: dict[str, VersionState] = {}
         for boundary_id in boundary_ids:
-            events = await self.events(boundary_id)
-            state = version_state(events)
+            if boundary_id not in tentative:
+                tentative[boundary_id] = version_state(await self.events(boundary_id))
+            state = tentative[boundary_id]
             event = actor_started_event(
                 boundary_id, actor_id=actor_id, package_id=state.package_id, runtime=runtime
             )
             try:
-                advance(state, event)
+                tentative[boundary_id] = advance(state, event)
             except BoundaryOrderError as exc:
                 raise BoundaryOrderError(
                     f"actor cannot start: {exc.message}",
@@ -966,6 +970,8 @@ class BoundaryLedger:
         """
         if not execution_id or parse_boundary_version(execution_id) is not None:
             raise BoundaryOrderError("a resumed decision needs the run's execution id")
+        event = acceptance_resumed_event(execution_id, package_id=None, payload=payload)
+        _run_record(event, execution_id)
         if not await self.check_package_enabled(execution_id) and not await self.run_versions(
             execution_id
         ):
@@ -975,7 +981,6 @@ class BoundaryLedger:
                 "an undecided resume is recorded only for a run whose check package was on",
                 details={"execution_id": execution_id},
             )
-        event = acceptance_resumed_event(execution_id, package_id=None, payload=payload)
         await self._store.append(event)
         return event
 
@@ -1085,26 +1090,30 @@ def recovery_projection(
         return RecoveryUndecidable(exc.message)
 
 
+def _run_record(event: BaseEvent, execution_id: str) -> EnabledRecord | ResumedRecord:
+    """The journal gateway for the run aggregate (``events.validate_run_record``)."""
+    try:
+        return validate_run_record(event, execution_id)
+    except JournalRecordError as exc:
+        raise BoundaryOrderError(str(exc), details={"execution_id": execution_id}) from exc
+
+
 def _project(
     execution_id: str,
     run_events: Sequence[BaseEvent],
     versions: Mapping[int, Sequence[BaseEvent]],
 ) -> RecoveryProjection:
-    enabled = [event for event in run_events if event.type == CHECK_PACKAGE_ENABLED]
-    if any(event.type not in (CHECK_PACKAGE_ENABLED, ACCEPTANCE_RESUMED) for event in run_events):
-        raise BoundaryOrderError(
-            "the run aggregate holds a record the product does not write there"
-        )
+    records = [_run_record(event, execution_id) for event in run_events]
+    enabled = [record for record in records if isinstance(record, EnabledRecord)]
     if not enabled:
         if versions or run_events:
             raise BoundaryOrderError("boundary records exist without the run's enabled record")
         return RecoveryOff()
     if len(enabled) != 1:
         raise BoundaryOrderError("the run's enabled record is repeated")
-    try:
-        contract = enabled_contract(enabled[0].data)
-    except ValueError as exc:
-        raise BoundaryOrderError("the run's check package contract is malformed") from exc
+    if run_events[0].type != CHECK_PACKAGE_ENABLED:
+        raise BoundaryOrderError("a run record precedes the run's enabled record")
+    contract = enabled[0].contract
     if list(versions) != list(range(1, len(versions) + 1)):
         raise BoundaryOrderError("the run's boundary versions are not v1, v2, ... in order")
     states: dict[int, VersionState] = {}

@@ -79,10 +79,11 @@ SUCCESSOR = boundary_version_id(RUN, 2)
 T0 = datetime(2026, 9, 28, tzinfo=UTC)
 
 
-def _bindings(phase: str) -> BindingsPayload:
-    check = {
-        "criterion_key": "k",
-        "check_id": "c1",
+def _bindings(phase: str, package: CheckPackage) -> BindingsPayload:
+    check = package.checks[0]
+    record = {
+        "criterion_key": check.assertions[0].criterion_key,
+        "check_id": check.check_id,
         "tier": "A",
         "binding_source": None,
         "binding": None,
@@ -90,10 +91,10 @@ def _bindings(phase: str) -> BindingsPayload:
         "reason": "r",
         "declared": None,
     }
-    return BindingsPayload.model_validate({"phase": phase, "checks": [check]})
+    return BindingsPayload.model_validate({"phase": phase, "checks": [record]})
 
 
-def _undecided() -> dict[str, Any]:
+def _undecided(package: CheckPackage) -> dict[str, Any]:
     """A decision the package could not make: every criterion indeterminate, none accepted."""
     return {
         "schema_version": "ouroboros.acceptance_reconciliation.v3",
@@ -102,12 +103,12 @@ def _undecided() -> dict[str, Any]:
         "artifact_verdict": "indeterminate",
         "verified_pass_count": 0,
         "unverified_count": 0,
-        "criterion_count": 1,
+        "criterion_count": len(package.criterion_keys),
         "tier_summary": {},
         "criteria": [
             {
-                "root_ac_index": 0,
-                "criterion_key": "k",
+                "root_ac_index": index,
+                "criterion_key": key,
                 "package_status": "indeterminate",
                 "tier": "A",
                 "reason": "authority_error:OSError",
@@ -118,7 +119,9 @@ def _undecided() -> dict[str, Any]:
                 "existing_accepted": True,
                 "accepted": False,
                 "governed_by": "check_package",
+                "declared_binding_pass": False,
             }
+            for index, key in enumerate(package.criterion_keys)
         ],
         "undecided_reason": "authority_error:OSError",
     }
@@ -160,7 +163,7 @@ class _Records:
             )
         if kind == BINDING_RECORDED:
             return binding_recorded_event(
-                BOUNDARY, package_id=str(package_id), payload=_bindings("repair")
+                BOUNDARY, package_id=str(package_id), payload=_bindings("repair", self.package)
             )
         if kind == CANDIDATE_VERIFIED:
             return candidate_verified_event(
@@ -170,16 +173,18 @@ class _Records:
             return acceptance_reconciled_event(
                 BOUNDARY,
                 package_id=package_id,
-                reconciliation=ReconciliationPayload.model_validate(_undecided()),
+                reconciliation=ReconciliationPayload.model_validate(_undecided(self.package)),
             )
         if kind == ACCEPTANCE_RESUMED:
-            payload = ResumedPayload.model_validate({**_undecided(), "source": "memory"})
+            payload = ResumedPayload.model_validate(
+                {**_undecided(self.package), "source": "memory"}
+            )
             return acceptance_resumed_event(BOUNDARY, package_id=package_id, payload=payload)
         raise AssertionError(kind)
 
     def final_bindings(self) -> BaseEvent:
         return binding_recorded_event(
-            BOUNDARY, package_id=self.package.package_id, payload=_bindings("final")
+            BOUNDARY, package_id=self.package.package_id, payload=_bindings("final", self.package)
         )
 
     def rejected_admission(self) -> BaseEvent:
