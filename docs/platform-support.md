@@ -56,7 +56,7 @@ Known limitations:
 - **Process management**: Subprocess spawning and signal handling differ on Windows.
 - **Codex CLI**: Not supported on native Windows. Use WSL 2 instead.
 - **Terminal/TUI**: Requires a terminal with ANSI support (Windows Terminal recommended; `cmd.exe` is not supported).
-- **CI testing**: Native Windows is not part of the current CI matrix.
+- **CI testing**: Native Windows runs only the execution-sandbox tests (the `Runtime sandbox (Windows)` job, which checks the AppContainer backend that confines verifier replay); the rest of the suite is not part of the Windows CI matrix.
 
 Git worktree discovery decodes Git for Windows output as UTF-8, so repository
 paths containing non-ASCII characters do not depend on the active ANSI code
