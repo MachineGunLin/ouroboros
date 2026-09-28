@@ -82,14 +82,10 @@ def case_id_for(position: int) -> str:
     return f"{_CASE_PREFIX}{position}"
 
 
-def positive_ordinal(text: str) -> int | None:
-    """The positive integer a minted id spells in ``text`` (no sign, no leading zero), or ``None``."""
+def _positive_int(text: str) -> int | None:
     if not text.isdecimal() or text.startswith("0"):
         return None
     return int(text)
-
-
-_positive_int = positive_ordinal
 
 
 def is_oracle_check_id(value: str) -> bool:
@@ -104,14 +100,6 @@ def is_oracle_check_id(value: str) -> bool:
         return True
     rank = _positive_int(ordinal)
     return rank is not None and rank >= 2
-
-
-def oracle_ordinal(check_id: str) -> int | None:
-    """The ordinal ``oracle_check_id`` encoded in ``check_id``, or ``None`` for any other form."""
-    if not is_oracle_check_id(check_id):
-        return None
-    _number, sep, ordinal = check_id[len(_ORACLE_CHECK_PREFIX) :].partition("_")
-    return _positive_int(ordinal) if sep else 1
 
 
 def case_position(value: str) -> int | None:
@@ -427,7 +415,5 @@ __all__ = [
     "oracle_check_id",
     "oracle_data",
     "oracle_data_text",
-    "oracle_ordinal",
-    "positive_ordinal",
     "redact_held_out",
 ]

@@ -28,7 +28,6 @@ from ouroboros.boundary.oracle import (
     OracleSpec,
     case_id_for,
     is_oracle_file,
-    oracle_check_id,
 )
 from ouroboros.boundary.package import (
     ORACLE_PACKAGE_SCHEMA,
@@ -39,10 +38,11 @@ from ouroboros.boundary.package import (
     CheckSpec,
     PackageFile,
     UncoveredObligation,
+    mint_check_ids,
+    mint_package_ids,
     oracle_check,
     oracle_files,
     script_assertion_id,
-    script_check_id,
     seed_criterion_keys,
     seed_digest,
 )
@@ -130,6 +130,10 @@ def assemble_package(
     package, byte for byte what the earlier constructor produced.
     """
     keys = seed_criterion_keys(seed)
+    try:
+        oracles, script_checks = mint_package_ids(keys, oracles, script_checks)
+    except (KeyError, ValidationError, ValueError) as exc:
+        raise CheckPackageError("package parts do not match the Seed's criteria") from exc
     checks = [oracle_check(spec, role) for spec, role in oracles] + list(script_checks)
     linked = {link.criterion_key for check in checks for link in check.assertions}
     gaps: dict[str, str] = {
@@ -360,20 +364,17 @@ def _mint_identifiers(normalized: dict[str, list[dict[str, Any]]]) -> None:
     carry nothing. Minting depends only on criterion numbers and order, so a
     reply normalized twice keeps its ids.
     """
-    ordinals: dict[int, int] = {}
-    for entry in normalized["oracles"]:
-        number = entry["criterion"]
-        ordinals[number] = ordinals.get(number, 0) + 1
-        entry["check_id"] = oracle_check_id(number, ordinals[number])
+    oracle_ids, script_ids = mint_check_ids(
+        [entry["criterion"] for entry in normalized["oracles"]],
+        [entry["assertions"][0]["criterion"] for entry in normalized["checks"]],
+    )
+    for entry, check_id in zip(normalized["oracles"], oracle_ids, strict=True):
+        entry["check_id"] = check_id
         entry["cases"] = [
             {**case, "case_id": case_id_for(position)}
             for position, case in enumerate(entry["cases"], start=1)
         ]
-    scripts: dict[int, int] = {}
-    for entry in normalized["checks"]:
-        number = entry["assertions"][0]["criterion"]
-        scripts[number] = scripts.get(number, 0) + 1
-        check_id = script_check_id(number, scripts[number])
+    for entry, check_id in zip(normalized["checks"], script_ids, strict=True):
         entry["check_id"] = check_id
         entry["assertions"] = [
             {

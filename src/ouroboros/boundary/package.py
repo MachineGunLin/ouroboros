@@ -22,7 +22,7 @@ generated check code in a worker workspace or bundle.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
@@ -42,10 +42,9 @@ from ouroboros.boundary.oracle import (
     ORACLE_HARNESS_PATH,
     ORACLE_HARNESS_SOURCE,
     OracleSpec,
+    case_id_for,
     oracle_check_id,
     oracle_data_text,
-    oracle_ordinal,
-    positive_ordinal,
 )
 from ouroboros.core.filesystem_capability import (
     HeldPathChanged,
@@ -128,20 +127,26 @@ def script_assertion_id(check_id: str, position: int) -> str:
     return f"{check_id}.a{position}"
 
 
-def _is_minted_script(check: CheckSpec, criterion_number: int) -> bool:
-    """``check`` carries exactly the ids the product mints for a script check of its criterion."""
-    prefix = f"{_SCRIPT_CHECK_PREFIX}{criterion_number}_"
-    if not check.check_id.startswith(prefix):
-        return False
-    ordinal = positive_ordinal(check.check_id[len(prefix) :])
+def mint_check_ids(
+    oracle_criteria: Sequence[int], script_criteria: Sequence[int]
+) -> tuple[list[str], list[str]]:
+    """The product's check ids, from the criterion number of each oracle and script check in order.
+
+    The one place check ids are minted: the ``k``-th oracle of criterion
+    ``n`` is ``oracle_check_id(n, k)`` and the ``k``-th script check first
+    linking ``n`` is ``script_check_id(n, k)``, counting 1, 2, ... in the
+    given order. The ids are a function of structure alone, so none can
+    carry a value, and a package holds exactly this sequence.
+    """
+    counts: dict[tuple[str, int], int] = {}
+
+    def ordinal(kind: str, number: int) -> int:
+        counts[kind, number] = counts.get((kind, number), 0) + 1
+        return counts[kind, number]
+
     return (
-        ordinal is not None
-        and check.check_id == script_check_id(criterion_number, ordinal)
-        and [link.assertion_id for link in check.assertions]
-        == [
-            script_assertion_id(check.check_id, position)
-            for position in range(1, len(check.assertions) + 1)
-        ]
+        [oracle_check_id(number, ordinal("oracle", number)) for number in oracle_criteria],
+        [script_check_id(number, ordinal("script", number)) for number in script_criteria],
     )
 
 
@@ -333,19 +338,7 @@ class CheckPackage(BaseModel, frozen=True):
                         f"criterion {link.criterion_key}"
                     )
                 linked.add(link.criterion_key)
-        numbers = {key: number for number, key in enumerate(keys, start=1)}
-        oracle_ids = {spec.check_id for spec in self.oracles}
-        for check in self.checks:
-            # Ids are persisted: only the product's minted form is accepted, so
-            # no identifier a caller chose (which could spell a held-out
-            # value) can reach a record, a receipt or the journal.
-            if check.check_id not in oracle_ids and not _is_minted_script(
-                check, numbers[check.assertions[0].criterion_key]
-            ):
-                raise ValueError(
-                    "a script check carries the product's ids (script_check_id, "
-                    "script_assertion_id)"
-                )
+        self._validate_ids()
         uncovered = [item.criterion_key for item in self.uncovered]
         if len(set(uncovered)) != len(uncovered):
             raise ValueError("uncovered criterion keys must be unique")
@@ -362,6 +355,40 @@ class CheckPackage(BaseModel, frozen=True):
         self._validate_oracles()
         return self
 
+    def _validate_ids(self) -> None:
+        """Every id is the one the product mints from this package's structure (``mint_check_ids``).
+
+        Ids are persisted, so a package carries exactly the dense sequence:
+        check ids by criterion and order, cases ``c1..cN`` in order, script
+        assertions ``<id>.a1..a<m>``. No identifier a caller chose, and no
+        gap a caller left, can spell a value in a record, a receipt or the
+        journal.
+        """
+        numbers = {key: number for number, key in enumerate(self.criterion_keys, start=1)}
+        oracle_ids = {spec.check_id for spec in self.oracles}
+        scripts = [check for check in self.checks if check.check_id not in oracle_ids]
+        if any(spec.criterion_key not in numbers for spec in self.oracles):
+            raise ValueError("an oracle checks a criterion the package does not list")
+        oracle_expected, script_expected = mint_check_ids(
+            [numbers[spec.criterion_key] for spec in self.oracles],
+            [numbers[check.assertions[0].criterion_key] for check in scripts],
+        )
+        if [spec.check_id for spec in self.oracles] != oracle_expected or [
+            check.check_id for check in scripts
+        ] != script_expected:
+            raise ValueError("check ids are the product's minted sequence (mint_check_ids)")
+        for check in scripts:
+            if [link.assertion_id for link in check.assertions] != [
+                script_assertion_id(check.check_id, position)
+                for position in range(1, len(check.assertions) + 1)
+            ]:
+                raise ValueError(f"{check.check_id}: assertion ids are the product's a1..a<m>")
+        for spec in self.oracles:
+            if [case.case_id for case in spec.cases] != [
+                case_id_for(position) for position in range(1, len(spec.cases) + 1)
+            ]:
+                raise ValueError(f"{spec.check_id}: case ids are the product's c1..c<n>")
+
     def _validate_oracles(self) -> None:
         if not self.oracles:
             if self.binding_grammar is not None or self.schema_version != CHECK_PACKAGE_SCHEMA:
@@ -373,21 +400,12 @@ class CheckPackage(BaseModel, frozen=True):
             )
         checks = {check.check_id: check for check in self.checks}
         files = {item.path: item.content for item in self.files}
-        numbers = {key: number for number, key in enumerate(self.criterion_keys, start=1)}
         seen: set[str] = set()
         for spec in self.oracles:
             check = checks.get(spec.check_id)
             if check is None or spec.check_id in seen:
                 raise ValueError(f"oracle {spec.check_id} needs exactly one check")
             seen.add(spec.check_id)
-            ordinal = oracle_ordinal(spec.check_id)
-            number = numbers.get(spec.criterion_key)
-            if (
-                ordinal is None
-                or number is None
-                or spec.check_id != oracle_check_id(number, ordinal)
-            ):
-                raise ValueError(f"oracle {spec.check_id} is not the product's id of its criterion")
             if check != oracle_check(spec, check.role):
                 # The harness argv, the frozen failure signature, one assertion
                 # per case with the product's ids, and only its criterion.
@@ -546,6 +564,56 @@ def oracle_files(oracles: Iterable[OracleSpec]) -> tuple[PackageFile, ...]:
         PackageFile.from_content(ORACLE_HARNESS_PATH, ORACLE_HARNESS_SOURCE),
         PackageFile.from_content(ORACLE_DATA_PATH, oracle_data_text(specs)),
     )
+
+
+def mint_package_ids(
+    criterion_keys: Sequence[str],
+    oracles: Sequence[tuple[OracleSpec, CheckRole]],
+    script_checks: Sequence[CheckSpec],
+) -> tuple[list[tuple[OracleSpec, CheckRole]], list[CheckSpec]]:
+    """``oracles`` and ``script_checks`` under the ids ``mint_check_ids`` gives their structure.
+
+    Whatever ids the parts carried (a rebuilt package after cases or oracles
+    were dropped, a merge of two packages' checks), the result carries the
+    dense sequence a package must hold: check ids by criterion and order,
+    cases ``c1..cN``, script assertions ``a1..a<m>``.
+    """
+    numbers = {key: number for number, key in enumerate(criterion_keys, start=1)}
+    oracle_ids, script_ids = mint_check_ids(
+        [numbers[spec.criterion_key] for spec, _role in oracles],
+        [numbers[check.assertions[0].criterion_key] for check in script_checks],
+    )
+    minted_oracles = [
+        (
+            OracleSpec.model_validate(
+                {
+                    **spec.model_dump(),
+                    "check_id": check_id,
+                    "cases": [
+                        {**case.model_dump(), "case_id": case_id_for(position)}
+                        for position, case in enumerate(spec.cases, start=1)
+                    ],
+                }
+            ),
+            role,
+        )
+        for check_id, (spec, role) in zip(oracle_ids, oracles, strict=True)
+    ]
+    minted_scripts = [
+        check.model_copy(
+            update={
+                "check_id": check_id,
+                "assertions": tuple(
+                    link.model_copy(
+                        update={"assertion_id": script_assertion_id(check_id, position)}
+                    )
+                    for position, link in enumerate(check.assertions, start=1)
+                ),
+            }
+        )
+        for check_id, check in zip(script_ids, script_checks, strict=True)
+    ]
+    return minted_oracles, minted_scripts
 
 
 def _is_under(path: str, root: str) -> bool:

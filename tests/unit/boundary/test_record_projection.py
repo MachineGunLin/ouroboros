@@ -307,12 +307,7 @@ def test_a_directly_built_oracle_check_is_the_product_harness_check_exactly() ->
     )
     # An oracle id naming another criterion than the one it checks.
     with pytest.raises(ValueError):
-        assemble_package(
-            SEED,
-            input_digest="1" * 64,
-            generator=None,
-            oracles=[(_oracle_spec("oracle_2"), CheckRole.REPRODUCTION)],
-        )
+        _direct_oracle(_oracle_spec("oracle_2"))
     # The oracle check with an assertion id the harness check does not have.
     minted = oracle_check(spec, CheckRole.REPRODUCTION)
     altered = minted.model_copy(
@@ -333,3 +328,76 @@ def test_a_directly_built_oracle_check_is_the_product_harness_check_exactly() ->
                 "checks": [altered.model_dump(), *[c.model_dump() for c in packaged.checks[1:]]],
             }
         )
+
+
+def _direct_oracle(spec: Any) -> CheckPackage:
+    """A package built around ``spec`` directly, without the product's minting."""
+    from ouroboros.boundary.package import oracle_check, oracle_files
+
+    keys = seed_criterion_keys(SEED)
+    return CheckPackage(
+        schema_version="ouroboros.check_package.v2",
+        seed_digest=seed_digest(SEED),
+        criterion_keys=keys,
+        input_digest="1" * 64,
+        generated_at=FIXED_TIME,
+        checks=(oracle_check(spec, CheckRole.REPRODUCTION),),
+        files=oracle_files([spec]),
+        uncovered=tuple(
+            UncoveredObligation(criterion_key=key, reason="constructor_omitted") for key in keys[1:]
+        ),
+        oracles=(spec,),
+        binding_grammar="ouroboros.binding_grammar.v1",
+    )
+
+
+def _with_case_ids(spec: Any, case_ids: tuple[str, ...]) -> Any:
+    from ouroboros.boundary.oracle import OracleSpec
+
+    dumped = spec.model_dump()
+    dumped["cases"] = [
+        {**case, "case_id": case_id}
+        for case, case_id in zip(dumped["cases"], case_ids, strict=True)
+    ]
+    return OracleSpec.model_validate(dumped)
+
+
+def test_ids_are_the_dense_sequence_the_product_mints_from_structure() -> None:
+    # The bot's probe: a Seed-valid package whose script id spells a value.
+    for check in (
+        _script_check(f"script_1_{SENTINEL}", (f"script_1_{SENTINEL}.a1",)),
+        _script_check("script_1_2", ("script_1_2.a1",)),  # a gap before it
+    ):
+        with pytest.raises(ValueError):
+            _direct(check)
+    assert _direct_oracle(_oracle_spec("oracle_1"))
+    for spec in (
+        _oracle_spec("oracle_1_2"),  # no oracle_1 before it
+        _with_case_ids(_oracle_spec("oracle_1"), ("c1", f"c{SENTINEL}")),  # a case gap
+    ):
+        with pytest.raises(ValueError):
+            _direct_oracle(spec)
+
+
+def test_assembling_mints_dense_ids_whatever_the_parts_carried() -> None:
+    # A rebuilt package (after cases or oracles are dropped) is minted again
+    # from its structure by the same function, so no gap survives.
+    from ouroboros.boundary.oracle_build import assemble_package
+
+    spec = _with_case_ids(_oracle_spec(f"oracle_1_{SENTINEL}"), ("c1", f"c{SENTINEL}"))
+    package = assemble_package(
+        SEED,
+        input_digest="1" * 64,
+        generator=None,
+        oracles=[(spec, CheckRole.REPRODUCTION)],
+        script_checks=[_script_check(f"script_1_{SENTINEL}", (f"script_1_{SENTINEL}.a1",))],
+        script_files=(PackageFile.from_content(_script_path("1"), _script("1")),),
+    )
+    assert [check.check_id for check in package.checks] == ["oracle_1", "script_1_1"]
+    assert [case.case_id for case in package.oracles[0].cases] == ["c1", "c2"]
+    assert [link.assertion_id for check in package.checks for link in check.assertions] == [
+        "oracle_1.c1",
+        "oracle_1.c2",
+        "script_1_1.a1",
+    ]
+    assert SENTINEL.encode() not in package_record_bytes(seal_package(package))
