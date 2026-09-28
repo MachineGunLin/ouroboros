@@ -39,9 +39,15 @@ def _seed(*criteria: str) -> Seed:
 
 
 def _oracle(
-    criterion: int, check_id: str, role: str, args: tuple[int, int, int], value: int
+    criterion: int,
+    check_id: str,
+    role: str,
+    args: tuple[int, int, int],
+    value: int,
+    held: tuple[int, int, int, int] = (-3, -2, 4, -2),
 ) -> dict[str, Any]:
     value_, low, high = args
+    held_value, held_low, held_high, held_expected = held
     return {
         "criterion": criterion,
         "check_id": check_id,
@@ -60,8 +66,8 @@ def _oracle(
             # A case the Seed does not state: only a held-out pass verifies.
             {
                 "case_id": "held",
-                "args": {"value": -3, "low": -2, "high": 4},
-                "expect": {"kind": "returns", "value": -2},
+                "args": {"value": held_value, "low": held_low, "high": held_high},
+                "expect": {"kind": "returns", "value": held_expected},
                 "held_out": True,
             },
         ],
@@ -69,7 +75,9 @@ def _oracle(
 
 
 # Base (BUGGY): clamp(15, 0, 10) = 15, clamp(5, 0, 10) = 5, clamp(-5, 0, 10) = 0.
-GOOD_REPRO_1 = _oracle(1, "oracle_1", "reproduction", (15, 0, 10), 10)
+# A reproduction oracle's held-out case must fail on the base too
+# (clamp(99, 1, 7) = 99 there), or it discriminates nothing.
+GOOD_REPRO_1 = _oracle(1, "oracle_1", "reproduction", (15, 0, 10), 10, held=(99, 1, 7, 7))
 BAD_REPRO_2 = _oracle(2, "oracle_2", "reproduction", (5, 0, 10), 5)  # passes on base
 GOOD_PRESERVE_3 = _oracle(3, "oracle_3", "preservation", (-5, 0, 10), 0)
 

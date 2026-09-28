@@ -125,6 +125,7 @@ from ouroboros.boundary.oracle import (
     ORACLE_HARNESS_PATH,
     ORACLE_HARNESS_SOURCE,
     OracleSpec,
+    imported_before_checkout,
 )
 from ouroboros.core.filesystem_capability import CheckoutFileRefusal, resolve_checkout_file
 
@@ -622,7 +623,7 @@ def _module_files(cwd: Path, dotted: str) -> tuple[str, ...] | _NotProven:
     ``__init__.py`` and ``__main__.py``.
     """
     parts = dotted.split(".")
-    if parts[0] in sys.stdlib_module_names or parts[0] in sys.builtin_module_names:
+    if imported_before_checkout(parts[0]):
         return _NotProven("missing", "standard_library_module")
     files: list[str] = []
     directory = ""

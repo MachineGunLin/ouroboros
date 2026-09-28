@@ -73,6 +73,7 @@ from ouroboros.boundary.package import (
 )
 from ouroboros.boundary.per_check import per_check_admission
 from ouroboros.boundary.receipts import (
+    AdmissionJournal,
     AdmissionResult,
     CandidateVerdict,
     CandidateVerification,
@@ -111,6 +112,12 @@ class _Completed:
     """Set when nothing ran (``check_env.CheckUnavailable``): an indeterminate check."""
 
 
+HELD_OUT_NOT_DISCRIMINATING = "held_out_not_discriminating"
+"""A reproduction oracle whose every held-out case already passes on the base.
+
+Only a held-out case can verify a pass, and one the base already passes
+shows nothing a candidate fixed: such an oracle is excluded at admission
+(``per_check``: ``repro_passes_on_base``) and its criterion is uncovered."""
 CANDIDATE_UNREADABLE = "candidate_unreadable"
 CANDIDATE_LAYOUT = "candidate_layout"
 """A candidate path the controller must create or enter is a symlink or not a directory."""
@@ -339,6 +346,7 @@ def _classify(
     signature_seen: bool,
     on_base: bool,
     oracle_undecided: bool = False,
+    held_out_passes_on_base: bool = False,
 ) -> tuple[CheckStatus, str]:
     if completed.unavailable is not None:
         return CheckStatus.INDETERMINATE, completed.unavailable
@@ -376,6 +384,8 @@ def _classify(
         return CheckStatus.VIOLATED, "preservation_failed"
     if passed:
         return CheckStatus.VIOLATED, "reproduction_passed_on_base"
+    if signature_seen and held_out_passes_on_base:
+        return CheckStatus.VIOLATED, HELD_OUT_NOT_DISCRIMINATING
     if signature_seen:
         return CheckStatus.EXPECTED, "reached_failing_assertion"
     return CheckStatus.INDETERMINATE, "failure_signature_absent"
@@ -482,6 +492,14 @@ async def _execute_check(
         signature_seen=signature_seen,
         on_base=on_base,
         oracle_undecided=oracle_run is not None and oracle_run.return_code not in (0, 1),
+        held_out_passes_on_base=(
+            include_held_out
+            and oracle_run is not None
+            and oracle_run.result is not None
+            and not any(
+                case["held_out"] and not case["passed"] for case in oracle_run.result["cases"]
+            )
+        ),
     )
     tail = combined if completed.launch_error is None else completed.launch_error
     if completed.unavailable is not None:
@@ -692,9 +710,11 @@ async def admit_check_package(
     ``indeterminate`` with ``protected_bytes_mutated``; any violated check is
     ``rejected``; any other indeterminate check is ``indeterminate``; otherwise
     ``admitted``. The per-check rule (``boundary/per_check.py``) is then
-    applied to that verdict: a reproduction check that passes on the base, or
-    a preservation check that fails on it, is excluded (tier ``C``,
-    ``excluded_checks``) and the rest of the package is admitted.
+    applied to that verdict: a reproduction check that passes on the base
+    (for an oracle, also one whose every held-out case passes there,
+    ``held_out_not_discriminating``), or a preservation check that fails on
+    it, is excluded (tier ``C``, ``excluded_checks``) and the rest of the
+    package is admitted.
     """
     run = await _run_package(
         package,
@@ -944,6 +964,27 @@ async def admit_binding(
         reason=reason,
         execution=execution,
     )
+
+
+def base_failing_held_out(
+    admission: AdmissionResult | AdmissionJournal,
+) -> dict[str, tuple[str, ...]]:
+    """Per admitted oracle check, the ids of its held-out cases that failed on the base.
+
+    Read from the admission receipt or its journal form alike (case ids and
+    pass/fail only). A verified pass needs one of these cases to pass on the
+    candidate: a held-out case the base already passed discriminates nothing.
+    Checks excluded at admission (tier ``C``) are left out.
+    """
+    tiers = admission.check_tiers or {}
+    failing: dict[str, tuple[str, ...]] = {}
+    for check in admission.checks:
+        if check.oracle_result is None or tiers.get(check.check_id) == CheckTier.C:
+            continue
+        failing[check.check_id] = tuple(
+            case.case_id for case in check.oracle_result.cases if case.held_out and not case.passed
+        )
+    return failing
 
 
 def base_run_tiers(package: CheckPackage, executions: Sequence[CheckExecution]) -> dict[str, str]:
