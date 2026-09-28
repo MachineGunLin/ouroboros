@@ -177,10 +177,11 @@ def test_the_frozen_event_and_the_record_confirm_no_guess(tmp_path: Path) -> Non
     haystack = json.dumps(event).encode() + path.read_bytes()
     assert guess_probe(package, haystack) == []
     assert package.sha256.encode()[:16] not in haystack
-    cases = {case["case_id"]: case for case in record["package"]["oracles"][0]["cases"]}
-    assert cases["c2"] == {"case_id": "c2", "held_out": True}
-    assert cases["c3"] == {"case_id": "c3", "held_out": True}
-    assert cases["c1"]["expect"]["value"] == 10
+    # The record keeps only product-computed counts; no case, visible or held
+    # out, is stored.
+    oracle = record["package"]["oracles"][0]
+    assert "cases" not in oracle
+    assert (oracle["case_count"], oracle["held_out_count"]) == (3, 2)
 
 
 @pytest.fixture
