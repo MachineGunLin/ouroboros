@@ -521,3 +521,105 @@ async def test_a_target_defined_in_the_checkout_is_resolved(tmp_path: Path) -> N
     admission = await admit_check_package(package, base)
     assert _oracle_result(admission.checks[0])["resolve"] == "ok"
     assert admission.check_tiers == {"oracle_1": "A"}
+
+
+# --------------------------------------------------------------------------
+# CLI target provenance: tier A only for code proven to be checkout files
+
+TOOL = "import sys\nprint(max(int(sys.argv[1]), int(sys.argv[2])))\n"
+
+
+def _cli_package(base: Path, symbol: str):  # type: ignore[no-untyped-def]
+    seed = _seed("the tool prints the larger of two numbers")
+    spec = build_oracle_spec(
+        seed,
+        criterion_index=0,
+        check_id="oracle_1",
+        call_kind="cli",
+        params=("a", "b"),
+        default_binding={"symbol": symbol, "call_kind": "cli", "arg_map": {"a": 0, "b": 1}},
+        cases=[
+            {
+                "case_id": "c1",
+                "held_out": True,
+                "args": {"a": 3, "b": 8},
+                "expect": {"kind": "cli", "exit_code": 0, "stdout": "8"},
+            }
+        ],
+    )
+    return assemble_package(
+        seed, input_digest="1" * 64, generator="t", oracles=[(spec, CheckRole.PRESERVATION)]
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    "layout",
+    ["linked_script", "linked_directory", "stdlib_module", "linked_package", "namespace_package"],
+)
+async def test_a_cli_target_outside_the_checkout_is_never_tier_a(
+    tmp_path: Path, layout: str
+) -> None:
+    # #2463 round 4: ``is_file()`` followed a link out of the checkout, and a
+    # ``-m`` binding was never checked, so both were resolved as tier A.
+    outside = tmp_path / "outside"
+    (outside / "pkg").mkdir(parents=True)
+    (outside / "tool.py").write_text(TOOL)
+    (outside / "pkg" / "__init__.py").write_text("")
+    (outside / "pkg" / "mod.py").write_text(TOOL)
+    base = _repo(tmp_path / "base", {"README.md": "tool\n"})
+    if layout == "linked_script":
+        (base / "tool.py").symlink_to(outside / "tool.py")
+        symbol = "tool.py"
+    elif layout == "linked_directory":
+        (base / "bin").symlink_to(outside, target_is_directory=True)
+        symbol = "bin/tool.py"
+    elif layout == "stdlib_module":
+        symbol = "-m json.tool"
+    elif layout == "linked_package":
+        (base / "pkg").symlink_to(outside / "pkg", target_is_directory=True)
+        symbol = "-m pkg.mod"
+    else:
+        (base / "pkg").mkdir()
+        (base / "pkg" / "mod.py").write_text(TOOL)
+        symbol = "-m pkg.mod"
+    admission = await admit_check_package(_cli_package(base, symbol), base)
+    result = _oracle_result(admission.checks[0])
+    assert result["resolve"] != "ok"
+    assert admission.check_tiers == {"oracle_1": "U"}
+
+
+@pytest.mark.parametrize("symbol", ["tool.py", "-m pkg.mod", "-m pkg"])
+async def test_a_cli_target_in_the_checkout_is_tier_a(tmp_path: Path, symbol: str) -> None:
+    base = _repo(
+        tmp_path / "base",
+        {"tool.py": TOOL, "pkg/__init__.py": "", "pkg/mod.py": TOOL, "pkg/__main__.py": TOOL},
+    )
+    admission = await admit_check_package(_cli_package(base, symbol), base)
+    assert _oracle_result(admission.checks[0])["resolve"] == "ok"
+    assert admission.check_tiers == {"oracle_1": "A"}
+    assert admission.verdict is PackageVerdict.ADMITTED
+
+
+async def test_an_unprovable_target_is_named_and_undecided(tmp_path: Path) -> None:
+    # The harness reports ``unprovable`` where the host cannot prove the
+    # target is a checkout file without following links; the controller
+    # keeps that name (it is not a malformed frame) and decides nothing.
+    forge = (
+        "import os, stat, sys\n"
+        "for fd in range(3, 64):\n"
+        "    try:\n"
+        "        if stat.S_ISFIFO(os.fstat(fd).st_mode):\n"
+        "            os.write(fd, b'\\n' + sys.argv[2].encode() + b' {\"phase\": \"resolved\", '\n"
+        '                     b\'"resolve": "unprovable", "detail": "no dir_fd"}\\n\')\n'
+        "            break\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "os._exit(0)\n"
+    )
+    base = _repo(tmp_path / "base", {"mathutils.py": forge})
+    admission = await admit_check_package(_package(_seed(), base), base)
+    (check,) = admission.checks
+    assert _oracle_result(check)["resolve"] == "unprovable"
+    assert check.status is CheckStatus.INDETERMINATE
+    assert admission.check_tiers == {"oracle_1": "U"}

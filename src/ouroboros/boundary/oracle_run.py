@@ -41,7 +41,9 @@ One oracle check runs as follows:
    observation as a ``result`` frame. Frames are JSON after a per-process
    random nonce on a pipe; every other line is ignored, and the target code's
    own output goes to stderr, which is discarded. A CLI oracle's target is the
-   bound command itself. When the case is over, the controller kills the
+   bound command itself, run only once the controller has proven, before
+   every case, that the code it runs is regular files of the checkout
+   (``_cli_target_files``). When the case is over, the controller kills the
    target's whole process group (on Linux also every process still in its
    session), closes its own ends of the pipes, and waits, bounded, for the
    group to be empty. One absolute deadline, taken before anything starts,
@@ -96,6 +98,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from importlib.machinery import EXTENSION_SUFFIXES
 import json
 import math
 import os
@@ -122,6 +125,7 @@ from ouroboros.boundary.oracle import (
     ORACLE_HARNESS_SOURCE,
     OracleSpec,
 )
+from ouroboros.core.filesystem_capability import CheckoutFileRefusal, resolve_checkout_file
 
 _FRAME_LIMIT = 8 * 1024 * 1024
 _CLI_OUTPUT_LIMIT = 1024 * 1024
@@ -443,9 +447,10 @@ class _Case:
     """One target process.
 
     ``kind`` is ``observed`` (``entry`` is the observation, possibly abnormal),
-    ``resolve`` (``missing`` or ``import_error``), ``setup`` (the target never
-    produced a valid ``resolved`` frame; ``entry`` says how, for a candidate),
-    or ``launch_error``.
+    ``resolve`` (``missing``, ``import_error``, or ``unprovable``: this host
+    cannot prove the target is a checkout file, which decides nothing),
+    ``setup`` (the target never produced a valid ``resolved`` frame; ``entry``
+    says how, for a candidate), or ``launch_error``.
     """
 
     kind: str
@@ -519,6 +524,7 @@ async def _python_exchange(
         "ok",
         "missing",
         "import_error",
+        "unprovable",
     ):
         return _Case(
             "setup",
@@ -554,6 +560,85 @@ async def _python_exchange(
         return _Case("observed", entry={"case_id": case_id, "outcome": "malformed"})
     assert isinstance(entry, dict)
     return _Case("observed", entry=entry)
+
+
+# A module file Python would import before the ``.py`` source beside it.
+_EXTENSION_SUFFIXES = (*EXTENSION_SUFFIXES, ".so", ".pyd")
+
+
+def _names(cwd: Path, directory: str) -> list[str] | None:
+    try:
+        return os.listdir(cwd / directory) if directory else os.listdir(cwd)
+    except OSError:
+        return None
+
+
+def _shadowed(names: Sequence[str], stem: str) -> bool:
+    """Whether Python could load ``stem`` from something other than ``stem.py``.
+
+    An extension module is imported before the source file, and bytecode
+    in ``__pycache__`` (which a checkout copy never has, so only code that
+    already ran can have put it there) stands in for a source file.
+    """
+    return "__pycache__" in names or any(
+        name.startswith(stem + ".") and name.endswith(_EXTENSION_SUFFIXES) for name in names
+    )
+
+
+def _module_files(cwd: Path, dotted: str) -> tuple[str, ...] | str:
+    """The checkout files ``python -m dotted`` runs from ``cwd``, or why they are not known.
+
+    ``-m`` puts ``cwd`` first on the module search path, but a built-in, frozen
+    or already imported module comes before any path, so a top-level name of
+    the standard library is never taken as the checkout's. Each parent must
+    be a regular package (``__init__.py``): a namespace package can be merged
+    with, or shadowed by, a package elsewhere on the path. The module is
+    ``<name>.py``, or a package's ``__init__.py`` and ``__main__.py``.
+    """
+    parts = dotted.split(".")
+    if parts[0] in sys.stdlib_module_names or parts[0] in sys.builtin_module_names:
+        return "standard_library_module"
+    files: list[str] = []
+    directory = ""
+    for index, part in enumerate(parts):
+        names = _names(cwd, directory)
+        if names is None or _shadowed(names, part):
+            return "module_not_provable"
+        package = _names(cwd, directory + part) if part in names else None
+        if package is not None and "__init__.py" in package:
+            if _shadowed(package, "__init__") or _shadowed(package, "__main__"):
+                return "module_not_provable"
+            files.append(f"{directory}{part}/__init__.py")
+            directory = f"{directory}{part}/"
+            if index == len(parts) - 1:
+                files.append(f"{directory}__main__.py")
+            continue
+        if index < len(parts) - 1:
+            return "namespace_package"
+        files.append(f"{directory}{part}.py")
+    return tuple(files)
+
+
+def _cli_target_files(cwd: Path, symbol: str) -> tuple[str, str] | None:
+    """``None`` when a CLI target's code is proven to be regular checkout files.
+
+    Otherwise ``(resolve, detail)``, the same outcomes as the harness gives a
+    Python target (``boundary/harness.py``): ``missing`` when the code is not
+    a checkout file (a link anywhere on its path, a directory, a special
+    file, a standard library or namespace module), ``unprovable`` where this
+    host cannot open a path without following links. Every file is proven
+    through ``resolve_checkout_file`` from ``cwd``: never through a link.
+    """
+    files = _module_files(cwd, symbol[3:]) if symbol.startswith("-m ") else (symbol,)
+    if isinstance(files, str):
+        return "missing", f"{symbol}: {files}"
+    for relative in files:
+        proof = resolve_checkout_file(cwd, relative)
+        if proof is CheckoutFileRefusal.UNAVAILABLE:
+            return "unprovable", f"{symbol}: {proof.value}"
+        if isinstance(proof, CheckoutFileRefusal):
+            return "missing", f"{symbol}: {relative}: {proof.value}"
+    return None
 
 
 async def _feed(process: asyncio.subprocess.Process, data: bytes) -> None:
@@ -645,12 +730,15 @@ async def _observe(
                 python, str(cwd), binding.symbol, list(oracle.params), arg_map, case.args
             )
             call_text = " ".join(argv[2:] if argv[0] == python else argv)
-            script = binding.symbol
-            if not script.startswith("-m ") and not (cwd / script).is_file():
-                return "missing", f"{script} not found", {}, False
-            outcome = await _cli_case(
-                _prepared(prepare, argv), case.stdin or "", case_deadline, call_text
-            )
+            # Proven before every case: an earlier case's target may have
+            # replaced the file.
+            refused = _cli_target_files(cwd, binding.symbol)
+            if refused is not None:
+                outcome = _Case("resolve", resolve=refused[0], detail=refused[1])
+            else:
+                outcome = await _cli_case(
+                    _prepared(prepare, argv), case.stdin or "", case_deadline, call_text
+                )
         else:
             args, kwargs = harness_module.split_args(list(oracle.params), arg_map, case.args)
             nonce = secrets.token_hex(16)
