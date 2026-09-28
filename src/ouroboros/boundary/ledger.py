@@ -117,10 +117,18 @@ from ouroboros.boundary.events import (
     validate_record,
     validate_run_record,
 )
+from ouroboros.boundary.oracle import (
+    case_position,
+    oracle_check_id,
+    oracle_ordinal,
+    positive_ordinal,
+)
 from ouroboros.boundary.package import (
     CheckPackage,
     CheckRole,
     find_workspace_leaks,
+    script_assertion_id,
+    script_check_id,
     validate_package_for_seed,
 )
 from ouroboros.boundary.per_check import (
@@ -284,7 +292,52 @@ def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
         oracle_ids.add(check.check_id)
         if count:
             held.add(check.check_id)
+    specs = {spec["check_id"]: spec for spec in oracles}
+    if not all(_minted(item, specs.get(item["check_id"]), keys) for item in raw_checks):
+        raise BoundaryOrderError(
+            "the frozen manifest names a check by an id the product never mints"
+        )
     return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids))
+
+
+def _minted(item: Mapping[str, Any], spec: Mapping[str, Any] | None, keys: Sequence[str]) -> bool:
+    """The check's ids are the ones the product mints for it (``package``, ``oracle``).
+
+    An oracle check is ``oracle_check_id`` of its criterion's position, with
+    one assertion per case (``<check id>.<case id>``, increasing positions);
+    a script check is ``script_check_id`` of the position of a criterion it
+    links, with assertions ``script_assertion_id`` 1..m.
+    """
+    check_id, ids, linked = item["check_id"], list(item["assertion_ids"]), item["criterion_keys"]
+    if spec is not None:
+        ordinal = oracle_ordinal(check_id)
+        key = spec.get("criterion_key")
+        prefix = f"{check_id}."
+        positions = [
+            (case_position(value[len(prefix) :]) if value.startswith(prefix) else None) or 0
+            for value in ids
+        ]
+        return (
+            ordinal is not None
+            and key in keys
+            and check_id == oracle_check_id(keys.index(key) + 1, ordinal)
+            and list(linked) == [key]
+            and 0 not in positions
+            and positions == sorted(set(positions))
+            and len(positions) == spec.get("case_count")
+        )
+    number_text, sep, ordinal_text = check_id.removeprefix("script_").partition("_")
+    number, ordinal = positive_ordinal(number_text), positive_ordinal(ordinal_text)
+    return (
+        check_id.startswith("script_")
+        and bool(sep)
+        and number is not None
+        and ordinal is not None
+        and number <= len(keys)
+        and keys[number - 1] in linked
+        and check_id == script_check_id(number, ordinal)
+        and ids == [script_assertion_id(check_id, n) for n in range(1, len(ids) + 1)]
+    )
 
 
 def _held_out_all_passed(manifest: FrozenManifest, check_id: str, item: Mapping[str, Any]) -> bool:

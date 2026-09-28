@@ -207,11 +207,9 @@ async def test_an_accepted_decision_without_any_authority_never_reaches_decided(
 # --------------------------------------------------------------------------
 # The frozen manifest is exactly the package's projection.
 
-_SEVEN = (
+_PROJECTION_FIELDS = (
+    # Fields ``manifest_summary`` emits that the reducer itself never reads.
     "schema_version",
-    "input_digest",
-    "generated_at",
-    "generator",
     "files",
     "base_file_count",
     "scratch_path_count",
@@ -242,7 +240,7 @@ def test_a_frozen_manifest_missing_projection_fields_makes_recovery_undecidable(
     run = "run_manifest"
     version = boundary_version_id(run, 1)
     frozen = package_frozen_event(version, package)
-    manifest = {k: v for k, v in frozen.data["manifest"].items() if k not in _SEVEN}
+    manifest = {k: v for k, v in frozen.data["manifest"].items() if k not in _PROJECTION_FIELDS}
     partial = frozen.model_copy(update={"data": {**frozen.data, "manifest": manifest}})
     rest = [
         admission_completed_event(version, admission_receipt(package, base_checkout)),
@@ -805,10 +803,10 @@ def test_a_non_discriminating_oracle_is_excluded_for_that_reason(base_checkout) 
     frozen = package_frozen_event(B, package).data
     # A second, preservation script check keeps the package admitted.
     keep = {
-        "check_id": "keep",
+        "check_id": "script_1_1",
         "role": "preservation",
         "criterion_keys": [key],
-        "assertion_ids": ["keep.a1"],
+        "assertion_ids": ["script_1_1.a1"],
     }
     manifest = frozen_manifest(
         {
@@ -821,7 +819,7 @@ def test_a_non_discriminating_oracle_is_excluded_for_that_reason(base_checkout) 
         data = admission_completed_event(B, _not_discriminating(package, base_checkout, base)).data
         kept = {
             **data["checks"][0],
-            "check_id": "keep",
+            "check_id": "script_1_1",
             "role": "preservation",
             "reason": "preservation_passed",
             "status": "expected",
@@ -831,7 +829,7 @@ def test_a_non_discriminating_oracle_is_excluded_for_that_reason(base_checkout) 
         return {
             **data,
             "checks": [*data["checks"], kept],
-            "check_tiers": {**data["check_tiers"], "keep": "S"},
+            "check_tiers": {**data["check_tiers"], "script_1_1": "S"},
         }
 
     assert admitted_exclusions(manifest, admitted({"c2": True, "c3": True})) == {"oracle_1"}

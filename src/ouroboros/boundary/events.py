@@ -29,7 +29,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
 from typing import Any, Literal, Protocol, cast
 
 from pydantic import (
@@ -640,6 +639,12 @@ class ManifestOracle(_Payload):
         return self
 
 
+class ManifestUncovered(_Payload):
+    """A criterion the package left uncovered, by key only (its reason is not persisted)."""
+
+    criterion_key: str
+
+
 class ManifestRecord(_Payload):
     """The exact closed schema of ``CheckPackage.manifest_summary`` (the frozen manifest).
 
@@ -651,29 +656,17 @@ class ManifestRecord(_Payload):
     schema_version: Literal["ouroboros.check_package.v1", "ouroboros.check_package.v2"]
     package_id: str
     seed_digest: str
-    input_digest: str
-    generated_at: str
-    """ISO 8601 with a UTC offset, as the package writes it (``datetime.isoformat``)."""
-    generator: str | None
     criterion_keys: tuple[str, ...]
     checks: tuple[ManifestCheck, ...]
     files: tuple[ManifestOracleData | ManifestFile, ...]
     base_file_count: int = Field(ge=0)
     scratch_path_count: int = Field(ge=0)
-    uncovered: tuple[UncoveredRecord, ...]
+    uncovered: tuple[ManifestUncovered, ...]
     binding_grammar: str | None = None
     oracles: tuple[ManifestOracle, ...] | None = None
 
-    _digests = field_validator("seed_digest", "input_digest")(_hex)
+    _digests = field_validator("seed_digest")(_hex)
     _id = field_validator("package_id")(lambda value: _hex(value, 2 * PACKAGE_ID_BYTES))
-
-    @field_validator("generated_at")
-    @classmethod
-    def _iso(cls, value: str) -> str:
-        moment = datetime.fromisoformat(value)
-        if moment.tzinfo is None or moment.isoformat() != value:
-            raise ValueError("generated_at is the package's timezone-aware ISO timestamp")
-        return value
 
     @model_validator(mode="after")
     def _oracles_together(self) -> ManifestRecord:

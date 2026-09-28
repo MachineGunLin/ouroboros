@@ -607,9 +607,6 @@ def _manifest_event_data(
             "schema_version": "ouroboros.check_package.v2",
             "package_id": "1" * 64,
             "seed_digest": "2" * 64,
-            "input_digest": "3" * 64,
-            "generated_at": "2026-09-28T00:00:00+00:00",
-            "generator": "test",
             "criterion_keys": list(keys),
             "checks": checks,
             "files": [],
@@ -623,11 +620,13 @@ def _manifest_event_data(
 
 
 def _check(check_id: str, role: str, *keys: str) -> dict[str, Any]:
+    """A manifest check with the product's ids (an oracle has three cases)."""
+    oracle = check_id.startswith("oracle_")
     return {
         "check_id": check_id,
         "role": role,
         "criterion_keys": list(keys),
-        "assertion_ids": [f"{check_id}.c1"],
+        "assertion_ids": [f"{check_id}.c{n}" for n in (1, 2, 3)] if oracle else [f"{check_id}.a1"],
     }
 
 
@@ -699,8 +698,8 @@ def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> d
 
 def _two_repros() -> dict[str, Any]:
     return _manifest_event_data(
-        [_check("repro_1", "reproduction", "k1"), _check("repro_2", "reproduction", "k2")],
-        [_oracle("repro_1", "k1", 1), _oracle("repro_2", "k2", 1)],
+        [_check("oracle_1", "reproduction", "k1"), _check("oracle_2", "reproduction", "k2")],
+        [_oracle("oracle_1", "k1", 1), _oracle("oracle_2", "k2", 1)],
     )
 
 
@@ -720,27 +719,27 @@ def _result(check_id: str, **update: Any) -> Any:
 IMPOSSIBLE_ADMISSIONS = {
     "protected_bytes_mutated": lambda a: a.update(protected_bytes_mutated=True),
     "base_changed": lambda a: a.update(base_tree_digest_after="c" * 64),
-    "incomplete_tiers": lambda a: a["check_tiers"].pop("repro_2"),
+    "incomplete_tiers": lambda a: a["check_tiers"].pop("oracle_2"),
     "no_tiers": lambda a: a.pop("check_tiers"),
-    "tier_after_admission": _set_tier("repro_2", "A_prime"),
+    "tier_after_admission": _set_tier("oracle_2", "A_prime"),
     "unknown_tier_check": _set_tier("ghost", "C"),
-    "tier_c_not_excluded": _set_tier("repro_2", "C"),
+    "tier_c_not_excluded": _set_tier("oracle_2", "C"),
     "excluded_without_tier_c": lambda a: a.update(
-        excluded_checks={**a["excluded_checks"], "repro_2": "x"}
+        excluded_checks={**a["excluded_checks"], "oracle_2": "x"}
     ),
     "every_check_excluded": lambda a: a.update(check_tiers=dict.fromkeys(a["check_tiers"], "C")),
     "duplicate_result": lambda a: a["checks"].append(dict(a["checks"][0])),
     "missing_result": lambda a: a["checks"].pop(),
-    "role_differs_from_manifest": _result("repro_2", role="preservation"),
-    "excluded_check_passed": _result("repro_1", status="expected"),
-    "excluded_for_another_role_reason": _result("repro_1", reason="preservation_failed"),
+    "role_differs_from_manifest": _result("oracle_2", role="preservation"),
+    "excluded_check_passed": _result("oracle_1", status="expected"),
+    "excluded_for_another_role_reason": _result("oracle_1", reason="preservation_failed"),
     "exclusion_reason_of_another_role": lambda a: a["excluded_checks"].update(
-        repro_1="preservation_fails_on_base"
+        oracle_1="preservation_fails_on_base"
     ),
     "admitted_check_violated": _result(
-        "repro_2", status="violated", reason="reproduction_passed_on_base"
+        "oracle_2", status="violated", reason="reproduction_passed_on_base"
     ),
-    "admitted_check_undecided": _result("repro_2", status="indeterminate"),
+    "admitted_check_undecided": _result("oracle_2", status="indeterminate"),
 }
 
 
@@ -781,8 +780,8 @@ def _enabled() -> list[BaseEvent]:
 
 def test_an_admission_record_admission_writes_is_accepted() -> None:
     frozen = _two_repros()
-    admission = _admission_data(frozen, ("repro_1",))
-    assert admitted_exclusions(frozen_manifest(frozen), admission) == frozenset({"repro_1"})
+    admission = _admission_data(frozen, ("oracle_1",))
+    assert admitted_exclusions(frozen_manifest(frozen), admission) == frozenset({"oracle_1"})
     assert verify_boundary_order(_journal(frozen, admission), run_events=_enabled()) == ()
 
 
@@ -793,12 +792,20 @@ def test_an_admission_record_admission_could_not_write_is_refused_and_flagged(
     edit: Any,
 ) -> None:
     frozen = _two_repros()
-    admission = _admission_data(frozen, ("repro_1",))
+    admission = _admission_data(frozen, ("oracle_1",))
     edit(admission)
     with pytest.raises(BoundaryOrderError):
         admitted_exclusions(frozen_manifest(frozen), admission)
     # The same rule on write (the reducer) and on replay.
     assert verify_boundary_order(_journal(frozen, admission), run_events=_enabled()) != ()
+
+
+def _rename_oracle(frozen: dict[str, Any], check_id: str) -> None:
+    """Rename the first oracle check consistently (check, its assertions, its oracle)."""
+    manifest = frozen["manifest"]
+    manifest["checks"][0] = _check(check_id, "reproduction", "k1")
+    manifest["checks"][0]["assertion_ids"] = [f"{check_id}.c{n}" for n in (1, 2, 3)]
+    manifest["oracles"][0] = _oracle(check_id, "k1", 1)
 
 
 @pytest.mark.parametrize(
@@ -809,8 +816,14 @@ def test_an_admission_record_admission_could_not_write_is_refused_and_flagged(
         lambda f: f["manifest"].update(package_id="q" * 64),
         lambda f: f["manifest"].update(checks=f["manifest"]["checks"][:1]),
         lambda f: f["manifest"].update(oracles=[_oracle("ghost", "k1", 1)]),
-        lambda f: f["manifest"].update(oracles=[_oracle("repro_1", "k1", -1)]),
+        lambda f: f["manifest"].update(oracles=[_oracle("oracle_1", "k1", -1)]),
         lambda f: f["manifest"]["checks"][0].update(role="other"),
+        # A check named by the constructor, not by the product's mint.
+        lambda f: _rename_oracle(f, "fix_c2_is_minus_2"),
+        lambda f: _rename_oracle(f, "oracle_5"),
+        lambda f: f["manifest"]["checks"][0].update(
+            assertion_ids=["oracle_1.c1", "oracle_1.c2", "oracle_1.held_minus_2"]
+        ),
     ],
     ids=[
         "no_record_digest",
@@ -820,6 +833,9 @@ def test_an_admission_record_admission_could_not_write_is_refused_and_flagged(
         "unknown_oracle",
         "held_out_count",
         "unknown_role",
+        "hand_named_check",
+        "oracle_id_of_another_criterion",
+        "hand_named_assertion",
     ],
 )
 def test_a_frozen_record_the_product_could_not_write_is_refused(edit: Any) -> None:
@@ -837,19 +853,19 @@ def test_a_frozen_record_the_product_could_not_write_is_refused(edit: Any) -> No
 def test_the_projection_applies_admission_exclusions_and_the_reproduction_rule() -> None:
     frozen = _manifest_event_data(
         [
-            _check("repro_1", "reproduction", "k1"),
-            _check("keep_1", "preservation", "k1"),
-            _check("repro_2", "reproduction", "k2"),
-            _check("hidden_2", "reproduction", "k2"),
+            _check("oracle_1", "reproduction", "k1"),
+            _check("script_1_1", "preservation", "k1"),
+            _check("script_2_1", "reproduction", "k2"),
+            _check("oracle_2", "reproduction", "k2"),
         ],
         [
-            _oracle("repro_1", "k1", 2),
-            _oracle("hidden_2", "k2", 3),
+            _oracle("oracle_1", "k1", 2),
+            _oracle("oracle_2", "k2", 3),
         ],
     )
-    # repro_1 excluded: k1 keeps only a preservation check, so it is not covered;
-    # hidden_2 excluded: k2 stays covered by repro_2, a script check (no held-out case).
-    events = _journal(frozen, _admission_data(frozen, ("repro_1", "hidden_2")))
+    # oracle_1 excluded: k1 keeps only a preservation check, so it is not covered;
+    # oracle_2 excluded: k2 stays covered by script_2_1, a script check (no held-out case).
+    events = _journal(frozen, _admission_data(frozen, ("oracle_1", "oracle_2")))
     projection = recovery_projection("run_p", _enabled(), {1: events})
     assert isinstance(projection, RecoveryBound)
     assert projection.covered == frozenset({"k2"})
@@ -860,7 +876,7 @@ def test_the_projection_applies_admission_exclusions_and_the_reproduction_rule()
     )
     assert isinstance(admitted, RecoveryBound)
     assert admitted.covered == frozenset({"k1", "k2"})
-    assert admitted.held_out_checks == frozenset({"repro_1", "hidden_2"})
+    assert admitted.held_out_checks == frozenset({"oracle_1", "oracle_2"})
 
 
 def test_the_projection_is_off_only_without_any_record_of_the_run() -> None:
