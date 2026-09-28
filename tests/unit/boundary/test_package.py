@@ -95,7 +95,8 @@ def test_manifest_summary_excludes_check_code(package) -> None:
     assert SIGNATURE not in text
     assert "probe/test_add.py" not in text  # a path the constructor chose is not recorded
     assert PY not in text  # nor is argv
-    assert {f["sha256"] for f in summary["files"]} == {f.sha256 for f in package.files}
+    # Files by kind only: no digest or size of bytes the constructor wrote.
+    assert summary["files"] == [{"kind": "generated"}] * len(package.files)
 
 
 def test_a_package_is_persisted_only_as_its_sealed_record(tmp_path: Path, seed) -> None:
@@ -164,10 +165,10 @@ def test_workspace_leaks_by_path_and_by_renamed_content(tmp_path: Path, package)
     (workspace / "probe" / "test_add.py").write_text("unrelated\n")
     (workspace / "renamed.py").write_text(REPRO_SCRIPT)
     assert find_workspace_leaks(workspace, [package]) == ("probe/test_add.py", "renamed.py")
-    # A manifest summary (as recorded in the journal) lists digests, not paths:
-    # it finds the renamed copy by its bytes.
-    summary = package.manifest_summary()
-    assert find_workspace_leaks(workspace, [summary]) == ("renamed.py",)
+    # A manifest summary (as recorded in the journal) carries no path, digest
+    # or size to scan for: it is refused, never scanned for nothing.
+    with pytest.raises(CheckPackageError, match="live"):
+        find_workspace_leaks(workspace, [package.manifest_summary()])  # type: ignore[list-item]
 
 
 def test_text_leaks(package) -> None:

@@ -22,7 +22,7 @@ generated check code in a worker workspace or bundle.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
@@ -392,13 +392,14 @@ class CheckPackage(BaseModel, frozen=True):
         Built from an allowlist of values the product computed: the package
         id (``seal_package``; ``None`` before it is sealed), the Seed and
         input digests, criterion keys, product-minted check and assertion
-        ids, roles, links, counts, sizes and SHA-256 digests. Nothing the
-        constructor wrote is copied: no file path, argv, script, failure
+        ids, roles, links, file kinds and counts. No value is a function of
+        bytes the constructor wrote: no file path, argv, script, failure
         signature, binding symbol, parameter name, case, locator or scratch
-        path, since any of them can carry a held-out value. The oracle data
-        file (which holds the held-out cases) is listed without a digest,
-        and the package itself is never named by an unkeyed digest: either
-        would let anyone confirm guessed held-out values offline.
+        path, and no digest or size of a package file, since any of them can
+        carry a held-out value or let anyone confirm a guessed one offline.
+        The package itself is never named by an unkeyed digest either. Two
+        packages that differ only in what the constructor wrote have the same
+        projection, apart from their random ids and timestamps.
         """
         return {
             "schema_version": self.schema_version,
@@ -418,7 +419,7 @@ class CheckPackage(BaseModel, frozen=True):
                 for check in self.checks
             ],
             "files": [_file_projection(item) for item in self.files],
-            "base_files": [{"sha256": item.sha256} for item in self.base_files],
+            "base_file_count": len(self.base_files),
             "scratch_path_count": len(self.scratch_paths),
             "uncovered": [item.model_dump(mode="json") for item in self.uncovered],
             **self._oracle_summary(),
@@ -445,11 +446,16 @@ class CheckPackage(BaseModel, frozen=True):
 
 
 def _file_projection(item: PackageFile) -> dict[str, Any]:
-    """A package file by its product role, digest and size; never by its path."""
+    """A package file by its product role only.
+
+    Never by its path, and never by a digest or size of its bytes: a
+    generated file's bytes are the constructor's, so an unkeyed digest (or a
+    length) of them would let anyone confirm a held-out value copied into a
+    script by enumerating candidates offline.
+    """
     if item.path == ORACLE_DATA_PATH:
         return {"kind": "oracle_data", "held_out_redacted": True}
-    kind = "oracle_harness" if item.path == ORACLE_HARNESS_PATH else "generated"
-    return {"kind": kind, "sha256": item.sha256, "size": len(item.content.encode("utf-8"))}
+    return {"kind": "oracle_harness" if item.path == ORACLE_HARNESS_PATH else "generated"}
 
 
 def oracle_argv(check_id: str) -> tuple[str, ...]:
@@ -636,25 +642,18 @@ def worker_criteria(seed: Seed) -> tuple[WorkerCriterion, ...]:
     )
 
 
-def _file_manifest(
-    package_or_manifest: CheckPackage | Mapping[str, Any],
-) -> tuple[set[str], list[dict[str, Any]]]:
-    """Paths and ``{sha256, size}`` entries to scan for: a live package's, or a journal manifest's.
+def _file_manifest(package: CheckPackage) -> tuple[set[str], list[dict[str, Any]]]:
+    """Paths and ``{sha256, size}`` entries of a live package's files, computed in memory.
 
-    A live package is scanned by the paths and digests of all its files, the
-    oracle data file included: those are read here, in memory, and never
-    persisted. A journal manifest carries no paths, and no digest for the
-    oracle data file, so it is scanned by the digests it lists.
+    Only the live package can be scanned for: its paths, digests and sizes,
+    the oracle data file included, are read here and never persisted. A
+    journal manifest carries none of them, so it cannot stand in for the
+    package; anything else refuses the scan (``CheckPackageError``).
     """
-    if isinstance(package_or_manifest, CheckPackage):
-        return {item.path for item in package_or_manifest.files}, [
-            {"sha256": item.sha256, "size": len(item.content.encode("utf-8"))}
-            for item in package_or_manifest.files
-        ]
-    return set(), [
-        entry
-        for entry in package_or_manifest.get("files", [])
-        if isinstance(entry, Mapping) and "sha256" in entry
+    if not isinstance(package, CheckPackage):
+        raise CheckPackageError("the leak scan needs the live, in-memory package")
+    return {item.path for item in package.files}, [
+        {"sha256": item.sha256, "size": len(item.content.encode("utf-8"))} for item in package.files
     ]
 
 
@@ -744,7 +743,7 @@ class _Scan:
 
 def find_workspace_leaks(
     workspace: Path,
-    packages: Iterable[CheckPackage | Mapping[str, Any]],
+    packages: Iterable[CheckPackage],
 ) -> tuple[str, ...]:
     """Return workspace-relative paths that carry, or may carry, generated check files.
 
@@ -760,8 +759,8 @@ def find_workspace_leaks(
     it is not a leak.
 
     Pass the live packages: a ``manifest_summary()`` dict (all a caller
-    holding only journal events has) lists no paths and no digest of the
-    oracle data file, so it finds only copies of the other files by content.
+    holding only journal events has) carries no path, digest or size, and is
+    refused (``CheckPackageError``) rather than scanned for nothing.
     """
     paths: set[str] = set()
     manifests: list[dict[str, Any]] = []
