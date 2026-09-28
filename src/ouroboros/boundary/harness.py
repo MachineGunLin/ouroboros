@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import sys
 from typing import Any
 
@@ -46,6 +47,10 @@ MAX_REPR = 300
 
 class _Missing(Exception):
     pass
+
+
+class _Unprovable(Exception):
+    """This platform cannot prove where the target's code comes from."""
 
 
 def _plain(value: Any, depth: int = 0) -> Any:
@@ -114,24 +119,55 @@ def _defining_file(target: Any, owner: Any) -> str | None:
     return filename if isinstance(filename, str) else None
 
 
+def _checkout_file(filename: str | None) -> bool:
+    """Whether ``filename`` is a regular file of the checkout, reached without a link.
+
+    The same proof as ``ouroboros.core.filesystem_capability``'s
+    ``resolve_checkout_file``, which this process cannot import (it runs
+    with ``-I`` in the project interpreter): the working directory is held,
+    ``filename`` must lie lexically below it, every directory of the path is
+    opened by name from the one before it with ``O_NOFOLLOW``, and the file
+    itself must open without following a link as a regular file. Nothing is
+    resolved through ``realpath``. Raises ``_Unprovable`` where this
+    platform has no ``O_NOFOLLOW`` or ``dir_fd`` support.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None or os.open not in os.supports_dir_fd:
+        raise _Unprovable("no-follow checkout resolution is unavailable")
+    root = os.getcwd()
+    if not isinstance(filename, str) or not filename.startswith(root.rstrip(os.sep) + os.sep):
+        return False
+    parts = filename[len(root.rstrip(os.sep)) + 1 :].split(os.sep)
+    if any(part in ("", ".", "..") for part in parts):
+        return False
+    held: list[int] = []
+    try:
+        held.append(os.open(".", os.O_RDONLY | directory_flag))
+        for part in parts[:-1]:
+            held.append(os.open(part, os.O_RDONLY | directory_flag | nofollow, dir_fd=held[-1]))
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
+        held.append(os.open(parts[-1], flags, dir_fd=held[-1]))
+        return stat.S_ISREG(os.fstat(held[-1]).st_mode)
+    except OSError:
+        return False
+    finally:
+        for descriptor in reversed(held):
+            os.close(descriptor)
+
+
 def _require_inside_checkout(symbol: str, target: Any, owner: Any) -> None:
     """The target is resolved only when its code is a file of the checkout under test.
 
     What the target process imported, not what a static look at the files
     suggests: a workspace ``json.py`` does not stand in for the standard
     library's ``json`` (already imported by this harness), a package linked in
-    from outside the checkout is outside it, and a name re-exported from
-    another library is that library's code.
+    from outside the checkout is outside it, a name re-exported from another
+    library is that library's code, and code whose file does not exist in
+    the checkout (compiled from a string, or naming a removed file) is not
+    the checkout's. A link anywhere in the path is not followed.
     """
-    filename = _defining_file(target, owner)
-    root = os.path.realpath(os.getcwd())
-    try:
-        inside = filename is not None and (
-            os.path.commonpath([root, os.path.realpath(filename)]) == root
-        )
-    except ValueError:  # another drive
-        inside = False
-    if not inside:
+    if not _checkout_file(_defining_file(target, owner)):
         raise _Missing(symbol + ": not defined in the checkout")
 
 
@@ -188,6 +224,10 @@ def _target(nonce: str, kind: str, symbol: str) -> None:
         target = _resolve(symbol, kind)
     except _Missing as exc:
         frame({"phase": "resolved", "resolve": "missing", "detail": str(exc)[:500]})
+        os._exit(0)
+    except _Unprovable as exc:
+        # Neither missing nor resolved: the check cannot decide on this host.
+        frame({"phase": "resolved", "resolve": "unprovable", "detail": str(exc)[:500]})
         os._exit(0)
     except BaseException as exc:
         frame(

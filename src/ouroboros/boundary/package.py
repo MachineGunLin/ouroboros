@@ -44,10 +44,14 @@ from ouroboros.boundary.oracle import (
     OracleSpec,
     oracle_data_text,
 )
+from ouroboros.core.filesystem_capability import (
+    NoFollowDirectoryChain,
+    open_nofollow_directory_chain,
+)
 from ouroboros.core.seed import AcceptanceCriterionSpec, Seed, derive_semantic_ac_key
 
 CHECK_PACKAGE_SCHEMA = "ouroboros.check_package.v1"
-PACKAGE_RECORD_SCHEMA = "ouroboros.check_package_record.v3"
+PACKAGE_RECORD_SCHEMA = "ouroboros.check_package_record.v4"
 PACKAGE_ID_BYTES = 32
 ORACLE_PACKAGE_SCHEMA = "ouroboros.check_package.v2"
 # Fields added with the oracle split. They are left out of the canonical
@@ -383,14 +387,18 @@ class CheckPackage(BaseModel, frozen=True):
         return self._package_id is not None
 
     def manifest_summary(self) -> dict[str, Any]:
-        """Return an event-safe summary: ids, roles, links, no check code.
+        """The package's safe projection: what the journal and the stored record carry.
 
-        File contents and argv are excluded so the summary can be persisted in
-        the shared event journal without exposing generated check code. The
-        package is named by its id (``seal_package``; ``None`` before it is
-        sealed), never by an unkeyed digest, and the oracle data file (which carries the held-out cases) is
-        listed by path only: an unkeyed digest of it would let anyone confirm
-        guessed held-out values offline.
+        Built from an allowlist of values the product computed: the package
+        id (``seal_package``; ``None`` before it is sealed), the Seed and
+        input digests, criterion keys, product-minted check and assertion
+        ids, roles, links, counts, sizes and SHA-256 digests. Nothing the
+        constructor wrote is copied: no file path, argv, script, failure
+        signature, binding symbol, parameter name, case, locator or scratch
+        path, since any of them can carry a held-out value. The oracle data
+        file (which holds the held-out cases) is listed without a digest,
+        and the package itself is never named by an unkeyed digest: either
+        would let anyone confirm guessed held-out values offline.
         """
         return {
             "schema_version": self.schema_version,
@@ -409,20 +417,9 @@ class CheckPackage(BaseModel, frozen=True):
                 }
                 for check in self.checks
             ],
-            "files": [
-                (
-                    {"path": item.path, "held_out_redacted": True}
-                    if item.path == ORACLE_DATA_PATH
-                    else {
-                        "path": item.path,
-                        "sha256": item.sha256,
-                        "size": len(item.content.encode("utf-8")),
-                    }
-                )
-                for item in self.files
-            ],
-            "base_files": [item.model_dump(mode="json") for item in self.base_files],
-            "scratch_paths": list(self.scratch_paths),
+            "files": [_file_projection(item) for item in self.files],
+            "base_files": [{"sha256": item.sha256} for item in self.base_files],
+            "scratch_path_count": len(self.scratch_paths),
             "uncovered": [item.model_dump(mode="json") for item in self.uncovered],
             **self._oracle_summary(),
         }
@@ -437,8 +434,7 @@ class CheckPackage(BaseModel, frozen=True):
                     "check_id": spec.check_id,
                     "criterion_key": spec.criterion_key,
                     "call_kind": spec.call_kind.value,
-                    "params": list(spec.params),
-                    "default_symbol": spec.default_binding.symbol,
+                    "param_count": len(spec.params),
                     "target_named_in_criterion": spec.target_named_in_criterion,
                     "case_count": len(spec.cases),
                     "held_out_count": spec.held_out_count,
@@ -446,6 +442,14 @@ class CheckPackage(BaseModel, frozen=True):
                 for spec in self.oracles
             ],
         }
+
+
+def _file_projection(item: PackageFile) -> dict[str, Any]:
+    """A package file by its product role, digest and size; never by its path."""
+    if item.path == ORACLE_DATA_PATH:
+        return {"kind": "oracle_data", "held_out_redacted": True}
+    kind = "oracle_harness" if item.path == ORACLE_HARNESS_PATH else "generated"
+    return {"kind": kind, "sha256": item.sha256, "size": len(item.content.encode("utf-8"))}
 
 
 def oracle_argv(check_id: str) -> tuple[str, ...]:
@@ -533,39 +537,18 @@ def seal_package(package: CheckPackage) -> CheckPackage:
 
 
 def package_record(package: CheckPackage) -> dict[str, Any]:
-    """The package as the product stores it: no held-out input or expected value.
+    """The package as the product stores it: its safe projection (``manifest_summary``).
 
-    A held-out case is reduced to its case id and ``held_out: true``, in the
-    oracle specs and in the oracle data file alike. The record names the
-    package by its id and Seed digest. It cannot be loaded back as a package.
+    The record names the package by its id and Seed digest and carries only
+    values the product computed, never anything the constructor wrote, so
+    no held-out input or expected value can reach the disk through it. It
+    cannot be loaded back as a package.
     """
-    data = package.canonical_dict()
-    oracles = []
-    for spec in data.get("oracles") or ():
-        cases = [
-            {"case_id": case["case_id"], "held_out": True} if case.get("held_out") else case
-            for case in spec["cases"]
-        ]
-        oracles.append({**spec, "cases": cases})
-    if oracles:
-        data["oracles"] = oracles
-        reduced = json.dumps(
-            {**json.loads(oracle_data_text(package.oracles)), "oracles": oracles},
-            sort_keys=True,
-            indent=1,
-            ensure_ascii=False,
-        )
-        data["files"] = [
-            {"path": item["path"], "content": reduced, "held_out_redacted": True}
-            if item["path"] == ORACLE_DATA_PATH
-            else item
-            for item in data["files"]
-        ]
     return {
         "schema_version": PACKAGE_RECORD_SCHEMA,
         "package_id": package.package_id,
         "seed_digest": package.seed_digest,
-        "package": data,
+        "package": package.manifest_summary(),
     }
 
 
@@ -580,42 +563,42 @@ def package_record_bytes(package: CheckPackage) -> bytes:
     return canonical_json_bytes(package_record(package))
 
 
-_PUBLISH_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-
-
 def publish_exact(target: Path, data: bytes) -> Path:
     """Publish ``data`` at ``target`` exactly once, or confirm it is already there.
 
-    A new target is created exclusively (``O_EXCL``, never through a link) and
-    written in full. When the target exists, it is accepted only if it is a
-    regular file (not followed through a link) whose bytes equal ``data``;
-    anything else raises ``CheckPackageError``, so a file planted at the
-    target never stands in for the record or receipt the caller cites.
+    Every directory from ``/`` to the target's parent is opened by name
+    without following a link (missing ones are created through their held
+    parent), so no link anywhere in the path redirects the publication; one
+    raises ``CheckPackageError``. A new target is created exclusively
+    (``O_EXCL``, never through a link) through the held parent and written in
+    full; if that fails, only the file this call created is removed. When the
+    target exists, it is accepted only if it is a regular file (not followed
+    through a link) whose bytes equal ``data``; anything else raises
+    ``CheckPackageError``, so a file planted at the target never stands in
+    for the record or receipt the caller cites.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
+    absolute = Path(os.path.abspath(target))
     try:
-        descriptor = os.open(target, _PUBLISH_FLAGS, 0o600)
-    except FileExistsError:
-        _confirm_published(target, data)
-        return target
+        directory = open_nofollow_directory_chain(absolute.parent, create_missing=True)
+    except (OSError, ValueError) as exc:
+        raise CheckPackageError(
+            f"cannot open the publication directory of {target.name} without following a link"
+        ) from exc
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
+        if not directory.create_exclusive(absolute.name, data):
+            _confirm_published(directory, absolute.name, data)
+    finally:
+        directory.close()
     return target
 
 
-def _confirm_published(target: Path, data: bytes) -> None:
+def _confirm_published(directory: NoFollowDirectoryChain, name: str, data: bytes) -> None:
     try:
-        descriptor = os.open(target, _READ_FLAGS)
-    except OSError as exc:
-        raise CheckPackageError(f"cannot confirm the published file {target.name}") from exc
-    with os.fdopen(descriptor, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode) or handle.read() != data:
-            raise CheckPackageError(f"a different file already exists at {target.name}")
+        published = directory.read_regular_file(name)
+    except (OSError, ValueError) as exc:
+        raise CheckPackageError(f"cannot confirm the published file {name}") from exc
+    if published.data != data:
+        raise CheckPackageError(f"a different file already exists at {name}")
 
 
 def write_package_record(package: CheckPackage, directory: Path) -> Path:
@@ -653,19 +636,26 @@ def worker_criteria(seed: Seed) -> tuple[WorkerCriterion, ...]:
     )
 
 
-def _file_manifest(package_or_manifest: CheckPackage | Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Path, digest and size of every file of a live package; a journal manifest as recorded.
+def _file_manifest(
+    package_or_manifest: CheckPackage | Mapping[str, Any],
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """Paths and ``{sha256, size}`` entries to scan for: a live package's, or a journal manifest's.
 
-    A live package is scanned by the digests of all its files, the oracle data
-    file included: those digests are computed here, in memory, and never
-    persisted. A journal manifest lists the oracle data file by path only.
+    A live package is scanned by the paths and digests of all its files, the
+    oracle data file included: those are read here, in memory, and never
+    persisted. A journal manifest carries no paths, and no digest for the
+    oracle data file, so it is scanned by the digests it lists.
     """
     if isinstance(package_or_manifest, CheckPackage):
-        return [
-            {"path": item.path, "sha256": item.sha256, "size": len(item.content.encode("utf-8"))}
+        return {item.path for item in package_or_manifest.files}, [
+            {"sha256": item.sha256, "size": len(item.content.encode("utf-8"))}
             for item in package_or_manifest.files
         ]
-    return list(package_or_manifest.get("files", []))
+    return set(), [
+        entry
+        for entry in package_or_manifest.get("files", [])
+        if isinstance(entry, Mapping) and "sha256" in entry
+    ]
 
 
 _MAX_SCAN_ENTRIES = 200_000
@@ -715,8 +705,6 @@ class _Scan:
             self.leaks.append(prefix.rstrip("/") or ".")
             return
         for entry in entries:
-            if entry.name == ".git":
-                continue
             relative = prefix + entry.name
             self.budget -= 1
             if self.budget < 0:
@@ -772,18 +760,21 @@ def find_workspace_leaks(
     it is not a leak.
 
     Pass the live packages: a ``manifest_summary()`` dict (all a caller
-    holding only journal events has) cannot find a renamed copy of the oracle
-    data file, whose digest the journal never records.
+    holding only journal events has) lists no paths and no digest of the
+    oracle data file, so it finds only copies of the other files by content.
     """
-    manifests = [entry for package in packages for entry in _file_manifest(package)]
+    paths: set[str] = set()
+    manifests: list[dict[str, Any]] = []
+    for package in packages:
+        package_paths, entries = _file_manifest(package)
+        paths |= package_paths
+        manifests.extend(entries)
     if not manifests:
         return ()
-    paths = {entry["path"] for entry in manifests}
     harness = sha256_bytes(ORACLE_HARNESS_SOURCE.encode("utf-8"))
     digests_by_size: dict[int, set[str]] = {}
     for entry in manifests:
-        # A redacted oracle data entry (a journal manifest) is matched by path only.
-        if "sha256" in entry and entry["sha256"] != harness:
+        if entry["sha256"] != harness:
             digests_by_size.setdefault(int(entry["size"]), set()).add(entry["sha256"])
     root = os.path.realpath(workspace)
     scan = _Scan(paths, digests_by_size)

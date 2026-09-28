@@ -93,8 +93,8 @@ def test_manifest_summary_excludes_check_code(package) -> None:
     assert summary["package_id"] == package.package_id
     assert package.sha256 not in text  # never the unkeyed package digest
     assert SIGNATURE not in text
-    assert "probe/test_add.py" in text  # path and digest are recorded
-    assert PY not in text  # argv is not
+    assert "probe/test_add.py" not in text  # a path the constructor chose is not recorded
+    assert PY not in text  # nor is argv
     assert {f["sha256"] for f in summary["files"]} == {f.sha256 for f in package.files}
 
 
@@ -164,9 +164,10 @@ def test_workspace_leaks_by_path_and_by_renamed_content(tmp_path: Path, package)
     (workspace / "probe" / "test_add.py").write_text("unrelated\n")
     (workspace / "renamed.py").write_text(REPRO_SCRIPT)
     assert find_workspace_leaks(workspace, [package]) == ("probe/test_add.py", "renamed.py")
-    # A manifest summary (as recorded in the journal) is enough to detect leaks.
+    # A manifest summary (as recorded in the journal) lists digests, not paths:
+    # it finds the renamed copy by its bytes.
     summary = package.manifest_summary()
-    assert find_workspace_leaks(workspace, [summary]) == ("probe/test_add.py", "renamed.py")
+    assert find_workspace_leaks(workspace, [summary]) == ("renamed.py",)
 
 
 def test_text_leaks(package) -> None:
@@ -219,6 +220,16 @@ def test_dangling_and_special_links_carry_nothing(tmp_path: Path, package) -> No
     (workspace / "pipe").symlink_to(fifo)
     os.mkfifo(workspace / "local_pipe")
     assert find_workspace_leaks(workspace, [package]) == ()
+
+
+def test_generated_check_files_hidden_in_git_metadata_are_found(tmp_path: Path, package) -> None:
+    # Version-control metadata is workspace content too: a renamed copy of a
+    # generated check under .git is a leak like anywhere else.
+    workspace = _workspace(tmp_path)
+    (workspace / ".git" / "hooks").mkdir(parents=True)
+    (workspace / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (workspace / ".git" / "hooks" / "pre-commit").write_text(REPRO_SCRIPT)
+    assert find_workspace_leaks(workspace, [package]) == (".git/hooks/pre-commit",)
 
 
 def test_a_hard_link_to_package_material_is_a_leak(tmp_path: Path, package) -> None:

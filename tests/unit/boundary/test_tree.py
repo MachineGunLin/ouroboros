@@ -10,6 +10,7 @@ import pytest
 
 from ouroboros.boundary import tree
 from ouroboros.boundary.tree import UNREADABLE, tree_manifest, unreadable_paths
+from ouroboros.core.filesystem_capability import open_directory_anchor
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX named pipes")
@@ -32,5 +33,9 @@ def test_hashing_a_path_swapped_for_a_link_refuses_it(tmp_path: Path) -> None:
     swapped = tmp_path / "swapped.py"
     swapped.symlink_to(secret)
 
-    with pytest.raises(OSError):
-        tree._file_sha256(swapped)
+    anchor = open_directory_anchor(tmp_path)
+    try:
+        with pytest.raises(OSError):
+            tree._file_sha256(anchor, "swapped.py")
+    finally:
+        anchor.close()
