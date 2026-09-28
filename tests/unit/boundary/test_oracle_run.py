@@ -552,41 +552,85 @@ def _cli_package(base: Path, symbol: str):  # type: ignore[no-untyped-def]
     )
 
 
+def _cli_layout(tmp_path: Path, root: Path, layout: str) -> str:
+    """Lay out ``root`` for ``layout``; the CLI binding symbol it is run through."""
+    outside = tmp_path / "outside"
+    (outside / "pkg").mkdir(parents=True, exist_ok=True)
+    (outside / "tool.py").write_text(TOOL)
+    (outside / "pkg" / "__init__.py").write_text("")
+    (outside / "pkg" / "mod.py").write_text(TOOL)
+    if layout == "linked_script":
+        (root / "tool.py").symlink_to(outside / "tool.py")
+        return "tool.py"
+    if layout == "linked_directory":
+        (root / "bin").symlink_to(outside, target_is_directory=True)
+        return "bin/tool.py"
+    if layout == "stdlib_module":
+        return "-m json.tool"
+    if layout == "linked_package":
+        (root / "pkg").symlink_to(outside / "pkg", target_is_directory=True)
+        return "-m pkg.mod"
+    (root / "pkg").mkdir()
+    (root / "pkg" / "mod.py").write_text(TOOL)
+    if layout == "extension_beside_source":
+        (root / "pkg" / "__init__.py").write_text("")
+        (root / "pkg" / "mod.so").write_bytes(b"\0")
+    return "-m pkg.mod"
+
+
+# Not the checkout's code: ``missing``. Possibly the checkout's, but not
+# provably what Python runs: ``unprovable`` (decides nothing).
+CLI_LAYOUTS = {
+    "linked_script": "missing",
+    "linked_directory": "missing",
+    "stdlib_module": "missing",
+    "linked_package": "missing",
+    "namespace_package": "unprovable",
+    "extension_beside_source": "unprovable",
+}
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-@pytest.mark.parametrize(
-    "layout",
-    ["linked_script", "linked_directory", "stdlib_module", "linked_package", "namespace_package"],
-)
+@pytest.mark.parametrize("layout", sorted(CLI_LAYOUTS))
 async def test_a_cli_target_outside_the_checkout_is_never_tier_a(
     tmp_path: Path, layout: str
 ) -> None:
     # #2463 round 4: ``is_file()`` followed a link out of the checkout, and a
     # ``-m`` binding was never checked, so both were resolved as tier A.
-    outside = tmp_path / "outside"
-    (outside / "pkg").mkdir(parents=True)
-    (outside / "tool.py").write_text(TOOL)
-    (outside / "pkg" / "__init__.py").write_text("")
-    (outside / "pkg" / "mod.py").write_text(TOOL)
     base = _repo(tmp_path / "base", {"README.md": "tool\n"})
-    if layout == "linked_script":
-        (base / "tool.py").symlink_to(outside / "tool.py")
-        symbol = "tool.py"
-    elif layout == "linked_directory":
-        (base / "bin").symlink_to(outside, target_is_directory=True)
-        symbol = "bin/tool.py"
-    elif layout == "stdlib_module":
-        symbol = "-m json.tool"
-    elif layout == "linked_package":
-        (base / "pkg").symlink_to(outside / "pkg", target_is_directory=True)
-        symbol = "-m pkg.mod"
-    else:
-        (base / "pkg").mkdir()
-        (base / "pkg" / "mod.py").write_text(TOOL)
-        symbol = "-m pkg.mod"
+    symbol = _cli_layout(tmp_path, base, layout)
     admission = await admit_check_package(_cli_package(base, symbol), base)
-    result = _oracle_result(admission.checks[0])
-    assert result["resolve"] != "ok"
+    (check,) = admission.checks
+    assert _oracle_result(check)["resolve"] == CLI_LAYOUTS[layout]
     assert admission.check_tiers == {"oracle_1": "U"}
+    if CLI_LAYOUTS[layout] == "unprovable":
+        assert check.status is CheckStatus.INDETERMINATE
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("layout", sorted(CLI_LAYOUTS))
+async def test_a_candidate_cli_target_outside_the_checkout_never_passes(
+    tmp_path: Path, layout: str
+) -> None:
+    # Admitted on a base whose checkout has the tool; the candidate's is not
+    # provably its own: a failure when it is not the checkout's, undecided
+    # when it cannot be told.
+    base = _repo(
+        tmp_path / "base",
+        {"tool.py": TOOL, "bin/tool.py": TOOL, "pkg/__init__.py": "", "pkg/mod.py": TOOL},
+    )
+    candidate = _repo(tmp_path / "cand", {"README.md": "tool\n"})
+    symbol = _cli_layout(tmp_path, candidate, layout)
+    package = _cli_package(base, symbol)
+    if layout != "stdlib_module":
+        assert (await admit_check_package(package, base)).verdict is PackageVerdict.ADMITTED
+    result = await verify_candidate(package, candidate)
+    expected = (
+        CandidateVerdict.FAIL
+        if CLI_LAYOUTS[layout] == "missing"
+        else CandidateVerdict.INDETERMINATE
+    )
+    assert result.verdict is expected
 
 
 @pytest.mark.parametrize("symbol", ["tool.py", "-m pkg.mod", "-m pkg"])

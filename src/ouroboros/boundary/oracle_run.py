@@ -68,7 +68,8 @@ Outcomes (``OracleRun``):
 
 - a failure before any target code runs (oracle files missing, the harness
   differs from this product version, no interpreter, the first target cannot
-  be launched) is indeterminate;
+  be launched) is indeterminate, and so is a target this host cannot prove to
+  be, or not to be, checkout code (``unprovable``);
 - on the base (admission, and the one base run of a late binding), anything
   but a clean observation of every case (no ``resolved`` frame, an import
   error, a crash, a timeout, a malformed frame) is indeterminate: a base run
@@ -585,59 +586,84 @@ def _shadowed(names: Sequence[str], stem: str) -> bool:
     )
 
 
-def _module_files(cwd: Path, dotted: str) -> tuple[str, ...] | str:
+@dataclass(frozen=True, slots=True)
+class _NotProven:
+    """Why a CLI target's code is not proven to be checkout files.
+
+    ``resolve`` is ``missing`` when it is not the checkout's code, and
+    ``unprovable`` when it may be but this host cannot tell (which decides
+    nothing, on the base or on a candidate).
+    """
+
+    resolve: str
+    reason: str
+
+
+_NOT_CHECKOUT_CODE = frozenset(
+    {
+        CheckoutFileRefusal.MISSING,
+        CheckoutFileRefusal.LINK,
+        CheckoutFileRefusal.NOT_DIRECTORY,
+        CheckoutFileRefusal.NOT_REGULAR,
+        CheckoutFileRefusal.NOT_CHECKOUT_RELATIVE,
+    }
+)
+
+
+def _module_files(cwd: Path, dotted: str) -> tuple[str, ...] | _NotProven:
     """The checkout files ``python -m dotted`` runs from ``cwd``, or why they are not known.
 
     ``-m`` puts ``cwd`` first on the module search path, but a built-in, frozen
     or already imported module comes before any path, so a top-level name of
-    the standard library is never taken as the checkout's. Each parent must
-    be a regular package (``__init__.py``): a namespace package can be merged
-    with, or shadowed by, a package elsewhere on the path. The module is
-    ``<name>.py``, or a package's ``__init__.py`` and ``__main__.py``.
+    the standard library is never the checkout's (``missing``). Each parent
+    must be a regular package (``__init__.py``): a namespace package can be
+    merged with, or shadowed by, a package elsewhere on the path
+    (``unprovable``). The module is ``<name>.py``, or a package's
+    ``__init__.py`` and ``__main__.py``.
     """
     parts = dotted.split(".")
     if parts[0] in sys.stdlib_module_names or parts[0] in sys.builtin_module_names:
-        return "standard_library_module"
+        return _NotProven("missing", "standard_library_module")
     files: list[str] = []
     directory = ""
     for index, part in enumerate(parts):
         names = _names(cwd, directory)
         if names is None or _shadowed(names, part):
-            return "module_not_provable"
+            return _NotProven("unprovable", "module_not_provable")
         package = _names(cwd, directory + part) if part in names else None
         if package is not None and "__init__.py" in package:
             if _shadowed(package, "__init__") or _shadowed(package, "__main__"):
-                return "module_not_provable"
+                return _NotProven("unprovable", "module_not_provable")
             files.append(f"{directory}{part}/__init__.py")
             directory = f"{directory}{part}/"
             if index == len(parts) - 1:
                 files.append(f"{directory}__main__.py")
             continue
         if index < len(parts) - 1:
-            return "namespace_package"
+            return _NotProven("unprovable", "namespace_package")
         files.append(f"{directory}{part}.py")
     return tuple(files)
 
 
-def _cli_target_files(cwd: Path, symbol: str) -> tuple[str, str] | None:
+def _cli_target_files(cwd: Path, symbol: str) -> _NotProven | None:
     """``None`` when a CLI target's code is proven to be regular checkout files.
 
-    Otherwise ``(resolve, detail)``, the same outcomes as the harness gives a
-    Python target (``boundary/harness.py``): ``missing`` when the code is not
-    a checkout file (a link anywhere on its path, a directory, a special
-    file, a standard library or namespace module), ``unprovable`` where this
-    host cannot open a path without following links. Every file is proven
-    through ``resolve_checkout_file`` from ``cwd``: never through a link.
+    Every file is proven through ``resolve_checkout_file`` from ``cwd``,
+    never through a link. Otherwise the outcome is the one the harness gives
+    a Python target (``boundary/harness.py``): ``missing`` when the code is
+    not a checkout file (a link anywhere on its path, a directory, a special
+    file, a standard library module), ``unprovable`` when this host cannot
+    tell (no no-follow traversal, an unreadable or moving path, a namespace
+    package, an extension module or bytecode beside the source).
     """
     files = _module_files(cwd, symbol[3:]) if symbol.startswith("-m ") else (symbol,)
-    if isinstance(files, str):
-        return "missing", f"{symbol}: {files}"
+    if isinstance(files, _NotProven):
+        return _NotProven(files.resolve, f"{symbol}: {files.reason}")
     for relative in files:
         proof = resolve_checkout_file(cwd, relative)
-        if proof is CheckoutFileRefusal.UNAVAILABLE:
-            return "unprovable", f"{symbol}: {proof.value}"
         if isinstance(proof, CheckoutFileRefusal):
-            return "missing", f"{symbol}: {relative}: {proof.value}"
+            resolve = "missing" if proof in _NOT_CHECKOUT_CODE else "unprovable"
+            return _NotProven(resolve, f"{symbol}: {relative}: {proof.value}")
     return None
 
 
@@ -734,7 +760,7 @@ async def _observe(
             # replaced the file.
             refused = _cli_target_files(cwd, binding.symbol)
             if refused is not None:
-                outcome = _Case("resolve", resolve=refused[0], detail=refused[1])
+                outcome = _Case("resolve", resolve=refused.resolve, detail=refused.reason)
             else:
                 outcome = await _cli_case(
                     _prepared(prepare, argv), case.stdin or "", case_deadline, call_text
