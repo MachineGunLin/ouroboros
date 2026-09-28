@@ -652,7 +652,7 @@ _EXCLUSION = {"reproduction": "repro_passes_on_base", "preservation": "preservat
 def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> dict[str, Any]:
     """The admission record ``admit_check_package`` writes for the frozen manifest."""
     roles = {check["check_id"]: check["role"] for check in frozen["manifest"]["checks"]}
-    oracles = {oracle["check_id"] for oracle in frozen["manifest"]["oracles"]}
+    oracles = {oracle["check_id"]: oracle for oracle in frozen["manifest"]["oracles"]}
     return {
         "schema_version": "ouroboros.check_admission.v2",
         "package_id": frozen["package_id"],
@@ -690,8 +690,26 @@ def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> d
                 "mutated_paths": [],
                 "scratch_outputs": [],
                 "undeclared_outputs": [],
+                **(
+                    {"oracle_result": _base_result(oracles[check_id], check_id in excluded)}
+                    if check_id in oracles
+                    else {}
+                ),
             }
             for check_id, role in roles.items()
+        ],
+    }
+
+
+def _base_result(oracle: dict[str, Any], passed: bool) -> dict[str, Any]:
+    """An oracle's base run: its last ``held_out_count`` cases held out, all ``passed``."""
+    count, held = oracle["case_count"], oracle["held_out_count"]
+    return {
+        "binding_source": "default",
+        "resolve": "ok",
+        "cases": [
+            {"case_id": f"c{n}", "held_out": n > count - held, "passed": passed}
+            for n in range(1, count + 1)
         ],
     }
 

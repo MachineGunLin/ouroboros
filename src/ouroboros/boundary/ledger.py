@@ -199,6 +199,8 @@ class FrozenManifest:
     """Oracle checks that had at least one held-out case."""
     oracle_checks: frozenset[str] = frozenset()
     """Checks that run an oracle (every other check is a model-written script)."""
+    oracle_cases: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    """Per oracle check, its case count and held-out case count."""
 
 
 def _strings(value: object, what: str) -> tuple[str, ...]:
@@ -277,6 +279,7 @@ def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
         raise BoundaryOrderError("the frozen manifest's oracles are malformed")
     held: set[str] = set()
     oracle_ids: set[str] = set()
+    oracle_cases: dict[str, tuple[int, int]] = {}
     for spec in oracles:
         check = by_id.get(spec.get("check_id")) if isinstance(spec, Mapping) else None
         count = spec.get("held_out_count") if isinstance(spec, Mapping) else None
@@ -290,13 +293,15 @@ def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
         if check.check_id in oracle_ids:
             raise BoundaryOrderError("the frozen manifest names an oracle twice")
         oracle_ids.add(check.check_id)
+        cases = spec.get("case_count")
+        oracle_cases[check.check_id] = (cases if type(cases) is int else 0, count)
         if count:
             held.add(check.check_id)
     if not _minted(raw_checks, oracles, keys):
         raise BoundaryOrderError(
             "the frozen manifest names a check by an id the product never mints"
         )
-    return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids))
+    return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids), oracle_cases)
 
 
 def _minted(
@@ -482,6 +487,8 @@ class VersionState:
     """The candidate verifications recorded (the run, then at most one re-run)."""
     base_failing: Mapping[str, frozenset[str]] = field(default_factory=dict)
     """Per admitted oracle check, the held-out cases its base run failed at admission."""
+    admitted_cases: Mapping[str, tuple[tuple[str, bool], ...]] = field(default_factory=dict)
+    """Per oracle check, its cases (id, held out) as admission ran them: every later run's."""
 
     @property
     def seal(self) -> str | None:
@@ -558,6 +565,7 @@ def _reference_checked(
 
 def _admission(state: VersionState, event: BaseEvent, record: AdmissionRecord) -> VersionState:
     time = _utc(event.timestamp)
+    _require_oracle_results(state, record.checks, bindings=None, on_base=True)
     if record.verdict != "admitted":
         # Recorded, but not an admission: the version can only be superseded.
         return replace(state, phase=Phase.REJECTED, gate_time=time)
@@ -569,11 +577,17 @@ def _admission(state: VersionState, event: BaseEvent, record: AdmissionRecord) -
     admitted_exclusions(state.manifest, event.data)
     excluded = dict(record.excluded_checks or {})
     base_failing = base_failing_held_out(record.checks, excluded)
+    admitted_cases = {
+        check.check_id: tuple((case.case_id, case.held_out) for case in check.oracle_result.cases)
+        for check in record.checks
+        if check.oracle_result is not None
+    }
     return replace(
         state,
         phase=Phase.ADMITTED,
         excluded=excluded,
         base_failing=base_failing,
+        admitted_cases=admitted_cases,
         interpreter_sha256=record.interpreter_sha256,
         interpreter_realpath_sha256=record.interpreter_realpath_sha256,
         admitted_tiers=dict(record.check_tiers or {}),
@@ -735,12 +749,69 @@ def _require_bound_run(state: VersionState, record: VerificationRecord) -> None:
         )
     ):
         raise BoundaryOrderError("a verification runs a check other than the bound runnable ones")
+    _require_oracle_results(state, record.checks, bindings=record.bindings, on_base=False)
     if not state.verifications:
         return
     first = state.verifications[0]
     rerunnable = {c.check_id for c in first.checks if c.status is CheckStatus.INDETERMINATE}
     if len(state.verifications) > 1 or not set(ran) <= rerunnable:
         raise BoundaryOrderError("a verification is re-run once, only for indeterminate checks")
+
+
+def _require_oracle_results(
+    state: VersionState,
+    checks: Sequence[JournalCheckExecution],
+    *,
+    bindings: Mapping[str, Any] | None,
+    on_base: bool,
+) -> None:
+    """Every oracle result is one ``oracle_run`` and the harness (``harness.compare``) can write.
+
+    Admission and verification receipts alike: only an oracle check carries
+    one; its cases are the frozen oracle's (``c1..c<n>`` with the frozen
+    held-out count, and on a candidate exactly the cases admission ran,
+    held-out flags included, since a journaled run includes held-out cases);
+    no case passes unless the target resolved (``resolve`` ``ok``); the
+    source says whether the run was handed a binding (``declared``, a
+    verification's ``bindings``) or used the default (admission); and the
+    status agrees with the cases (``admission._classify``): an expected check
+    on a candidate, or an expected preservation check on the base, passed
+    every case; an expected reproduction check on the base failed one, and
+    not only visible ones.
+    """
+    manifest = state.manifest
+    assert manifest is not None
+    for check in checks:
+        result = check.oracle_result
+        if check.check_id not in manifest.oracle_checks:
+            if result is not None:
+                raise BoundaryOrderError("a script check reports an oracle result")
+            continue
+        if result is None:
+            if check.status is CheckStatus.EXPECTED:
+                raise BoundaryOrderError("an oracle check met its role without a result")
+            continue
+        count, held = manifest.oracle_cases[check.check_id]
+        cases = tuple((case.case_id, case.held_out) for case in result.cases)
+        reference = None if on_base else state.admitted_cases.get(check.check_id)
+        frozen = [case_id_for(n) for n in range(1, count + 1)]
+        passed = [case.passed for case in result.cases]
+        source = "declared" if check.check_id in (bindings or {}) else "default"
+        if check.status is not CheckStatus.EXPECTED:
+            expected_ok = True
+        elif on_base and check.role is CheckRole.REPRODUCTION:
+            expected_ok = not all(passed) and not held_out_all_passed(result)
+        else:
+            expected_ok = all(passed) and result.resolve == "ok"
+        if (
+            [case_id for case_id, _held in cases] != frozen
+            or sum(held_out for _id, held_out in cases) != held
+            or (reference is not None and cases != reference)
+            or (result.resolve != "ok" and any(passed))
+            or result.binding_source != source
+            or not expected_ok
+        ):
+            raise BoundaryOrderError("an oracle result is not one the oracle harness can write")
 
 
 def _effective(state: VersionState) -> tuple[dict[str, JournalCheckExecution], bool]:
