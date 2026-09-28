@@ -83,6 +83,10 @@ _SYNCHRONIZE = 0x00100000
 _FILE_READ_ATTRIBUTES = 0x0080
 _FILE_SHARE_READ = 0x1
 _FILE_SHARE_WRITE = 0x2
+_FILE_SHARE_ALL = 0x7  # read, write, delete
+_EXTENDED_FILE_ID_TYPE = 2
+# OpenFileById on a volume that holds no object with that id.
+_NO_SUCH_OBJECT = frozenset({2, 3, 87})
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -94,6 +98,9 @@ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 _SE_FILE_OBJECT = 1
 _DACL_SECURITY_INFORMATION = 0x4
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
+_SE_DACL_PROTECTED = 0x1000
 _GRANT_ACCESS = 1
 _REVOKE_ACCESS = 4
 _NO_INHERITANCE = 0
@@ -162,6 +169,7 @@ class _Win32:
         signatures: dict[Any, dict[str, tuple[Any, ...]]] = {
             self.kernel32: {
                 "CreateFileW": (h, w, d, d, p, d, d, h),
+                "OpenFileById": (h, h, p, d, d, p, d),
                 "CloseHandle": (bool, h),
                 "GetFileInformationByHandleEx": (bool, h, ctypes.c_int, p, d),
                 "GetStdHandle": (h, d),
@@ -196,6 +204,12 @@ class _Win32:
                 "SetNamedSecurityInfoW": (d, wintypes.LPWSTR, ctypes.c_int, d, p, p, p, p),
                 "SetEntriesInAclW": (d, wintypes.ULONG, p, p, pp),
                 "GetAce": (bool, p, d, pp),
+                "GetSecurityDescriptorControl": (
+                    bool,
+                    p,
+                    ctypes.POINTER(wintypes.WORD),
+                    ctypes.POINTER(d),
+                ),
                 "EqualSid": (bool, p, p),
                 "GetLengthSid": (d, p),
                 "FreeSid": (p, p),
@@ -425,10 +439,6 @@ def _new_dacl(dacl: int, sid: Sid, mode: int, access: int, inheritance: int) -> 
     return new
 
 
-def _is_directory(path: str) -> bool:
-    return os.path.isdir(path) and not os.path.islink(path) and not os.path.isjunction(path)
-
-
 def dacl_sddl(path: str) -> str:
     """The DACL of ``path`` in SDDL (diagnostics and tests)."""
     api = _api()
@@ -459,121 +469,6 @@ def dacl_sddl(path: str) -> str:
         api.kernel32.LocalFree(descriptor)
 
 
-def _update_named(path: str, sid: Sid, mode: int, access: int) -> bool:
-    """Grant or revoke ``sid`` on ``path`` by name; False when this user may not.
-
-    Returns False (and changes nothing) when the DACL cannot be read or
-    written by this user, as for system directories.
-    """
-    api = _api()
-    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-    code = api.advapi32.GetNamedSecurityInfoW(
-        path,
-        _SE_FILE_OBJECT,
-        _DACL_SECURITY_INFORMATION,
-        None,
-        None,
-        ctypes.byref(dacl),
-        None,
-        ctypes.byref(descriptor),
-    )
-    if code != _ERROR_SUCCESS:
-        return False
-    try:
-        if mode == _REVOKE_ACCESS and not _names(dacl.value or 0, sid):
-            return True
-        inheritance = (
-            _SUB_CONTAINERS_AND_OBJECTS_INHERIT if _is_directory(path) else _NO_INHERITANCE
-        )
-        new = _new_dacl(dacl.value or 0, sid, mode, access, inheritance)
-        try:
-            code = api.advapi32.SetNamedSecurityInfoW(
-                path, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION, None, None, new, None
-            )
-        finally:
-            api.kernel32.LocalFree(new)
-        return code == _ERROR_SUCCESS
-    finally:
-        api.kernel32.LocalFree(descriptor)
-
-
-def readable_by_containers(path: str, capability: Sid) -> bool:
-    """Whether ``path`` already lets every AppContainer, or the read capability, read it."""
-    api = _api()
-    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-    code = api.advapi32.GetNamedSecurityInfoW(
-        path,
-        _SE_FILE_OBJECT,
-        _DACL_SECURITY_INFORMATION,
-        None,
-        None,
-        ctypes.byref(dacl),
-        None,
-        ctypes.byref(descriptor),
-    )
-    if code != _ERROR_SUCCESS:
-        return False
-    try:
-        everyone = sid_from_string(api, _ALL_APPLICATION_PACKAGES)
-        return _grants(
-            dacl.value or 0, [everyone, capability], FILE_READ_EXECUTE, subtree=_is_directory(path)
-        )
-    finally:
-        api.kernel32.LocalFree(descriptor)
-
-
-def grant_read(paths: list[str], manifest: str, capability: Sid) -> list[str]:
-    """Grant the read capability on each path containers cannot already read.
-
-    Each path is appended to ``manifest`` before its DACL changes, so a
-    grant is never left unrecorded. A path whose DACL this user may not
-    change is left alone (the command may then fail to read it: fail closed).
-    Returns the paths granted.
-    """
-    granted = []
-    for path in paths:
-        if not os.path.exists(path) or readable_by_containers(path, capability):
-            continue
-        os.makedirs(os.path.dirname(manifest), exist_ok=True)
-        with open(manifest, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"path": path, "capability": READ_CAPABILITY}) + "\n")
-        if _update_named(path, capability, _GRANT_ACCESS, FILE_READ_EXECUTE):
-            granted.append(path)
-    return granted
-
-
-def remove_read_grants(manifest: str) -> list[str]:
-    """Remove every ACE for the read capability from each path in ``manifest``.
-
-    The manifest is deleted once every recorded path that still exists has
-    been cleaned; a path whose DACL cannot be changed keeps it. Returns the
-    paths cleaned.
-    """
-    if not os.path.exists(manifest):
-        return []
-    capability = capability_sid(_api())
-    paths: list[str] = []
-    with open(manifest, encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                path = json.loads(line)["path"]
-            except (ValueError, KeyError, TypeError):
-                continue
-            if isinstance(path, str) and path not in paths:
-                paths.append(path)
-    cleaned, failed = [], []
-    for path in paths:
-        if not os.path.exists(path):
-            continue
-        if _update_named(path, capability, _REVOKE_ACCESS, 0):
-            cleaned.append(path)
-        else:
-            failed.append(path)
-    if not failed:
-        os.remove(manifest)
-    return cleaned
-
-
 class _FileIdInfo(ctypes.Structure):
     _fields_ = [("VolumeSerialNumber", ctypes.c_uint64), ("FileId", ctypes.c_ubyte * 16)]
 
@@ -582,39 +477,268 @@ class _FileAttributeTagInfo(ctypes.Structure):
     _fields_ = [("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32)]
 
 
+class _FileIdDescriptor(ctypes.Structure):
+    # FILE_ID_DESCRIPTOR with Type = ExtendedFileIdType and a FILE_ID_128.
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("Type", ctypes.c_int),
+        ("FileId", ctypes.c_ubyte * 16),
+    ]
+
+
+_DACL_ACCESS = _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES
+
+
+def _identity(handle: int, what: str) -> tuple[int, int, int]:
+    """``(volume serial, file id, attributes)`` of the object ``handle`` names."""
+    api = _api()
+    tag, identity = _FileAttributeTagInfo(), _FileIdInfo()
+    if not api.kernel32.GetFileInformationByHandleEx(
+        handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(tag), ctypes.sizeof(tag)
+    ) or not api.kernel32.GetFileInformationByHandleEx(
+        handle, _FILE_ID_INFO, ctypes.byref(identity), ctypes.sizeof(identity)
+    ):
+        raise api.error(f"GetFileInformationByHandleEx({what})")
+    file_id = int.from_bytes(bytes(identity.FileId), "little")
+    return identity.VolumeSerialNumber, file_id, tag.FileAttributes
+
+
+def _open(path: str, access: int, share: int) -> int | None:
+    """A handle on ``path`` itself (a reparse point is not followed), or None."""
+    handle = _api().kernel32.CreateFileW(
+        path,
+        access,
+        share,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    return None if not handle or handle == _INVALID_HANDLE_VALUE else int(handle)
+
+
+def _open_by_id(path: str, volume: int, file_id: int) -> int | None:
+    """Reopen the object with ``file_id`` on the volume ``path`` was on, wherever
+    it is now; None when that volume holds no such object any more.
+
+    Raises SandboxError when it cannot be told (the volume is not reachable).
+    """
+    api = _api()
+    anchor, _ = os.path.splitdrive(path)
+    hint = _open(anchor + "\\", _FILE_READ_ATTRIBUTES, _FILE_SHARE_ALL)
+    if hint is None:
+        raise api.error(f"the volume of {path} cannot be opened")
+    try:
+        descriptor = _FileIdDescriptor(
+            dwSize=ctypes.sizeof(_FileIdDescriptor),
+            Type=_EXTENDED_FILE_ID_TYPE,
+            FileId=(ctypes.c_ubyte * 16)(*file_id.to_bytes(16, "little")),
+        )
+        handle = api.kernel32.OpenFileById(
+            hint,
+            ctypes.byref(descriptor),
+            _DACL_ACCESS,
+            _FILE_SHARE_ALL,
+            None,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            code = ctypes.get_last_error()
+            if code in _NO_SUCH_OBJECT:
+                return None
+            raise api.error(f"OpenFileById({path})", code)
+    finally:
+        api.kernel32.CloseHandle(hint)
+    if _identity(int(handle), path)[:2] != (volume, file_id):
+        api.kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def update_dacl(handle: int, sid: Sid, mode: int, access: int, what: str) -> None:
+    """Grant ``sid`` (inherited by everything beneath a directory) or revoke every
+    entry naming it, on the object ``handle`` names.
+
+    The rest of the DACL is kept as it is: its entries, and whether it is
+    protected from inheritance. A NULL DACL (no access control: everyone may
+    do anything) cannot take a grant for one principal without replacing
+    that meaning, so granting on one is refused; revoking on one is a no-op,
+    since nothing names ``sid``.
+    """
+    api = _api()
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = api.advapi32.GetSecurityInfo(
+        handle,
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if code != _ERROR_SUCCESS:
+        raise api.error(f"GetSecurityInfo({what})", code)
+    try:
+        if not dacl.value:
+            if mode == _REVOKE_ACCESS:
+                return
+            raise SandboxError(f"{what} has a NULL DACL (no access control); it is not changed")
+        if mode == _REVOKE_ACCESS and not _names(dacl.value, sid):
+            return
+        from ctypes import wintypes
+
+        control, revision = wintypes.WORD(), wintypes.DWORD()
+        if not api.advapi32.GetSecurityDescriptorControl(
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ):
+            raise api.error(f"GetSecurityDescriptorControl({what})")
+        protection = (
+            _PROTECTED_DACL_SECURITY_INFORMATION
+            if control.value & _SE_DACL_PROTECTED
+            else _UNPROTECTED_DACL_SECURITY_INFORMATION
+        )
+        directory = _identity(handle, what)[2] & _FILE_ATTRIBUTE_DIRECTORY
+        inheritance = _SUB_CONTAINERS_AND_OBJECTS_INHERIT if directory else _NO_INHERITANCE
+        new = _new_dacl(dacl.value, sid, mode, access, inheritance)
+        try:
+            code = api.advapi32.SetSecurityInfo(
+                handle,
+                _SE_FILE_OBJECT,
+                _DACL_SECURITY_INFORMATION | protection,
+                None,
+                None,
+                new,
+                None,
+            )
+        finally:
+            api.kernel32.LocalFree(new)
+        if code != _ERROR_SUCCESS:
+            raise api.error(f"SetSecurityInfo({what})", code)
+    finally:
+        api.kernel32.LocalFree(descriptor)
+
+
+def readable_by_containers(handle: int, capability: Sid, what: str) -> bool:
+    """Whether every AppContainer, or the read capability, may already read the
+    object ``handle`` names (a NULL DACL lets everyone)."""
+    api = _api()
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = api.advapi32.GetSecurityInfo(
+        handle,
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if code != _ERROR_SUCCESS:
+        return False
+    try:
+        if not dacl.value:
+            return True
+        everyone = sid_from_string(api, _ALL_APPLICATION_PACKAGES)
+        directory = bool(_identity(handle, what)[2] & _FILE_ATTRIBUTE_DIRECTORY)
+        return _grants(dacl.value, [everyone, capability], FILE_READ_EXECUTE, subtree=directory)
+    finally:
+        api.kernel32.LocalFree(descriptor)
+
+
+def grant_read(paths: list[str], manifest: str, capability: Sid) -> list[str]:
+    """Grant the read capability on each path containers cannot already read.
+
+    Each grant is bound to the object, not its name: the object is opened
+    once, its volume and file id are appended to ``manifest`` before its DACL
+    changes (so a grant is never left unrecorded), and the DACL is changed
+    through that handle. A path this user may not open for ``WRITE_DAC`` is
+    left alone (the command may then fail to read it: fail closed). Returns
+    the paths granted.
+    """
+    granted = []
+    for path in paths:
+        handle = _open(path, _DACL_ACCESS, _FILE_SHARE_ALL)
+        if handle is None:
+            continue
+        try:
+            if readable_by_containers(handle, capability, path):
+                continue
+            volume, file_id, _ = _identity(handle, path)
+            os.makedirs(os.path.dirname(manifest), exist_ok=True)
+            record = {"path": path, "volume": volume, "file_id": file_id}
+            with open(manifest, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps({**record, "capability": READ_CAPABILITY}) + "\n")
+            try:
+                update_dacl(handle, capability, _GRANT_ACCESS, FILE_READ_EXECUTE, path)
+            except SandboxError:
+                continue
+            granted.append(path)
+        finally:
+            _api().kernel32.CloseHandle(handle)
+    return granted
+
+
+def remove_read_grants(manifest: str) -> list[str]:
+    """Remove every entry for the read capability from each object in ``manifest``.
+
+    Each object is reopened by its volume and file id, so one renamed or
+    moved within its volume since the grant is still found, and a new object
+    at the recorded path is not touched. An object that no longer exists
+    took its entries with it. The manifest is deleted once every recorded
+    object is clean or gone; if any cannot be reached or changed, it is kept.
+    Returns the recorded paths of the objects cleaned.
+    """
+    if not os.path.exists(manifest):
+        return []
+    capability = capability_sid(_api())
+    records: dict[tuple[int, int], str] = {}
+    with open(manifest, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                entry = json.loads(line)
+                key = (int(entry["volume"]), int(entry["file_id"]))
+                path = str(entry["path"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            records.setdefault(key, path)
+    cleaned, failed = [], []
+    for (volume, file_id), path in records.items():
+        try:
+            handle = _open_by_id(path, volume, file_id)
+            if handle is None:
+                continue
+            try:
+                update_dacl(handle, capability, _REVOKE_ACCESS, 0, path)
+            finally:
+                _api().kernel32.CloseHandle(handle)
+        except SandboxError:
+            failed.append(path)
+            continue
+        cleaned.append(path)
+    if not failed:
+        os.remove(manifest)
+    return cleaned
+
+
 class Root:
     """A writable root opened by handle and verified against ``confine``'s claim."""
 
     def __init__(self, path: str, device: int, inode: int) -> None:
         api = _api()
         self.path = path
-        handle = api.kernel32.CreateFileW(
-            path,
-            _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
-            None,
-            _OPEN_EXISTING,
-            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        if not handle or handle == _INVALID_HANDLE_VALUE:
+        # No delete sharing: the root cannot be renamed or replaced while held.
+        handle = _open(path, _DACL_ACCESS | _SYNCHRONIZE, _FILE_SHARE_READ | _FILE_SHARE_WRITE)
+        if handle is None:
             raise api.error(f"writable root {path} cannot be opened")
         self.handle = handle
         try:
-            tag = _FileAttributeTagInfo()
-            identity = _FileIdInfo()
-            if not api.kernel32.GetFileInformationByHandleEx(
-                handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(tag), ctypes.sizeof(tag)
-            ) or not api.kernel32.GetFileInformationByHandleEx(
-                handle, _FILE_ID_INFO, ctypes.byref(identity), ctypes.sizeof(identity)
-            ):
-                raise api.error(f"GetFileInformationByHandleEx({path})")
-            if not tag.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY or (
-                tag.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            volume, file_id, attributes = _identity(handle, path)
+            if not attributes & _FILE_ATTRIBUTE_DIRECTORY or (
+                attributes & _FILE_ATTRIBUTE_REPARSE_POINT
             ):
                 raise SandboxError(f"writable root {path} is not a plain directory")
-            file_id = int.from_bytes(bytes(identity.FileId), "little")
-            if (identity.VolumeSerialNumber, file_id) != (device, inode):
+            if (volume, file_id) != (device, inode):
                 raise SandboxError(f"writable root {path} is not the directory that was confined")
         except BaseException:
             api.kernel32.CloseHandle(handle)
@@ -622,34 +746,7 @@ class Root:
 
     def update(self, sid: Sid, mode: int, access: int) -> None:
         """Grant (inherited by everything beneath) or revoke ``sid`` through the handle."""
-        api = _api()
-        dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-        code = api.advapi32.GetSecurityInfo(
-            self.handle,
-            _SE_FILE_OBJECT,
-            _DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            ctypes.byref(dacl),
-            None,
-            ctypes.byref(descriptor),
-        )
-        if code != _ERROR_SUCCESS:
-            raise api.error(f"GetSecurityInfo({self.path})", code)
-        try:
-            if mode == _REVOKE_ACCESS and not _names(dacl.value or 0, sid):
-                return
-            new = _new_dacl(dacl.value or 0, sid, mode, access, _SUB_CONTAINERS_AND_OBJECTS_INHERIT)
-            try:
-                code = api.advapi32.SetSecurityInfo(
-                    self.handle, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION, None, None, new, None
-                )
-            finally:
-                api.kernel32.LocalFree(new)
-            if code != _ERROR_SUCCESS:
-                raise api.error(f"SetSecurityInfo({self.path})", code)
-        finally:
-            api.kernel32.LocalFree(descriptor)
+        update_dacl(self.handle, sid, mode, access, f"writable root {self.path}")
 
     def close(self) -> None:
         _api().kernel32.CloseHandle(self.handle)

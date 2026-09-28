@@ -86,6 +86,31 @@ def _aces(path: Path | str) -> str:
     return sddl[sddl.index("(") :] if "(" in sddl else ""
 
 
+def _protected(path: Path | str) -> bool:
+    """Whether ``path``'s DACL is protected from inheritance (the SDDL ``P`` flag)."""
+    sddl = launcher.dacl_sddl(str(path))
+    return "P" in sddl[2 : sddl.index("(")] if "(" in sddl else "P" in sddl[2:]
+
+
+def _set_dacl(path: Path, *, null: bool = False) -> None:
+    """Protect ``path``'s DACL from inheritance, keeping its entries, or make it NULL."""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = advapi32.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor)
+    )
+    assert code == 0, code
+    try:
+        # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        code = advapi32.SetNamedSecurityInfoW(
+            str(path), 1, 0x80000004, None, None, None if null else dacl, None
+        )
+        assert code == 0, code
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
 def _container_sid(command: ConfinedCommand) -> str:
     name = command.argv[command.argv.index("--appcontainer") + 1]
     return str(launcher.appcontainer_sid(launcher._api(), name))
@@ -400,8 +425,11 @@ class TestGrants:
         copy, temp = layout["copy"], layout["temp"]
         (copy / "sub").mkdir()
         (copy / "sub" / "file.txt").write_text("x", encoding="utf-8")
+        # A protected root keeps its protection through grant and revocation.
+        _set_dacl(copy)
         watched = [copy, copy / "sub", copy / "sub" / "file.txt", temp]
-        before = {path: _aces(path) for path in watched}
+        before = {path: (_aces(path), _protected(path)) for path in watched}
+        assert before[copy][1] and not before[temp][1]
         commands = {
             "succeeds": (_python("open('made.txt', 'w').write('x')"), 0),
             "fails": (_python("import sys; sys.exit(3)"), 3),
@@ -414,7 +442,7 @@ class TestGrants:
             result = _run(command)
 
             assert result.returncode == status, (label, result.stderr)
-            after = {path: _aces(path) for path in watched}
+            after = {path: (_aces(path), _protected(path)) for path in watched}
             assert after == before, label
             if (copy / "made.txt").exists():
                 assert sid not in launcher.dacl_sddl(str(copy / "made.txt")), label
@@ -451,6 +479,57 @@ class TestGrants:
         second = _confine(layout, read)
         assert _run(second).returncode == 0
         assert exec_sandbox.remove_persistent_read_grants() == (str(deps),)
+
+    def test_removal_follows_the_granted_object_not_its_name(
+        self, layout: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dependency renamed after its grant is still cleaned; the new object
+        at the old name is not touched; a deleted one needs nothing."""
+        _require_backend()
+        manifest = tmp_path.resolve() / "state" / "read-grants.jsonl"
+        monkeypatch.setattr(exec_sandbox, "_read_grant_manifest", lambda: manifest)
+        base = tmp_path.resolve()
+        deps, gone = base / "deps", base / "gone"
+        for tree in (deps, gone):
+            tree.mkdir()
+            (tree / "module.txt").write_text("dependency", encoding="utf-8")
+            _winapi.CreateJunction(str(tree), str(layout["copy"] / tree.name))
+        read = _python(
+            "import sys\n"
+            "sys.exit(0 if open('deps/module.txt').read() and open('gone/module.txt').read() else 1)"
+        )
+        assert _run(_confine(layout, read)).returncode == 0
+        capability = str(launcher.capability_sid(launcher._api()))
+        moved = base / "deps-moved"
+        deps.rename(moved)
+        deps.mkdir()
+        replacement = _aces(deps)
+        shutil.rmtree(gone)
+        assert capability in launcher.dacl_sddl(str(moved / "module.txt"))
+
+        removed = exec_sandbox.remove_persistent_read_grants()
+
+        assert removed == (str(deps),)
+        assert capability not in launcher.dacl_sddl(str(moved))
+        assert capability not in launcher.dacl_sddl(str(moved / "module.txt"))
+        assert _aces(deps) == replacement
+        assert not manifest.exists()
+
+    def test_a_null_dacl_root_is_refused_and_left_as_it_was(self, layout: dict[str, Path]) -> None:
+        """A NULL DACL means no access control; one grant cannot be added to it."""
+        _require_backend()
+        copy = layout["copy"]
+        _set_dacl(copy, null=True)
+        before = launcher.dacl_sddl(str(copy))
+        assert "NO_ACCESS_CONTROL" in before
+        command = _confine(layout, _python("open('ran.txt', 'w').write('x')"))
+
+        result = _run(command)
+
+        assert result.returncode == launcher.EXIT_SANDBOX_FAILED, result.stderr
+        assert "NULL DACL" in result.stderr
+        assert not (copy / "ran.txt").exists()
+        assert launcher.dacl_sddl(str(copy)) == before
 
 
 class TestUnavailable:

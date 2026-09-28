@@ -127,8 +127,11 @@ Backends:
   ``CreateProcessW`` requires a registered profile, so the launcher creates
   one and deletes it after creating the command's process and before
   resuming it: the profile folder, which grants the container full control,
-  and its registry storage are gone before the command runs anything. The launcher grants that
-  SID modify on the writable roots, through the handles it verified,
+  and its registry storage are gone before the command runs anything. The
+  launcher grants that SID modify on the writable roots, through the handles
+  it verified (keeping the rest of each DACL, its protection included; a
+  root with a NULL DACL, which means no access control, is refused rather
+  than rewritten),
   creates the command suspended with ``PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES``
   (no network capability when the network is denied; the client and server
   capabilities otherwise) and ``PROC_THREAD_ATTRIBUTE_HANDLE_LIST`` (exactly
@@ -155,9 +158,12 @@ Backends:
   restrict. A path is granted only when containers cannot already read it,
   never when it is a volume root, contains a writable root, the user's home
   directory, the Windows directory or a Program Files directory, or lies
-  inside one of the last two. Every granted path is recorded in
+  inside one of the last two. Every grant is bound to its object: the
+  object's volume and file id are recorded in
   ``~/.ouroboros/exec-sandbox/read-grants.jsonl`` before its DACL changes,
-  and ``remove_persistent_read_grants`` removes every such grant.
+  through the same handle, and ``remove_persistent_read_grants`` reopens each
+  object by that id (so one renamed since is still cleaned, and a new object
+  at the old name is not touched) and removes every such grant.
 - **Anything else** (a Linux kernel without Landlock, a macOS process that
   is already sandboxed, another operating system): no backend, and
   ``confine`` returns ``SandboxUnavailable``. A command is never run
@@ -577,9 +583,11 @@ def remove_persistent_read_grants() -> tuple[str, ...]:
     """Remove every persistent Windows read grant the sandbox has made.
 
     Reads the manifest (``~/.ouroboros/exec-sandbox/read-grants.jsonl``),
-    removes every ACE for the Ouroboros read capability from each recorded
-    path that still exists, and deletes the manifest once all of them are
-    clean. Returns the paths cleaned; empty on other platforms. Run it while
+    reopens each recorded object by its volume and file id (wherever it has
+    been renamed to on that volume), removes every ACE for the Ouroboros read
+    capability from it, and deletes the manifest once every object is clean
+    or gone. Returns the recorded paths of the objects cleaned; empty on
+    other platforms. Run it while
     no Ouroboros command is running: a confined command then loses what it
     was reading. The next confined command grants what it needs again.
     """
