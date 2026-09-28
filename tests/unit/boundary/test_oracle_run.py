@@ -11,7 +11,6 @@ import pytest
 from ouroboros.boundary.admission import (
     admit_binding,
     admit_check_package,
-    base_failing_held_out,
     verify_candidate,
 )
 from ouroboros.boundary.binding import CallKind, CheckTier, parse_binding
@@ -23,6 +22,7 @@ from ouroboros.boundary.oracle_build import assemble_package, build_oracle_spec
 from ouroboros.boundary.package import CheckRole, seal_package
 from ouroboros.boundary.per_check import (
     HELD_OUT_NOT_DISCRIMINATING,
+    base_failing_held_out,
     criteria_without_admitted_check,
 )
 from ouroboros.boundary.receipts import (
@@ -790,14 +790,13 @@ async def test_a_held_out_case_the_base_already_passes_discriminates_nothing(
     # Which held-out cases failed on the base, by id only, from the receipt
     # and from its journal form alike.
     journal = AdmissionJournal.model_validate(admission.event_summary())
-    assert base_failing_held_out(admission) == {"oracle_2": ("c2",)}
-    assert base_failing_held_out(journal) == {"oracle_2": ("c2",)}
+    excluded = admission.excluded_checks or {}
+    assert base_failing_held_out(admission.checks, excluded) == {"oracle_2": frozenset({"c2"})}
+    assert base_failing_held_out(journal.checks, excluded) == {"oracle_2": frozenset({"c2"})}
     # The ledger accepts the record admission wrote, and its replay gives
     # the same base-failing held-out cases (the rule a verified pass needs).
     frozen = package_frozen_event("boundary_b2", package)
     manifest = frozen_manifest(frozen.data)
     assert admitted_exclusions(manifest, admission.event_summary()) == frozenset({"oracle_1"})
     replayed = version_state([frozen, admission_completed_event("boundary_b2", admission)])
-    assert replayed.base_failing == {
-        check_id: frozenset(ids) for check_id, ids in base_failing_held_out(admission).items()
-    }
+    assert replayed.base_failing == base_failing_held_out(admission.checks, excluded)

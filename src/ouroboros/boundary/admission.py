@@ -46,7 +46,7 @@ import shutil
 import stat
 import tempfile
 import time
-from typing import Any, Literal
+from typing import Literal
 
 from ouroboros.boundary.binding import Binding, CheckTier
 from ouroboros.boundary.check_env import (
@@ -71,9 +71,12 @@ from ouroboros.boundary.package import (
     CheckSpec,
     sha256_bytes,
 )
-from ouroboros.boundary.per_check import HELD_OUT_NOT_DISCRIMINATING, per_check_admission
+from ouroboros.boundary.per_check import (
+    HELD_OUT_NOT_DISCRIMINATING,
+    held_out_all_passed,
+    per_check_admission,
+)
 from ouroboros.boundary.receipts import (
-    AdmissionJournal,
     AdmissionResult,
     CandidateVerdict,
     CandidateVerification,
@@ -479,6 +482,11 @@ async def _execute_check(
         signature_seen = oracle_run.signature_seen
     else:
         signature_seen = bool(signature) and signature in combined
+    oracle_result = (
+        OracleResult.model_validate(oracle_run.result)
+        if oracle_run is not None and oracle_run.result is not None
+        else None
+    )
     status, reason = _classify(
         check,
         completed,
@@ -486,12 +494,7 @@ async def _execute_check(
         signature_seen=signature_seen,
         on_base=on_base,
         oracle_undecided=oracle_run is not None and oracle_run.return_code not in (0, 1),
-        held_out_passes_on_base=(
-            include_held_out
-            and oracle_run is not None
-            and oracle_run.result is not None
-            and _held_out_all_passed(oracle_run.result)
-        ),
+        held_out_passes_on_base=include_held_out and held_out_all_passed(oracle_result),
     )
     tail = combined if completed.launch_error is None else completed.launch_error
     if completed.unavailable is not None:
@@ -517,18 +520,8 @@ async def _execute_check(
         undeclared_outputs=undeclared,
         tier=tier,
         binding=binding if binding is not None else (oracle.default_binding if oracle else None),
-        oracle_result=(
-            OracleResult.model_validate(oracle_run.result)
-            if oracle_run is not None and oracle_run.result is not None
-            else None
-        ),
+        oracle_result=oracle_result,
     )
-
-
-def _held_out_all_passed(result: Mapping[str, Any]) -> bool:
-    """An oracle run passed every held-out case it ran (at least one): the ledger's rule."""
-    held = [case for case in result.get("cases") or () if case.get("held_out")]
-    return bool(held) and all(case.get("passed") is True for case in held)
 
 
 def _unreadable_execution(
@@ -962,28 +955,6 @@ async def admit_binding(
         reason=reason,
         execution=execution,
     )
-
-
-def base_failing_held_out(
-    admission: AdmissionResult | AdmissionJournal,
-) -> dict[str, tuple[str, ...]]:
-    """Per admitted oracle check, the ids of its held-out cases that failed on the base.
-
-    Read from the admission receipt or its journal form alike (case ids and
-    pass/fail only). A verified pass needs one of these cases to pass on the
-    candidate: a held-out case the base already passed discriminates nothing.
-    Checks excluded at admission (``excluded_checks``) are left out: the
-    same rule the ledger applies when it replays an admission record.
-    """
-    excluded = admission.excluded_checks or {}
-    failing: dict[str, tuple[str, ...]] = {}
-    for check in admission.checks:
-        if check.oracle_result is None or check.check_id in excluded:
-            continue
-        failing[check.check_id] = tuple(
-            case.case_id for case in check.oracle_result.cases if case.held_out and not case.passed
-        )
-    return failing
 
 
 def base_run_tiers(package: CheckPackage, executions: Sequence[CheckExecution]) -> dict[str, str]:
