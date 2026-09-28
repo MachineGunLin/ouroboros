@@ -39,15 +39,17 @@ from ouroboros.boundary.ledger import (
     recovery_projection,
     verify_boundary_order,
 )
-from ouroboros.boundary.package import CheckPackageError, seal_package
+from ouroboros.boundary.package import CheckPackageError, seal_package, seed_criterion_keys
 from ouroboros.boundary.receipts import AdmissionResult, CandidateVerification, write_receipt
 from ouroboros.events.base import BaseEvent
 from ouroboros.persistence.event_store import EventStore
 
-from .conftest import INPUT_DIGEST, REPRO_SCRIPT, SIGNATURE, build_package
+from .conftest import INPUT_DIGEST, REPRO_SCRIPT, SIGNATURE, build_package, make_seed
 from .journal_fixtures import admission_receipt, verification_receipt
 
 CONTRACT = RunContract(check_timeout_seconds=120)
+KEYS = seed_criterion_keys(make_seed())
+"""The criteria of the ``package`` fixture (its frozen manifest's keys)."""
 
 
 @pytest.fixture
@@ -412,6 +414,7 @@ async def test_an_undecided_resume_is_recorded_only_for_a_run_that_was_on(store)
         tier_summary={},
         criteria=(),
         source="none",
+        reason="boundary_record_missing",
     )
     with pytest.raises(BoundaryOrderError, match="was on"):
         await ledger.record_resumed_undecided("run_x", payload=payload)
@@ -425,8 +428,8 @@ def _bindings(tier: str) -> BindingsPayload:
             "phase": "final",
             "checks": [
                 {
-                    "criterion_key": "k",
-                    "check_id": "c1",
+                    "criterion_key": KEYS[0],
+                    "check_id": "repro-add",
                     "tier": tier,
                     "binding_source": None,
                     "binding": None,
@@ -440,30 +443,35 @@ def _bindings(tier: str) -> BindingsPayload:
 
 
 def _decision(status: str, *, undecided: str | None = None) -> ReconciliationPayload:
-    criterion = {
-        "root_ac_index": 0,
-        "criterion_key": "k",
-        "package_status": status,
-        "tier": "A",
-        "reason": "r",
-        "failed_heldout_only": False,
-        "binding": None,
-        "existing_outcome": "succeeded",
-        "existing_failure_class": None,
-        "existing_accepted": True,
-        "accepted": status in ("pass", "unverified", "uncovered"),
-        "governed_by": "check_package",
-    }
+    """The same ``status`` for every criterion of the frozen manifest."""
+    criteria = [
+        {
+            "root_ac_index": index,
+            "criterion_key": key,
+            "package_status": status,
+            "tier": "A",
+            "reason": "r",
+            "failed_heldout_only": False,
+            "binding": None,
+            "existing_outcome": "succeeded",
+            "existing_failure_class": None,
+            "existing_accepted": True,
+            "accepted": status in ("pass", "unverified", "uncovered"),
+            "governed_by": "check_package",
+            "declared_binding_pass": False,
+        }
+        for index, key in enumerate(KEYS)
+    ]
     data = {
         "schema_version": "ouroboros.acceptance_reconciliation.v3",
         "run_accepted": status in ("pass", "unverified", "uncovered"),
         "existing_run_accepted": True,
         "artifact_verdict": status,
-        "verified_pass_count": int(status == "pass"),
+        "verified_pass_count": len(KEYS) if status == "pass" else 0,
         "unverified_count": 0,
-        "criterion_count": 1,
+        "criterion_count": len(KEYS),
         "tier_summary": {},
-        "criteria": [criterion],
+        "criteria": criteria,
     }
     if undecided is not None:
         data["undecided_reason"] = undecided
@@ -588,12 +596,12 @@ def _manifest_event_data(
     checks: list[dict[str, Any]], oracles: list[dict[str, Any]], *, keys=("k1", "k2")
 ) -> dict[str, Any]:
     return {
-        "package_id": "p" * 64,
-        "seed_digest": "s" * 64,
+        "package_id": "1" * 64,
+        "seed_digest": "2" * 64,
         "record_sha256": "a" * 64,
         "manifest": {
-            "package_id": "p" * 64,
-            "seed_digest": "s" * 64,
+            "package_id": "1" * 64,
+            "seed_digest": "2" * 64,
             "criterion_keys": list(keys),
             "checks": checks,
             "uncovered": [],
@@ -626,9 +634,14 @@ def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> d
     """The admission record ``admit_check_package`` writes for the frozen manifest."""
     roles = {check["check_id"]: check["role"] for check in frozen["manifest"]["checks"]}
     return {
+        "schema_version": "ouroboros.check_admission.v2",
         "package_id": frozen["package_id"],
         "seed_digest": frozen["seed_digest"],
         "verdict": "admitted",
+        "reasons": [],
+        "timeout_seconds": 120,
+        "started_at": "2026-09-28T00:00:00+00:00",
+        "completed_at": "2026-09-28T00:00:01+00:00",
         "protected_bytes_mutated": False,
         "base_tree_digest": "b" * 64,
         "base_tree_digest_after": "b" * 64,
@@ -642,6 +655,18 @@ def _admission_data(frozen: dict[str, Any], excluded: tuple[str, ...] = ()) -> d
                 "role": role,
                 "status": "violated" if check_id in excluded else "expected",
                 "reason": _BASE_REASON[role] if check_id in excluded else "passed",
+                "cwd": ".",
+                "return_code": 1,
+                "timed_out": False,
+                "duration_seconds": 0.0,
+                "signature_seen": True,
+                "stdout_sha256": "0" * 64,
+                "stderr_sha256": "0" * 64,
+                "protected_digest_before": "0" * 64,
+                "protected_digest_after": "0" * 64,
+                "mutated_paths": [],
+                "scratch_outputs": [],
+                "undeclared_outputs": [],
             }
             for check_id, role in roles.items()
         ],

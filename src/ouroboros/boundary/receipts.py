@@ -44,18 +44,9 @@ class _Receipt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class PackageReceipt(_Receipt):
-    """A receipt about one package: it names the package's Seed digest and id.
+class _CitesPackage(_Receipt):
+    """The package a receipt names: its Seed digest and id, both validated."""
 
-    ``seed_digest`` is required and validated; ``package_id`` is required and
-    is ``None`` only for a package that was never sealed (``seal_package``),
-    which the ledger never records. The ledger compares both with the frozen
-    event of the boundary version before it appends a receipt.
-    """
-
-    # In-memory identity of the package that ran (``CheckPackage.sha256``);
-    # never dumped, so no stored receipt or journal event carries it.
-    package_sha256: str = Field(exclude=True)
     package_id: str | None
     seed_digest: str
 
@@ -68,6 +59,20 @@ class PackageReceipt(_Receipt):
     @classmethod
     def _package(cls, value: str | None) -> str | None:
         return None if value is None else _hex_digest(value, 2 * PACKAGE_ID_BYTES, "package_id")
+
+
+class PackageReceipt(_CitesPackage):
+    """A receipt about one package: it names the package's Seed digest and id.
+
+    ``seed_digest`` is required and validated; ``package_id`` is required and
+    is ``None`` only for a package that was never sealed (``seal_package``),
+    which the ledger never records. The ledger compares both with the frozen
+    event of the boundary version before it appends a receipt.
+    """
+
+    # In-memory identity of the package that ran (``CheckPackage.sha256``);
+    # never dumped, so no stored receipt or journal event carries it.
+    package_sha256: str = Field(exclude=True)
 
 
 ExclusionReason = Literal["repro_passes_on_base", "preservation_fails_on_base"]
@@ -152,7 +157,7 @@ class AdmissionResult(PackageReceipt):
 
     def event_summary(self) -> dict[str, Any]:
         """Return the journal payload: statuses and digests, no argv or output."""
-        return _journal_safe(self)
+        return _journal_safe(self, AdmissionJournal)
 
 
 class CandidateVerification(PackageReceipt):
@@ -177,7 +182,109 @@ class CandidateVerification(PackageReceipt):
 
     def event_summary(self) -> dict[str, Any]:
         """Return the journal payload: statuses and digests, no argv or output."""
-        return _journal_safe(self)
+        return _journal_safe(self, VerificationJournal)
+
+
+# --------------------------------------------------------------------------
+# The journal form of a receipt (``event_summary``): the same closed schema
+# with argv, output text, the interpreter path and held-out values removed.
+# ``event_summary`` validates what it writes against these models, and the
+# journal gateway (``events.validate_record``) validates what replay reads, so
+# a record the product could not write is refused on both paths.
+
+
+class JournalCase(_Receipt):
+    """One oracle case in the journal: its id, whether it was held out, pass/fail."""
+
+    case_id: str
+    held_out: bool
+    passed: bool
+
+
+class JournalOracleResult(_Receipt):
+    """An oracle result in the journal (``oracle.journal_safe_oracle_result``)."""
+
+    binding_source: Literal["default", "declared"]
+    resolve: str
+    cases: tuple[JournalCase, ...]
+
+
+class JournalCheckExecution(_Receipt):
+    """A ``CheckExecution`` in the journal: no argv, no output tail."""
+
+    check_id: str
+    role: CheckRole
+    cwd: str
+    status: CheckStatus
+    reason: str
+    return_code: int | None
+    timed_out: bool
+    duration_seconds: float
+    signature_seen: bool
+    stdout_sha256: str
+    stderr_sha256: str
+    protected_digest_before: str
+    protected_digest_after: str
+    mutated_paths: tuple[str, ...]
+    scratch_outputs: tuple[str, ...]
+    undeclared_outputs: tuple[str, ...]
+    tier: CheckTier | None = None
+    binding: Binding | None = None
+    oracle_result: JournalOracleResult | None = None
+
+
+class AdmissionJournal(_CitesPackage):
+    """An ``AdmissionResult`` in the journal (``AdmissionResult.event_summary``)."""
+
+    schema_version: Literal["ouroboros.check_admission.v2"]
+    base_tree_digest: str
+    base_tree_digest_after: str
+    verdict: PackageVerdict
+    reasons: tuple[str, ...]
+    protected_bytes_mutated: bool
+    timeout_seconds: int
+    checks: tuple[JournalCheckExecution, ...]
+    started_at: datetime
+    completed_at: datetime
+    interpreter_source: str | None = None
+    interpreter_sha256: str | None = None
+    interpreter_realpath_sha256: str | None = None
+    check_tiers: dict[str, CheckTier] | None = None
+    excluded_checks: dict[str, ExclusionReason] | None = None
+
+    def check_ids(self) -> tuple[str, ...]:
+        """Every check id the record names."""
+        return (
+            *(check.check_id for check in self.checks),
+            *(self.check_tiers or {}),
+            *(self.excluded_checks or {}),
+        )
+
+
+class VerificationJournal(_CitesPackage):
+    """A ``CandidateVerification`` in the journal (``CandidateVerification.event_summary``)."""
+
+    schema_version: Literal["ouroboros.candidate_verification.v3"]
+    artifact_tree_digest: str
+    artifact_tree_digest_after: str
+    verdict: CandidateVerdict
+    reasons: tuple[str, ...]
+    protected_bytes_mutated: bool
+    timeout_seconds: int
+    checks: tuple[JournalCheckExecution, ...]
+    started_at: datetime
+    completed_at: datetime
+    interpreter_source: str | None = None
+    check_tiers: dict[str, CheckTier] | None = None
+    bindings: dict[str, Binding] | None = None
+
+    def check_ids(self) -> tuple[str, ...]:
+        """Every check id the record names."""
+        return (
+            *(check.check_id for check in self.checks),
+            *(self.check_tiers or {}),
+            *(self.bindings or {}),
+        )
 
 
 _JOURNAL_EXCLUDED_CHECK_FIELDS = frozenset({"argv", "output_tail"})
@@ -226,8 +333,8 @@ def _receipt_dump(receipt: BaseModel) -> dict[str, Any]:
     return data
 
 
-def _journal_safe(receipt: BaseModel) -> dict[str, Any]:
-    """Dump a receipt without check argv or output text.
+def _journal_safe(receipt: BaseModel, journal: type[_CitesPackage]) -> dict[str, Any]:
+    """Dump a receipt without check argv or output text, in its closed ``journal`` form.
 
     The event journal is readable by other tools, so it carries statuses,
     reasons, and digests only. The complete receipt (argv, output tails) is a
@@ -244,6 +351,7 @@ def _journal_safe(receipt: BaseModel) -> dict[str, Any]:
         if "oracle_result" in check:
             # Case pass/fail and held-out flags only: no inputs, no observations.
             check["oracle_result"] = journal_safe_oracle_result(check["oracle_result"])
+    journal.model_validate(data)
     return data
 
 
