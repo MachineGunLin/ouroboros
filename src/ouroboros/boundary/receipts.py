@@ -75,7 +75,9 @@ class PackageReceipt(_CitesPackage):
     package_sha256: str = Field(exclude=True)
 
 
-ExclusionReason = Literal["repro_passes_on_base", "preservation_fails_on_base"]
+ExclusionReason = Literal[
+    "repro_passes_on_base", "held_out_not_discriminating", "preservation_fails_on_base"
+]
 """Why per-check admission excluded a check (``per_check.EXCLUSION_REASONS``)."""
 
 

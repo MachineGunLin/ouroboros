@@ -136,8 +136,9 @@ class _Records:
                 reason="r",
             )
         if kind == BINDING_RECORDED:
+            # A resumed run's bindings: the one binding record every started phase allows.
             return binding_recorded_event(
-                BOUNDARY, package_id=str(package_id), payload=_bindings("repair", self.package)
+                BOUNDARY, package_id=str(package_id), payload=_bindings("resumed", self.package)
             )
         if kind == CANDIDATE_VERIFIED:
             return candidate_verified_event(
@@ -199,7 +200,9 @@ STATES: dict[str, tuple[tuple[str, ...], bool, frozenset[str]]] = {
     "verified": (
         (PACKAGE_FROZEN, ADMISSION_COMPLETED, ACTOR_STARTED, "final_bindings", CANDIDATE_VERIFIED),
         True,
-        frozenset({CANDIDATE_VERIFIED, ACCEPTANCE_RECONCILED, ACCEPTANCE_RESUMED}),
+        frozenset(
+            {BINDING_RECORDED, CANDIDATE_VERIFIED, ACCEPTANCE_RECONCILED, ACCEPTANCE_RESUMED}
+        ),
     ),
     "decided": (
         (
@@ -211,7 +214,20 @@ STATES: dict[str, tuple[tuple[str, ...], bool, frozenset[str]]] = {
             ACCEPTANCE_RECONCILED,
         ),
         True,
-        frozenset({ACCEPTANCE_RESUMED}),
+        frozenset({BINDING_RECORDED, ACCEPTANCE_RESUMED}),
+    ),
+    "resuming": (
+        (
+            PACKAGE_FROZEN,
+            ADMISSION_COMPLETED,
+            ACTOR_STARTED,
+            "final_bindings",
+            CANDIDATE_VERIFIED,
+            ACCEPTANCE_RECONCILED,
+            BINDING_RECORDED,
+        ),
+        True,
+        frozenset({BINDING_RECORDED, CANDIDATE_VERIFIED, ACCEPTANCE_RESUMED}),
     ),
     "superseded": ((PACKAGE_FROZEN, SUPERSEDED), True, frozenset()),
     "no_package": ((CONSTRUCTION_FAILED,), False, frozenset({ACTOR_STARTED, SUPERSEDED})),
@@ -279,6 +295,11 @@ def test_the_transition_table_is_the_documented_lifecycle() -> None:
         (Phase.ADMITTED, ACTOR_STARTED),
         (Phase.NO_PACKAGE, ACTOR_STARTED),
         (Phase.STARTED, BINDING_RECORDED),
+        (Phase.VERIFIED, BINDING_RECORDED),
+        (Phase.DECIDED, BINDING_RECORDED),
+        (Phase.RESUMING, BINDING_RECORDED),
+        (Phase.RESUMING, CANDIDATE_VERIFIED),
+        (Phase.RESUMING, ACCEPTANCE_RESUMED),
         (Phase.STARTED, CANDIDATE_VERIFIED),
         (Phase.VERIFIED, CANDIDATE_VERIFIED),
         (Phase.STARTED, ACCEPTANCE_RECONCILED),

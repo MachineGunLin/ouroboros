@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from ouroboros.boundary.events import (
     artifact_verdict_of,
     coverage_of,
 )
+from ouroboros.boundary.oracle import CaseResult, OracleResult
 from ouroboros.boundary.package import CheckPackage, CheckRole, CheckSpec
 from ouroboros.boundary.receipts import (
     AdmissionResult,
@@ -56,6 +58,40 @@ def expected_execution(check: CheckSpec) -> CheckExecution:
     )
 
 
+def oracle_result(package: CheckPackage, check_id: str, passed: Mapping[str, bool]) -> OracleResult:
+    """The result of ``check_id``'s oracle: each case passes as ``passed`` says (default no)."""
+    spec = package.oracle_for(check_id)
+    assert spec is not None
+    return OracleResult(
+        check_id=check_id,
+        criterion_key=spec.criterion_key,
+        binding_source="default",
+        symbol=spec.default_binding.symbol,
+        call_kind=spec.call_kind,
+        resolve="ok",
+        cases=tuple(
+            CaseResult(
+                case_id=case.case_id, held_out=case.held_out, passed=passed.get(case.case_id, False)
+            )
+            for case in spec.cases
+        ),
+    )
+
+
+def _base_execution(package: CheckPackage, check: CheckSpec) -> CheckExecution:
+    """What admission records for a check that met its role on the base.
+
+    A reproduction oracle reproduced the bug: its base run failed every case,
+    held-out cases included.
+    """
+    execution = expected_execution(check)
+    if package.oracle_for(check.check_id) is None:
+        return execution
+    return execution.model_copy(
+        update={"tier": CheckTier.A, "oracle_result": oracle_result(package, check.check_id, {})}
+    )
+
+
 def admission_receipt(
     package: CheckPackage, checkout: Path, verdict: PackageVerdict = PackageVerdict.ADMITTED
 ) -> AdmissionResult:
@@ -77,7 +113,9 @@ def admission_receipt(
         reasons=(),
         protected_bytes_mutated=False,
         timeout_seconds=120,
-        checks=tuple(expected_execution(check) for check in package.checks) if admitted else (),
+        checks=tuple(_base_execution(package, check) for check in package.checks)
+        if admitted
+        else (),
         started_at=now,
         completed_at=now,
         interpreter_sha256=PIN if admitted else None,

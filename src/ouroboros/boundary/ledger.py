@@ -32,8 +32,13 @@ time to the event about to be appended and at replay time by
    bindings bind every frozen check once, at a tier ``assign_tiers`` can
    give it; a verification runs only the runnable bound checks (a re-run
    only those that ended indeterminate); a decision records only the
-   package statuses the recorded results support, and a criterion the
-   package did not verify is the existing verifier's own verdict.
+   package statuses the recorded results support (a pass needs a held-out
+   case the base failed at admission), and a criterion the package did not
+   verify is the existing verifier's own verdict;
+7. a resumed run records its own bindings (``resumed``), then the
+   verification it ran, then its decision, judged by the same rule; a
+   resumed decision without them verified nothing and records only
+   undecided statuses.
 
 A boundary version of a run (``events.boundary_version_id``) is sealed only
 after the run's ``record_check_package_enabled``, and that record is refused
@@ -121,8 +126,9 @@ from ouroboros.boundary.package import (
 from ouroboros.boundary.per_check import (
     EXCLUDED_STATUS_HINT,
     EXCLUSION_REASONS,
+    HELD_OUT_NOT_DISCRIMINATING,
+    ROLE_EXCLUSION_REASONS,
     criteria_without_admitted_check,
-    exclusion_reason_for_role,
 )
 from ouroboros.boundary.receipts import (
     AdmissionResult,
@@ -281,6 +287,18 @@ def frozen_manifest(data: Mapping[str, Any]) -> FrozenManifest:
     return FrozenManifest(keys, tuple(checks), frozenset(held), frozenset(oracle_ids))
 
 
+def _held_out_all_passed(manifest: FrozenManifest, check_id: str, item: Mapping[str, Any]) -> bool:
+    """An oracle's base run passed every held-out case it ran (at least one)."""
+    result = item.get("oracle_result")
+    cases = result.get("cases") if isinstance(result, Mapping) else None
+    held = [case for case in cases or () if isinstance(case, Mapping) and case.get("held_out")]
+    return (
+        check_id in manifest.oracle_checks
+        and bool(held)
+        and all(case.get("passed") is True for case in held)
+    )
+
+
 # Tiers admission records (``admission.base_run_tiers``): an oracle check is
 # ``A`` or ``U`` from its base run, a script check ``S``, and any check ``C``
 # when ``per_check`` excluded it.
@@ -297,9 +315,11 @@ def admitted_exclusions(manifest: FrozenManifest, data: Mapping[str, Any]) -> fr
     ``U`` for an oracle check, ``S`` for a script check, ``C`` for either when
     excluded); one result per check with the manifest's role; every
     excluded check (tier ``C``) exactly an ``excluded_checks`` entry,
-    ``violated`` for the one base reason its role allows and carrying that
-    role's exclusion reason; every other check ``expected``; and at least one
-    check not excluded.
+    ``violated`` for a base reason its role allows and carrying the
+    exclusion reason that base reason maps to (``per_check.EXCLUSION_REASONS``;
+    ``held_out_not_discriminating`` only for a reproduction oracle whose base
+    run passed every held-out case); every other check ``expected``; and at
+    least one check not excluded.
     """
     by_id = {check.check_id: check for check in manifest.checks}
     if data.get("protected_bytes_mutated") is not False or data.get("base_tree_digest") != data.get(
@@ -332,11 +352,15 @@ def admitted_exclusions(manifest: FrozenManifest, data: Mapping[str, Any]) -> fr
         if item.get("role") != check.role.value:
             raise BoundaryOrderError("an admission result names another role")
         if check.check_id in excluded:
-            allowed = exclusion_reason_for_role(check.role)
+            reason = EXCLUSION_REASONS.get(str(item.get("reason")))
             if (
                 item.get("status") != "violated"
-                or EXCLUSION_REASONS.get(str(item.get("reason"))) != allowed
-                or recorded[check.check_id] != allowed
+                or reason not in ROLE_EXCLUSION_REASONS[check.role]
+                or recorded[check.check_id] != reason
+                or (
+                    reason == HELD_OUT_NOT_DISCRIMINATING
+                    and not _held_out_all_passed(manifest, check.check_id, item)
+                )
             ):
                 raise BoundaryOrderError("an excluded check was not excluded for its role")
         elif item.get("status") != "expected":
@@ -369,6 +393,8 @@ class Phase(StrEnum):
     """The candidate was verified against the frozen package."""
     DECIDED = "decided"
     """The acceptance decision was recorded."""
+    RESUMING = "resuming"
+    """A resumed run recorded its own bindings; its verification and decision follow."""
     SUPERSEDED = "superseded"
     """A later version of the run replaced this one; nothing more is recorded on it."""
 
@@ -384,8 +410,8 @@ class VersionState:
     """What the frozen event says the package links (checked when the seal is recorded)."""
     gate_time: datetime | None = None
     """When the latest seal or admission record was written (an actor starts after it)."""
-    excluded: frozenset[str] = frozenset()
-    """Checks the admission excluded (tier ``C``)."""
+    excluded: Mapping[str, str] = field(default_factory=dict)
+    """Checks the admission excluded (tier ``C``), with the recorded reason."""
     interpreter_sha256: str | None = None
     interpreter_realpath_sha256: str | None = None
     final_bindings: bool = False
@@ -397,6 +423,8 @@ class VersionState:
     """The final bindings, by check id: the tier and binding each check ran through."""
     verifications: tuple[VerificationRecord, ...] = ()
     """The candidate verifications recorded (the run, then at most one re-run)."""
+    base_failing: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    """Per admitted oracle check, the held-out cases its base run failed at admission."""
 
     @property
     def seal(self) -> str | None:
@@ -411,7 +439,7 @@ class VersionState:
 
     @property
     def started(self) -> bool:
-        return self.phase in (Phase.STARTED, Phase.VERIFIED, Phase.DECIDED)
+        return self.phase in (Phase.STARTED, Phase.VERIFIED, Phase.DECIDED, Phase.RESUMING)
 
     @property
     def superseded(self) -> bool:
@@ -476,10 +504,20 @@ def _admission(state: VersionState, event: BaseEvent, record: AdmissionRecord) -
         record.interpreter_realpath_sha256
     ):
         raise BoundaryOrderError("an admitted package's record has no interpreter pin")
+    admitted_exclusions(state.manifest, event.data)
+    excluded = dict(record.excluded_checks or {})
+    base_failing = {
+        check.check_id: frozenset(
+            case.case_id for case in check.oracle_result.cases if case.held_out and not case.passed
+        )
+        for check in record.checks
+        if check.oracle_result is not None and check.check_id not in excluded
+    }
     return replace(
         state,
         phase=Phase.ADMITTED,
-        excluded=admitted_exclusions(state.manifest, event.data),
+        excluded=excluded,
+        base_failing=base_failing,
         interpreter_sha256=record.interpreter_sha256,
         interpreter_realpath_sha256=record.interpreter_realpath_sha256,
         admitted_tiers=dict(record.check_tiers or {}),
@@ -508,16 +546,23 @@ def _bindings(state: VersionState, _event: BaseEvent, record: BindingsRecord) ->
         raise BoundaryOrderError("bindings must cite the boundary's frozen package")
     for item in record.checks:
         _require_assignable(state, item)
-    if record.phase != "final":
+    if record.phase != "resumed" and state.phase is not Phase.STARTED:
+        raise BoundaryOrderError("the run's bindings are recorded before its verification")
+    if record.phase == "repair":
         return state
-    if state.final_bindings:
+    if record.phase == "final" and state.final_bindings:
         raise BoundaryOrderError("final bindings already recorded")
     assert state.manifest is not None
     if {item.check_id for item in record.checks} != {c.check_id for c in state.manifest.checks}:
         raise BoundaryOrderError("final bindings bind every check of the frozen package once")
     runnable = any(check.tier in _RUNNABLE_TIERS for check in record.checks)
     bound = {item.check_id: item for item in record.checks}
-    return replace(state, final_bindings=True, runnable=runnable, bound=bound)
+    # A resumed run's bindings open its own verification and decision: the
+    # resumed decision is judged by what that verification recorded.
+    phase = Phase.RESUMING if record.phase == "resumed" else state.phase
+    return replace(
+        state, phase=phase, final_bindings=True, runnable=runnable, bound=bound, verifications=()
+    )
 
 
 def _candidate_verified(
@@ -528,7 +573,8 @@ def _candidate_verified(
     if not state.final_bindings:
         raise BoundaryOrderError("a candidate verification follows the final bindings it ran")
     _require_bound_run(state, record)
-    return replace(state, phase=Phase.VERIFIED, verifications=(*state.verifications, record))
+    phase = Phase.RESUMING if state.phase is Phase.RESUMING else Phase.VERIFIED
+    return replace(state, phase=phase, verifications=(*state.verifications, record))
 
 
 def _reconciled(state: VersionState, _event: BaseEvent, record: ReconciledRecord) -> VersionState:
@@ -539,10 +585,18 @@ def _reconciled(state: VersionState, _event: BaseEvent, record: ReconciledRecord
     return replace(state, phase=Phase.DECIDED)
 
 
-def _resumed(state: VersionState, _event: BaseEvent, _record: ResumedRecord) -> VersionState:
+def _resumed(state: VersionState, _event: BaseEvent, record: ResumedRecord) -> VersionState:
+    """A resumed decision is judged like a fresh one, by the resume's own recorded run.
+
+    Without resumed bindings (the resume had no live package) nothing was
+    verified: only undecided statuses, and uncovered where no admitted check
+    covers the criterion, are supported.
+    """
     if not state.frozen:
         raise BoundaryOrderError("a resumed decision must cite the boundary's frozen package")
-    return state
+    judged = state if state.phase is Phase.RESUMING else replace(state, bound={}, verifications=())
+    _require_supported_statuses(judged, record)
+    return replace(state, phase=Phase.DECIDED)
 
 
 # --------------------------------------------------------------------------
@@ -675,8 +729,10 @@ def _supported(state: VersionState, key: str, lost: Mapping[str, str]) -> tuple[
         elif check.check_id in manifest.oracle_checks:
             passed += 1
             oracle = execution.oracle_result
+            # Only a held-out case the base failed at admission verifies a pass.
+            failing = state.base_failing.get(check.check_id, frozenset())
             if check.role is CheckRole.REPRODUCTION and oracle is not None:
-                if any(case.held_out and case.passed for case in oracle.cases):
+                if any(c.held_out and c.passed and c.case_id in failing for c in oracle.cases):
                     held_out += 1
                     by_default += int(item is not None and item.tier is CheckTier.A)
     if failed:
@@ -703,10 +759,17 @@ results do not show, and no failure or undecided criterion recorded as one
 the package did not verify (which would hand it to the legacy verifier)."""
 
 
-def _require_supported_statuses(state: VersionState, record: ReconciledRecord) -> None:
+def _require_supported_statuses(
+    state: VersionState, record: ReconciledRecord | ResumedRecord
+) -> None:
     assert state.manifest is not None
+    keys = state.manifest.criterion_keys
     lost = criteria_without_admitted_check(state.manifest, state.excluded)
     for item in record.criteria:
+        # The frozen manifest lists the criteria in Seed order, the order the
+        # decision's root indexes follow.
+        if keys[item.root_ac_index] != item.criterion_key:
+            raise BoundaryOrderError("a decision's root index names another criterion")
         supported, declared = _supported(state, item.criterion_key, lost)
         if item.package_status not in _SUPPORTED_STATUSES[supported] or (
             item.package_status == "pass" and item.declared_binding_pass != declared
@@ -728,6 +791,11 @@ TRANSITIONS: Mapping[tuple[Phase, str], Transition] = {
     (Phase.ADMITTED, ACTOR_STARTED): _actor_started,
     (Phase.NO_PACKAGE, ACTOR_STARTED): _actor_started,
     (Phase.STARTED, BINDING_RECORDED): _bindings,
+    (Phase.VERIFIED, BINDING_RECORDED): _bindings,
+    (Phase.DECIDED, BINDING_RECORDED): _bindings,
+    (Phase.RESUMING, BINDING_RECORDED): _bindings,
+    (Phase.RESUMING, CANDIDATE_VERIFIED): _candidate_verified,
+    (Phase.RESUMING, ACCEPTANCE_RESUMED): _resumed,
     (Phase.STARTED, CANDIDATE_VERIFIED): _candidate_verified,
     (Phase.VERIFIED, CANDIDATE_VERIFIED): _candidate_verified,
     (Phase.STARTED, ACCEPTANCE_RECONCILED): _reconciled,
@@ -792,6 +860,8 @@ def _refusal(state: VersionState, kind: str) -> str:
         ACCEPTANCE_RECONCILED: (
             "acceptance already reconciled"
             if phase is Phase.DECIDED
+            else "a resumed run records a resumed decision"
+            if phase is Phase.RESUMING
             else "acceptance is decided only after the worker start"
         ),
         ACCEPTANCE_RESUMED: "a resumed decision needs an admitted package and a started worker",
@@ -1174,7 +1244,8 @@ class BoundaryLedger:
 
         Written on the run's own aggregate (``execution_id``), next to the
         record that the check package was on, because no boundary version
-        can be cited.
+        can be cited. Refused unless the run's recovery projection is
+        undecidable: with a usable boundary the resume cites its version.
         """
         if not execution_id or parse_boundary_version(execution_id) is not None:
             raise BoundaryOrderError("a resumed decision needs the run's execution id")
@@ -1187,6 +1258,14 @@ class BoundaryLedger:
             # package was on; a run with neither was off and has nothing to record.
             raise BoundaryOrderError(
                 "an undecided resume is recorded only for a run whose check package was on",
+                details={"execution_id": execution_id},
+            )
+        projection = recovery_projection(
+            execution_id, await self.events(execution_id), await self.run_versions(execution_id)
+        )
+        if not isinstance(projection, RecoveryUndecidable):
+            raise BoundaryOrderError(
+                "an undecided resume is recorded only when the run's boundary is unusable",
                 details={"execution_id": execution_id},
             )
         await self._store.append(event)
@@ -1321,6 +1400,10 @@ def _project(
         raise BoundaryOrderError("the run's enabled record is repeated")
     if run_events[0].type != CHECK_PACKAGE_ENABLED:
         raise BoundaryOrderError("a run record precedes the run's enabled record")
+    if len(records) > 1:
+        # The product records a run-level resume only when recovery was
+        # already undecidable, and nothing it records later makes it decidable.
+        raise BoundaryOrderError("the run was resumed once without a usable boundary")
     contract = enabled[0].contract
     if list(versions) != list(range(1, len(versions) + 1)):
         raise BoundaryOrderError("the run's boundary versions are not v1, v2, ... in order")

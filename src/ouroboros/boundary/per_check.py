@@ -6,6 +6,9 @@ package:
 
 - a reproduction check that passes on the base does not reproduce the bug
   (``repro_passes_on_base``);
+- a reproduction oracle whose every held-out case already passes on the base
+  cannot verify a pass, since only a held-out case can and one the base
+  passes shows nothing a candidate fixed (``held_out_not_discriminating``);
 - a preservation check that fails on the base does not describe behavior the
   base already has (``preservation_fails_on_base``).
 
@@ -45,21 +48,26 @@ from ouroboros.boundary.package import CheckRole
 from ouroboros.boundary.receipts import AdmissionResult, CheckStatus, PackageVerdict
 
 REPRO_PASSES_ON_BASE = "repro_passes_on_base"
+HELD_OUT_NOT_DISCRIMINATING = "held_out_not_discriminating"
 PRESERVATION_FAILS_ON_BASE = "preservation_fails_on_base"
 NO_ADMITTED_REPRODUCTION_CHECK = "no_admitted_reproduction_check"
 ALL_CHECKS_EXCLUDED = "all_checks_excluded"
 EXCLUDED_STATUS_HINT = "excluded"
 
-# Base classification reason (``admission._classify``) to exclusion reason.
+# Base classification reason (``admission._classify``) to exclusion reason:
+# each exclusion records what the base run showed.
 EXCLUSION_REASONS: dict[str, str] = {
     "reproduction_passed_on_base": REPRO_PASSES_ON_BASE,
+    HELD_OUT_NOT_DISCRIMINATING: HELD_OUT_NOT_DISCRIMINATING,
     "preservation_failed": PRESERVATION_FAILS_ON_BASE,
 }
 
-
-def exclusion_reason_for_role(role: CheckRole) -> str:
-    """The only exclusion reason a check of ``role`` can have."""
-    return REPRO_PASSES_ON_BASE if role is CheckRole.REPRODUCTION else PRESERVATION_FAILS_ON_BASE
+ROLE_EXCLUSION_REASONS: Mapping[CheckRole, frozenset[str]] = {
+    CheckRole.REPRODUCTION: frozenset({REPRO_PASSES_ON_BASE, HELD_OUT_NOT_DISCRIMINATING}),
+    CheckRole.PRESERVATION: frozenset({PRESERVATION_FAILS_ON_BASE}),
+}
+"""The exclusion reasons a check of each role can have
+(``held_out_not_discriminating`` only for a reproduction oracle)."""
 
 
 def per_check_admission(admission: AdmissionResult) -> AdmissionResult:
@@ -136,15 +144,17 @@ class LinkedChecks(Protocol):
 
 
 def criteria_without_admitted_check(
-    package: LinkedChecks, excluded: Mapping[str, str] | frozenset[str] | set[str]
+    package: LinkedChecks, excluded: Mapping[str, str]
 ) -> dict[str, str]:
     """Criteria that lose their authority to the exclusions, with the reason.
 
-    Only criteria the package linked to at least one check are considered
-    (criteria the constructor left uncovered keep their own reason). The
-    reason is the first exclusion reason of the criterion's checks, or
-    ``no_admitted_reproduction_check`` when an admitted preservation check
-    remains for a reproduction-type criterion.
+    ``excluded`` is the admission's ``excluded_checks`` (check id to its
+    recorded exclusion reason). Only criteria the package linked to at least
+    one check are considered (criteria the constructor left uncovered keep
+    their own reason). The reason is the recorded exclusion reason of the
+    criterion's first excluded check, or ``no_admitted_reproduction_check``
+    when an admitted preservation check remains for a reproduction-type
+    criterion.
     """
     excluded_ids = set(excluded)
     lost: dict[str, str] = {}
@@ -159,7 +169,7 @@ def criteria_without_admitted_check(
             continue
         kept = [check for check in linked if check.check_id not in excluded_ids]
         if not kept:
-            lost[key] = exclusion_reason_for_role(dropped[0].role)
+            lost[key] = excluded[dropped[0].check_id]
         elif any(check.role is CheckRole.REPRODUCTION for check in linked) and not any(
             check.role is CheckRole.REPRODUCTION for check in kept
         ):
@@ -171,12 +181,13 @@ __all__ = [
     "ALL_CHECKS_EXCLUDED",
     "EXCLUDED_STATUS_HINT",
     "EXCLUSION_REASONS",
+    "HELD_OUT_NOT_DISCRIMINATING",
     "LinkedChecks",
     "NO_ADMITTED_REPRODUCTION_CHECK",
     "PRESERVATION_FAILS_ON_BASE",
     "REPRO_PASSES_ON_BASE",
+    "ROLE_EXCLUSION_REASONS",
     "criteria_without_admitted_check",
-    "exclusion_reason_for_role",
     "excluded_check_ids",
     "per_check_admission",
 ]

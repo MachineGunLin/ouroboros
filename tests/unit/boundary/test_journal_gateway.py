@@ -235,13 +235,40 @@ def test_a_malformed_run_level_resume_makes_recovery_undecidable(
     assert isinstance(projection, RecoveryUndecidable)
 
 
-def test_a_well_formed_run_level_resume_is_part_of_a_decidable_history(
+def test_a_well_formed_run_level_resume_on_a_usable_boundary_makes_recovery_undecidable(
     package, base_checkout
 ) -> None:
+    # The product records a run-level resume only when recovery was already
+    # undecidable; appended to a usable history it is one it could not write.
     resumed = _run_resumed(_undecided_resume(package.criterion_keys))
     validate_record(resumed, None)
-    projection = recovery_projection(RUN, [*_enabled(), resumed], _versions(package, base_checkout))
-    assert isinstance(projection, RecoveryBound)
+    versions = _versions(package, base_checkout)
+    assert isinstance(recovery_projection(RUN, _enabled(), versions), RecoveryBound)
+    projection = recovery_projection(RUN, [*_enabled(), resumed], versions)
+    assert isinstance(projection, RecoveryUndecidable)
+
+
+async def test_a_run_level_resume_is_refused_while_the_boundary_is_usable(
+    package, base_checkout
+) -> None:
+    from ouroboros.boundary.events import ResumedPayload
+
+    store = EventStore("sqlite+aiosqlite:///:memory:")
+    await store.initialize()
+    try:
+        ledger = BoundaryLedger(store)
+        await ledger.record_check_package_enabled(RUN, CONTRACT)
+        await ledger.record_package_frozen(VERSION, package)
+        await ledger.record_admission(VERSION, admission_receipt(package, base_checkout))
+        await ledger.record_actor_started(RUN, [VERSION])
+        data = _undecided_resume(package.criterion_keys)
+        payload = ResumedPayload.model_validate(
+            {k: v for k, v in data.items() if k != "package_id"}
+        )
+        with pytest.raises(BoundaryOrderError, match="unusable"):
+            await ledger.record_resumed_undecided(RUN, payload=payload)
+    finally:
+        await store.close()
 
 
 def test_a_malformed_enabled_record_makes_recovery_undecidable(package, base_checkout) -> None:
