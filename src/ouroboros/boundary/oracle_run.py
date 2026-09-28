@@ -356,7 +356,12 @@ async def reap_check_process(process: CheckProcess, deadline: float) -> int | No
     it was not reported by then.
     """
     kill_check_group(process)
-    process.transport.close()
+    # Only the pipes: closing the whole transport would poll the leader
+    # from here and race the child watcher for its exit status.
+    for fd in (0, 1, 2):
+        pipe = process.transport.get_pipe_transport(fd)
+        if pipe is not None:
+            pipe.close()
     loop = asyncio.get_running_loop()
     limit = deadline + REAP_MARGIN_SECONDS
     try:
