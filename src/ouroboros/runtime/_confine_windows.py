@@ -1,0 +1,1082 @@
+"""Run one command inside a per-run AppContainer, then revoke its write grants.
+
+Run as a standalone script (standard library and ``ctypes`` only), never
+imported into the controller for a run:
+
+    python -I -S -B _confine_windows.py --appcontainer NAME --manifest PATH
+        [--network] [--read PATH ...] --root DIR DEV INO ... -- ARGV...
+
+It is the Windows backend of ``ouroboros.runtime.exec_sandbox``. Unlike the
+POSIX helper (``_confine_exec.py``), which confines itself and execs, an
+AppContainer is applied by the parent when it creates the process, so this
+launcher stays outside the container, starts the command inside it, waits for
+it, and exits with its status. It is started with the fixed bootstrap
+environment; the command's environment arrives as JSON in
+``OUROBOROS_SANDBOX_COMMAND_ENV`` and takes effect only in the confined
+process. In order:
+
+1. Each writable root (``--root DIR DEV INO``) is opened without following a
+   reparse point and must still be the directory ``confine`` validated (same
+   volume and file id), or nothing runs. The handles stay open, without
+   delete sharing, until the launcher exits, so no root can be renamed or
+   replaced while the command runs.
+2. The AppContainer SID is derived from ``NAME``, a fresh random name per
+   run (no profile is created, so there is no profile folder or registry
+   hive the container could write to).
+3. Each ``--read`` path the container cannot already read is granted read
+   and execute for the Ouroboros read capability (``READ_CAPABILITY``), a
+   stable capability SID every run's container holds. That grant is
+   persistent: it is recorded in ``--manifest`` before it is applied and
+   removed only by ``remove_read_grants``.
+4. Each root is granted modify (inherited by everything beneath it) for this
+   run's AppContainer SID only, through the verified handle.
+5. No regular file beneath a root may have another hard link (it may be
+   outside the roots), or nothing runs.
+6. The command is created suspended in the AppContainer with no network
+   capability (``--network`` adds the client and server capabilities),
+   inheriting exactly the launcher's standard handles, then assigned to a
+   Job Object that kills every process in it when its last handle closes,
+   then resumed.
+7. When the command exits, the rest of its process tree is terminated and
+   the per-run grants are revoked (on every path this launcher controls:
+   normal exit, failure of the command, failure of any step above). If the
+   launcher itself is terminated, its job handle closes and the kernel
+   kills the whole tree; the per-run grants then remain on the roots, whose
+   caller deletes them, and name a SID that no process holds any more.
+
+Exit status: the command's, or 125 when the sandbox could not be applied,
+126 or 127 when the command could not be started.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+COMMAND_ENV_VARIABLE = "OUROBOROS_SANDBOX_COMMAND_ENV"
+READ_CAPABILITY = "ouroborosExecSandboxRead"
+"""Name of the capability SID that read grants are made to (persistent)."""
+
+EXIT_SANDBOX_FAILED = 125
+EXIT_NOT_EXECUTABLE = 126
+EXIT_NOT_FOUND = 127
+
+# Win32 constants (winnt.h, winbase.h, accctrl.h).
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_SYNCHRONIZE = 0x00100000
+_FILE_READ_ATTRIBUTES = 0x0080
+_FILE_SHARE_READ = 0x1
+_FILE_SHARE_WRITE = 0x2
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_TAG_INFO = 9
+_FILE_ID_INFO = 18
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x4
+_GRANT_ACCESS = 1
+_REVOKE_ACCESS = 4
+_NO_INHERITANCE = 0
+_SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3
+_TRUSTEE_IS_SID = 0
+_TRUSTEE_IS_UNKNOWN = 0
+_ACCESS_ALLOWED_ACE_TYPE = 0
+_INHERIT_ONLY_ACE = 0x08
+_ERROR_SUCCESS = 0
+
+FILE_READ_EXECUTE = 0x001200A9
+"""``FILE_GENERIC_READ | FILE_GENERIC_EXECUTE``: what ``--read`` grants."""
+FILE_MODIFY = 0x001301BF
+"""Read, write, execute and delete, without ``WRITE_DAC``/``WRITE_OWNER``."""
+
+_SE_GROUP_ENABLED = 0x4
+# Well-known capability SIDs (S-1-15-3-1, -2, -3).
+_NETWORK_CAPABILITIES = ("S-1-15-3-1", "S-1-15-3-2", "S-1-15-3-3")
+_ALL_APPLICATION_PACKAGES = "S-1-15-2-1"
+
+_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+_PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_STARTF_USESTDHANDLES = 0x00000100
+_HANDLE_FLAG_INHERIT = 0x1
+_STD_HANDLES = (-10, -11, -12)  # input, output, error
+_INFINITE = 0xFFFFFFFF
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class SandboxError(Exception):
+    """The AppContainer could not be set up; the command must not run."""
+
+
+def _require_windows() -> None:
+    if sys.platform != "win32":
+        raise SandboxError("the AppContainer backend runs only on Windows")
+
+
+class _Win32:
+    """The DLLs this launcher calls, loaded by absolute path from System32."""
+
+    def __init__(self) -> None:
+        _require_windows()
+        from ctypes import wintypes
+
+        # kernel32 is a KnownDLL: the loader maps it from System32 whatever
+        # the name. Every other DLL is loaded by its absolute System32 path.
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buffer = ctypes.create_unicode_buffer(260)
+        if not self.kernel32.GetSystemDirectoryW(buffer, len(buffer)):
+            raise SandboxError("GetSystemDirectoryW failed")
+        system = buffer.value
+        self.advapi32 = ctypes.WinDLL(os.path.join(system, "advapi32.dll"), use_last_error=True)
+        self.userenv = ctypes.WinDLL(os.path.join(system, "userenv.dll"), use_last_error=True)
+        self.kernelbase = ctypes.WinDLL(os.path.join(system, "kernelbase.dll"), use_last_error=True)
+        k, a = self.kernel32, self.advapi32
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        k.GetStdHandle.restype = wintypes.HANDLE
+        k.GetStdHandle.argtypes = [wintypes.DWORD]
+        k.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k.ResumeThread.restype = wintypes.DWORD
+        k.ResumeThread.argtypes = [wintypes.HANDLE]
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k.InitializeProcThreadAttributeList.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        k.UpdateProcThreadAttribute.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        k.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+        k.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        k.LocalFree.restype = ctypes.c_void_p
+        k.LocalFree.argtypes = [ctypes.c_void_p]
+        a.GetSecurityInfo.restype = wintypes.DWORD
+        a.GetSecurityInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        a.SetSecurityInfo.restype = wintypes.DWORD
+        a.SetSecurityInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        a.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        a.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        a.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        a.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        a.SetEntriesInAclW.restype = wintypes.DWORD
+        a.SetEntriesInAclW.argtypes = [
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        a.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        a.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        a.IsValidSid.argtypes = [ctypes.c_void_p]
+        a.GetLengthSid.restype = wintypes.DWORD
+        a.GetLengthSid.argtypes = [ctypes.c_void_p]
+        a.FreeSid.restype = ctypes.c_void_p
+        a.FreeSid.argtypes = [ctypes.c_void_p]
+        a.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        a.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        a.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_wchar_p),
+            ctypes.c_void_p,
+        ]
+        self.userenv.DeriveAppContainerSidFromAppContainerName.restype = ctypes.c_long
+        self.userenv.DeriveAppContainerSidFromAppContainerName.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self.kernelbase.DeriveCapabilitySidsFromName.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+
+    @staticmethod
+    def error(what: str, code: int | None = None) -> SandboxError:
+        code = ctypes.get_last_error() if code is None else code
+        return SandboxError(f"{what} failed: {ctypes.FormatError(code).strip()} ({code})")  # type: ignore[attr-defined]
+
+
+class Sid:
+    """A SID owned by this process, copied into a buffer it frees itself."""
+
+    def __init__(self, api: _Win32, pointer: int) -> None:
+        length = api.advapi32.GetLengthSid(pointer)
+        self.buffer = ctypes.create_string_buffer(ctypes.string_at(pointer, length), length)
+        self.api = api
+
+    @property
+    def pointer(self) -> int:
+        return ctypes.addressof(self.buffer)
+
+    def __str__(self) -> str:
+        text = ctypes.c_wchar_p()
+        if not self.api.advapi32.ConvertSidToStringSidW(self.pointer, ctypes.byref(text)):
+            raise self.api.error("ConvertSidToStringSidW")
+        try:
+            return str(text.value)
+        finally:
+            self.api.kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def sid_from_string(api: _Win32, text: str) -> Sid:
+    pointer = ctypes.c_void_p()
+    if not api.advapi32.ConvertStringSidToSidW(text, ctypes.byref(pointer)):
+        raise api.error(f"ConvertStringSidToSidW({text})")
+    try:
+        return Sid(api, pointer.value or 0)
+    finally:
+        api.kernel32.LocalFree(pointer)
+
+
+def appcontainer_sid(api: _Win32, name: str) -> Sid:
+    """The AppContainer SID for ``name``, derived without creating a profile."""
+    pointer = ctypes.c_void_p()
+    result = api.userenv.DeriveAppContainerSidFromAppContainerName(name, ctypes.byref(pointer))
+    if result != 0 or not pointer.value:
+        raise api.error(f"DeriveAppContainerSidFromAppContainerName({name!r})", result & 0xFFFF)
+    try:
+        return Sid(api, pointer.value)
+    finally:
+        api.advapi32.FreeSid(pointer)
+
+
+def capability_sid(api: _Win32, name: str = READ_CAPABILITY) -> Sid:
+    """The capability SID (``S-1-15-3-1024-...``) for capability ``name``."""
+    from ctypes import wintypes
+
+    groups = ctypes.POINTER(ctypes.c_void_p)()
+    capabilities = ctypes.POINTER(ctypes.c_void_p)()
+    group_count, capability_count = wintypes.DWORD(), wintypes.DWORD()
+    if not api.kernelbase.DeriveCapabilitySidsFromName(
+        name,
+        ctypes.byref(groups),
+        ctypes.byref(group_count),
+        ctypes.byref(capabilities),
+        ctypes.byref(capability_count),
+    ):
+        raise api.error(f"DeriveCapabilitySidsFromName({name!r})")
+    try:
+        if capability_count.value < 1:
+            raise SandboxError(f"DeriveCapabilitySidsFromName({name!r}) returned no SID")
+        return Sid(api, capabilities[0])
+    finally:
+        for array, count in ((groups, group_count.value), (capabilities, capability_count.value)):
+            for index in range(count):
+                api.kernel32.LocalFree(array[index])
+            api.kernel32.LocalFree(ctypes.cast(array, ctypes.c_void_p))
+
+
+class _TrusteeW(ctypes.Structure):
+    _fields_ = [
+        ("pMultipleTrustee", ctypes.c_void_p),
+        ("MultipleTrusteeOperation", ctypes.c_int),
+        ("TrusteeForm", ctypes.c_int),
+        ("TrusteeType", ctypes.c_int),
+        ("ptstrName", ctypes.c_void_p),
+    ]
+
+
+class _ExplicitAccessW(ctypes.Structure):
+    _fields_ = [
+        ("grfAccessPermissions", ctypes.c_uint32),
+        ("grfAccessMode", ctypes.c_int),
+        ("grfInheritance", ctypes.c_uint32),
+        ("Trustee", _TrusteeW),
+    ]
+
+
+class _AceHeader(ctypes.Structure):
+    _fields_ = [
+        ("AceType", ctypes.c_ubyte),
+        ("AceFlags", ctypes.c_ubyte),
+        ("AceSize", ctypes.c_ushort),
+    ]
+
+
+class _AclHeader(ctypes.Structure):
+    _fields_ = [
+        ("AclRevision", ctypes.c_ubyte),
+        ("Sbz1", ctypes.c_ubyte),
+        ("AclSize", ctypes.c_ushort),
+        ("AceCount", ctypes.c_ushort),
+        ("Sbz2", ctypes.c_ushort),
+    ]
+
+
+def _entries(dacl: int) -> list[tuple[int, int, int, int]]:
+    """``(type, flags, mask, sid pointer)`` of each ACE in ``dacl``."""
+    if not dacl:
+        return []
+    header = _AclHeader.from_address(dacl)
+    result = []
+    for index in range(header.AceCount):
+        ace = ctypes.c_void_p()
+        if not _api().advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+            raise _api().error("GetAce")
+        head = _AceHeader.from_address(ace.value or 0)
+        mask = ctypes.c_uint32.from_address((ace.value or 0) + 4).value
+        result.append((head.AceType, head.AceFlags, mask, (ace.value or 0) + 8))
+    return result
+
+
+def _grants(dacl: int, sids: list[Sid], access: int, *, subtree: bool) -> bool:
+    """Whether ``dacl`` allows ``access`` on this object to one of ``sids``.
+
+    With ``subtree``, the allowing entry must also be inherited by every
+    file and directory beneath the object.
+    """
+    for kind, flags, mask, sid in _entries(dacl):
+        if kind != _ACCESS_ALLOWED_ACE_TYPE or flags & _INHERIT_ONLY_ACE:
+            continue
+        if subtree and flags & _SUB_CONTAINERS_AND_OBJECTS_INHERIT != (
+            _SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        ):
+            continue
+        if mask & access == access and any(_api().advapi32.EqualSid(sid, s.pointer) for s in sids):
+            return True
+    return False
+
+
+def _names(dacl: int, sid: Sid) -> bool:
+    """Whether any ACE in ``dacl`` names ``sid``."""
+    return any(_api().advapi32.EqualSid(entry[3], sid.pointer) for entry in _entries(dacl))
+
+
+def _new_dacl(dacl: int, sid: Sid, mode: int, access: int, inheritance: int) -> ctypes.c_void_p:
+    entry = _ExplicitAccessW(
+        grfAccessPermissions=access,
+        grfAccessMode=mode,
+        grfInheritance=inheritance,
+        Trustee=_TrusteeW(
+            TrusteeForm=_TRUSTEE_IS_SID, TrusteeType=_TRUSTEE_IS_UNKNOWN, ptstrName=sid.pointer
+        ),
+    )
+    new = ctypes.c_void_p()
+    code = _api().advapi32.SetEntriesInAclW(1, ctypes.byref(entry), dacl, ctypes.byref(new))
+    if code != _ERROR_SUCCESS:
+        raise _api().error("SetEntriesInAclW", code)
+    return new
+
+
+def _is_directory(path: str) -> bool:
+    return os.path.isdir(path) and not os.path.islink(path) and not os.path.isjunction(path)
+
+
+def dacl_sddl(path: str) -> str:
+    """The DACL of ``path`` in SDDL (diagnostics and tests)."""
+    api = _api()
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = api.advapi32.GetNamedSecurityInfoW(
+        path,
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if code != _ERROR_SUCCESS:
+        raise api.error(f"GetNamedSecurityInfoW({path})", code)
+    try:
+        text = ctypes.c_wchar_p()
+        if not api.advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, 1, _DACL_SECURITY_INFORMATION, ctypes.byref(text), None
+        ):
+            raise api.error("ConvertSecurityDescriptorToStringSecurityDescriptorW")
+        try:
+            return str(text.value)
+        finally:
+            api.kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        api.kernel32.LocalFree(descriptor)
+
+
+def _update_named(path: str, sid: Sid, mode: int, access: int) -> bool:
+    """Grant or revoke ``sid`` on ``path`` by name; False when this user may not.
+
+    Returns False (and changes nothing) when the DACL cannot be read or
+    written by this user, as for system directories.
+    """
+    api = _api()
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = api.advapi32.GetNamedSecurityInfoW(
+        path,
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if code != _ERROR_SUCCESS:
+        return False
+    try:
+        if mode == _REVOKE_ACCESS and not _names(dacl.value or 0, sid):
+            return True
+        inheritance = (
+            _SUB_CONTAINERS_AND_OBJECTS_INHERIT if _is_directory(path) else _NO_INHERITANCE
+        )
+        new = _new_dacl(dacl.value or 0, sid, mode, access, inheritance)
+        try:
+            code = api.advapi32.SetNamedSecurityInfoW(
+                path, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION, None, None, new, None
+            )
+        finally:
+            api.kernel32.LocalFree(new)
+        return code == _ERROR_SUCCESS
+    finally:
+        api.kernel32.LocalFree(descriptor)
+
+
+def readable_by_containers(path: str, capability: Sid) -> bool:
+    """Whether ``path`` already lets every AppContainer, or the read capability, read it."""
+    api = _api()
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    code = api.advapi32.GetNamedSecurityInfoW(
+        path,
+        _SE_FILE_OBJECT,
+        _DACL_SECURITY_INFORMATION,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if code != _ERROR_SUCCESS:
+        return False
+    try:
+        everyone = sid_from_string(api, _ALL_APPLICATION_PACKAGES)
+        return _grants(
+            dacl.value or 0, [everyone, capability], FILE_READ_EXECUTE, subtree=_is_directory(path)
+        )
+    finally:
+        api.kernel32.LocalFree(descriptor)
+
+
+def grant_read(paths: list[str], manifest: str, capability: Sid) -> list[str]:
+    """Grant the read capability on each path containers cannot already read.
+
+    Each path is appended to ``manifest`` before its DACL changes, so a
+    grant is never left unrecorded. A path whose DACL this user may not
+    change is left alone (the command may then fail to read it: fail closed).
+    Returns the paths granted.
+    """
+    granted = []
+    for path in paths:
+        if not os.path.exists(path) or readable_by_containers(path, capability):
+            continue
+        os.makedirs(os.path.dirname(manifest), exist_ok=True)
+        with open(manifest, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"path": path, "capability": READ_CAPABILITY}) + "\n")
+        if _update_named(path, capability, _GRANT_ACCESS, FILE_READ_EXECUTE):
+            granted.append(path)
+    return granted
+
+
+def remove_read_grants(manifest: str) -> list[str]:
+    """Remove every ACE for the read capability from each path in ``manifest``.
+
+    The manifest is deleted once every recorded path that still exists has
+    been cleaned; a path whose DACL cannot be changed keeps it. Returns the
+    paths cleaned.
+    """
+    if not os.path.exists(manifest):
+        return []
+    capability = capability_sid(_api())
+    paths: list[str] = []
+    with open(manifest, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                path = json.loads(line)["path"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(path, str) and path not in paths:
+                paths.append(path)
+    cleaned, failed = [], []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        if _update_named(path, capability, _REVOKE_ACCESS, 0):
+            cleaned.append(path)
+        else:
+            failed.append(path)
+    if not failed:
+        os.remove(manifest)
+    return cleaned
+
+
+class _FileIdInfo(ctypes.Structure):
+    _fields_ = [("VolumeSerialNumber", ctypes.c_uint64), ("FileId", ctypes.c_ubyte * 16)]
+
+
+class _FileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32)]
+
+
+class Root:
+    """A writable root opened by handle and verified against ``confine``'s claim."""
+
+    def __init__(self, path: str, device: int, inode: int) -> None:
+        api = _api()
+        self.path = path
+        handle = api.kernel32.CreateFileW(
+            path,
+            _READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            raise api.error(f"writable root {path} cannot be opened")
+        self.handle = handle
+        try:
+            tag = _FileAttributeTagInfo()
+            identity = _FileIdInfo()
+            if not api.kernel32.GetFileInformationByHandleEx(
+                handle, _FILE_ATTRIBUTE_TAG_INFO, ctypes.byref(tag), ctypes.sizeof(tag)
+            ) or not api.kernel32.GetFileInformationByHandleEx(
+                handle, _FILE_ID_INFO, ctypes.byref(identity), ctypes.sizeof(identity)
+            ):
+                raise api.error(f"GetFileInformationByHandleEx({path})")
+            if not tag.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY or (
+                tag.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise SandboxError(f"writable root {path} is not a plain directory")
+            file_id = int.from_bytes(bytes(identity.FileId), "little")
+            if (identity.VolumeSerialNumber, file_id) != (device, inode):
+                raise SandboxError(f"writable root {path} is not the directory that was confined")
+        except BaseException:
+            api.kernel32.CloseHandle(handle)
+            raise
+
+    def update(self, sid: Sid, mode: int, access: int) -> None:
+        """Grant (inherited by everything beneath) or revoke ``sid`` through the handle."""
+        api = _api()
+        dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+        code = api.advapi32.GetSecurityInfo(
+            self.handle,
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if code != _ERROR_SUCCESS:
+            raise api.error(f"GetSecurityInfo({self.path})", code)
+        try:
+            if mode == _REVOKE_ACCESS and not _names(dacl.value or 0, sid):
+                return
+            new = _new_dacl(dacl.value or 0, sid, mode, access, _SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+            try:
+                code = api.advapi32.SetSecurityInfo(
+                    self.handle, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION, None, None, new, None
+                )
+            finally:
+                api.kernel32.LocalFree(new)
+            if code != _ERROR_SUCCESS:
+                raise api.error(f"SetSecurityInfo({self.path})", code)
+        finally:
+            api.kernel32.LocalFree(descriptor)
+
+    def close(self) -> None:
+        _api().kernel32.CloseHandle(self.handle)
+
+
+def refuse_root_aliases(roots: list[Root]) -> None:
+    """Refuse when a regular file beneath a root has another hard link.
+
+    The other link may be outside the roots, and the grant made on the root
+    would let the command change that file. Links (symbolic links,
+    junctions) are not descended into; the walk must be complete, so an
+    entry that cannot be examined refuses too. The roots are held open
+    without delete sharing, so each walk starts at the verified directory.
+    """
+
+    def unreadable(error: OSError) -> None:
+        raise SandboxError(f"a writable root cannot be fully inspected for aliases: {error}")
+
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root.path, onerror=unreadable):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not os.path.isjunction(os.path.join(dirpath, name))
+                and not os.path.islink(os.path.join(dirpath, name))
+            ]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                try:
+                    status = os.lstat(path)
+                except OSError as exc:
+                    unreadable(exc)
+                if not os.path.islink(path) and status.st_nlink > 1:
+                    raise SandboxError(
+                        f"{path} in a writable root has {status.st_nlink} hard links"
+                    )
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.c_uint32)]
+
+
+class _SecurityCapabilities(ctypes.Structure):
+    _fields_ = [
+        ("AppContainerSid", ctypes.c_void_p),
+        ("Capabilities", ctypes.POINTER(_SidAndAttributes)),
+        ("CapabilityCount", ctypes.c_uint32),
+        ("Reserved", ctypes.c_uint32),
+    ]
+
+
+class _StartupInfoW(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", ctypes.c_uint32),
+        ("dwY", ctypes.c_uint32),
+        ("dwXSize", ctypes.c_uint32),
+        ("dwYSize", ctypes.c_uint32),
+        ("dwXCountChars", ctypes.c_uint32),
+        ("dwYCountChars", ctypes.c_uint32),
+        ("dwFillAttribute", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("wShowWindow", ctypes.c_uint16),
+        ("cbReserved2", ctypes.c_uint16),
+        ("lpReserved2", ctypes.c_void_p),
+        ("hStdInput", ctypes.c_void_p),
+        ("hStdOutput", ctypes.c_void_p),
+        ("hStdError", ctypes.c_void_p),
+    ]
+
+
+class _StartupInfoExW(ctypes.Structure):
+    _fields_ = [("StartupInfo", _StartupInfoW), ("lpAttributeList", ctypes.c_void_p)]
+
+
+class _ProcessInformation(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", ctypes.c_void_p),
+        ("hThread", ctypes.c_void_p),
+        ("dwProcessId", ctypes.c_uint32),
+        ("dwThreadId", ctypes.c_uint32),
+    ]
+
+
+class _BasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _ExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimitInformation),
+        ("IoInfo", ctypes.c_uint64 * 6),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def kill_on_close_job() -> int:
+    """A Job Object that terminates every process in it when its last handle closes."""
+    api = _api()
+    job = api.kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise api.error("CreateJobObjectW")
+    limits = _ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not api.kernel32.SetInformationJobObject(
+        job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits), ctypes.sizeof(limits)
+    ):
+        error = api.error("SetInformationJobObject")
+        api.kernel32.CloseHandle(job)
+        raise error
+    return int(job)
+
+
+def environment_block(env: dict[str, str]) -> ctypes.Array[ctypes.c_wchar]:
+    """``env`` as a Unicode environment block, sorted case-insensitively."""
+    folded: dict[str, tuple[str, str]] = {}
+    for name, value in env.items():
+        if not name or "=" in name[1:] or "\0" in name or "\0" in value:
+            raise SandboxError(f"environment variable {name!r} cannot be passed on Windows")
+        folded[name.upper()] = (name, value)
+    entries = [f"{name}={value}" for _key, (name, value) in sorted(folded.items())]
+    text = "\0".join(entries) + "\0\0" if entries else "\0\0"
+    return ctypes.create_unicode_buffer(text, len(text))
+
+
+def resolve_executable(command: str, env: dict[str, str]) -> str | None:
+    """The file ``command`` names, searched on the command's ``PATH`` and ``PATHEXT``."""
+    search = next((value for name, value in env.items() if name.upper() == "PATH"), None)
+    pathext = next((value for name, value in env.items() if name.upper() == "PATHEXT"), None)
+    if pathext is not None:
+        os.environ["PATHEXT"] = pathext
+    found = shutil.which(command, path=search)
+    return os.path.abspath(found) if found else None
+
+
+def _inheritable_std_handles() -> list[int | None]:
+    api = _api()
+    handles: list[int | None] = []
+    for which in _STD_HANDLES:
+        handle = api.kernel32.GetStdHandle(which & 0xFFFFFFFF)
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            handles.append(None)
+            continue
+        if not api.kernel32.SetHandleInformation(
+            handle, _HANDLE_FLAG_INHERIT, _HANDLE_FLAG_INHERIT
+        ):
+            handles.append(None)
+            continue
+        handles.append(int(handle))
+    return handles
+
+
+def launch(
+    executable: str,
+    argv: list[str],
+    env: dict[str, str],
+    container: Sid,
+    capabilities: list[Sid],
+    job: int,
+) -> tuple[int, int]:
+    """Create ``argv`` suspended in the AppContainer, put it in ``job``, resume it.
+
+    Returns the process and thread handles. It inherits exactly the
+    launcher's standard handles (``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``).
+    """
+    api = _api()
+    entries = (_SidAndAttributes * max(len(capabilities), 1))()
+    for index, capability in enumerate(capabilities):
+        entries[index] = _SidAndAttributes(capability.pointer, _SE_GROUP_ENABLED)
+    security = _SecurityCapabilities(
+        AppContainerSid=container.pointer,
+        Capabilities=ctypes.cast(entries, ctypes.POINTER(_SidAndAttributes))
+        if capabilities
+        else None,
+        CapabilityCount=len(capabilities),
+    )
+    std = _inheritable_std_handles()
+    unique = sorted({handle for handle in std if handle is not None})
+    handle_list = (ctypes.c_void_p * max(len(unique), 1))(*unique)
+    attribute_count = 2 if unique else 1
+    size = ctypes.c_size_t()
+    api.kernel32.InitializeProcThreadAttributeList(None, attribute_count, 0, ctypes.byref(size))
+    attributes = ctypes.create_string_buffer(size.value)
+    if not api.kernel32.InitializeProcThreadAttributeList(
+        attributes, attribute_count, 0, ctypes.byref(size)
+    ):
+        raise api.error("InitializeProcThreadAttributeList")
+    try:
+        if not api.kernel32.UpdateProcThreadAttribute(
+            attributes,
+            0,
+            _PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            ctypes.byref(security),
+            ctypes.sizeof(security),
+            None,
+            None,
+        ):
+            raise api.error("UpdateProcThreadAttribute(SECURITY_CAPABILITIES)")
+        if unique and not api.kernel32.UpdateProcThreadAttribute(
+            attributes,
+            0,
+            _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handle_list,
+            ctypes.sizeof(ctypes.c_void_p) * len(unique),
+            None,
+            None,
+        ):
+            raise api.error("UpdateProcThreadAttribute(HANDLE_LIST)")
+        startup = _StartupInfoExW()
+        startup.StartupInfo.cb = ctypes.sizeof(startup)
+        startup.lpAttributeList = ctypes.addressof(attributes)
+        if unique:
+            startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
+            startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput = std[0], std[1]
+            startup.StartupInfo.hStdError = std[2]
+        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+        block = environment_block(env)
+        info = _ProcessInformation()
+        if not api.kernel32.CreateProcessW(
+            executable,
+            command_line,
+            None,
+            None,
+            bool(unique),
+            _CREATE_SUSPENDED | _CREATE_UNICODE_ENVIRONMENT | _EXTENDED_STARTUPINFO_PRESENT,
+            block,
+            None,
+            ctypes.byref(startup),
+            ctypes.byref(info),
+        ):
+            code = ctypes.get_last_error()
+            raise OSError(0, ctypes.FormatError(code).strip(), executable, code)  # type: ignore[attr-defined]
+    finally:
+        api.kernel32.DeleteProcThreadAttributeList(attributes)
+    if not api.kernel32.AssignProcessToJobObject(job, info.hProcess):
+        error = api.error("AssignProcessToJobObject")
+        api.kernel32.TerminateProcess(info.hProcess, EXIT_SANDBOX_FAILED)
+        api.kernel32.CloseHandle(info.hThread)
+        api.kernel32.CloseHandle(info.hProcess)
+        raise error
+    if api.kernel32.ResumeThread(info.hThread) == 0xFFFFFFFF:
+        error = api.error("ResumeThread")
+        api.kernel32.TerminateProcess(info.hProcess, EXIT_SANDBOX_FAILED)
+        api.kernel32.CloseHandle(info.hThread)
+        api.kernel32.CloseHandle(info.hProcess)
+        raise error
+    return int(info.hProcess), int(info.hThread)
+
+
+def wait(process: int) -> int:
+    """Wait for ``process`` and return its exit status as a signed 32-bit value."""
+    from ctypes import wintypes
+
+    api = _api()
+    api.kernel32.WaitForSingleObject(process, _INFINITE)
+    status = wintypes.DWORD()
+    if not api.kernel32.GetExitCodeProcess(process, ctypes.byref(status)):
+        raise api.error("GetExitCodeProcess")
+    code = status.value
+    return code - (1 << 32) if code >= 1 << 31 else code
+
+
+_API: _Win32 | None = None
+
+
+def _api() -> _Win32:
+    global _API
+    if _API is None:
+        _API = _Win32()
+    return _API
+
+
+def _parse(arguments: list[str]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {"network": False, "read": [], "roots": []}
+    index = 0
+    while index < len(arguments) and arguments[index] != "--":
+        option = arguments[index]
+        if option == "--network":
+            parsed["network"] = True
+            index += 1
+        elif option in ("--appcontainer", "--manifest", "--read") and index + 1 < len(arguments):
+            value = arguments[index + 1]
+            if option == "--read":
+                parsed["read"].append(value)
+            else:
+                parsed[option[2:]] = value
+            index += 2
+        elif option == "--root" and index + 3 < len(arguments):
+            try:
+                device, inode = int(arguments[index + 2]), int(arguments[index + 3])
+            except ValueError:
+                raise SandboxError("--root DEV and INO must be integers") from None
+            parsed["roots"].append((arguments[index + 1], device, inode))
+            index += 4
+        else:
+            raise SandboxError(f"unexpected argument {option!r}")
+    if index + 1 >= len(arguments):
+        raise SandboxError(
+            "usage: --appcontainer NAME --manifest PATH [--network] [--read PATH ...] "
+            "--root DIR DEV INO ... -- ARGV..."
+        )
+    if "appcontainer" not in parsed or "manifest" not in parsed or not parsed["roots"]:
+        raise SandboxError("--appcontainer, --manifest and at least one --root are required")
+    parsed["argv"] = arguments[index + 1 :]
+    return parsed
+
+
+def _command_environment() -> dict[str, str]:
+    raw = os.environ.get(COMMAND_ENV_VARIABLE)
+    if raw is None:
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not set")
+    try:
+        env = json.loads(raw)
+    except ValueError as exc:
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not JSON: {exc}") from None
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+    ):
+        raise SandboxError(f"{COMMAND_ENV_VARIABLE} is not a string mapping")
+    return env
+
+
+def main(arguments: list[str]) -> int:
+    roots: list[Root] = []
+    granted: list[Root] = []
+    container: Sid | None = None
+    job: int | None = None
+    try:
+        try:
+            parsed = _parse(arguments)
+            env = _command_environment()
+            api = _api()
+            for path, device, inode in parsed["roots"]:
+                roots.append(Root(path, device, inode))
+            container = appcontainer_sid(api, parsed["appcontainer"])
+            reader = capability_sid(api)
+            grant_read(parsed["read"], parsed["manifest"], reader)
+            for root in roots:
+                granted.append(root)
+                root.update(container, _GRANT_ACCESS, FILE_MODIFY)
+            refuse_root_aliases(roots)
+            job = kill_on_close_job()
+            capabilities = [reader]
+            if parsed["network"]:
+                capabilities += [sid_from_string(api, text) for text in _NETWORK_CAPABILITIES]
+        except (SandboxError, OSError) as exc:
+            sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
+            return EXIT_SANDBOX_FAILED
+        command = parsed["argv"]
+        executable = resolve_executable(command[0], env)
+        if executable is None:
+            sys.stderr.write(f"ouroboros exec sandbox: {command[0]}: not found\n")
+            return EXIT_NOT_FOUND
+        try:
+            process, thread = launch(executable, command, env, container, capabilities, job)
+        except SandboxError as exc:
+            sys.stderr.write(f"ouroboros exec sandbox: {exc}\n")
+            return EXIT_SANDBOX_FAILED
+        except OSError as exc:
+            sys.stderr.write(f"ouroboros exec sandbox: {command[0]}: {exc.strerror}\n")
+            return EXIT_NOT_EXECUTABLE
+        try:
+            return wait(process)
+        finally:
+            # The command has exited: end whatever it left running before
+            # its grants are revoked.
+            api.kernel32.TerminateJobObject(job, 1)
+            api.kernel32.CloseHandle(thread)
+            api.kernel32.CloseHandle(process)
+    finally:
+        for root in granted:
+            try:
+                root.update(container, _REVOKE_ACCESS, 0)  # type: ignore[arg-type]
+            except SandboxError as exc:
+                sys.stderr.write(f"ouroboros exec sandbox: revoking {root.path}: {exc}\n")
+        for root in roots:
+            root.close()
+        if job is not None:
+            _api().kernel32.CloseHandle(job)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

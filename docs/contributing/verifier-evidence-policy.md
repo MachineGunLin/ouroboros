@@ -180,14 +180,25 @@ command text a second way. The rules:
   can change (under `sandbox-exec` too); only a `noatime` mount stops that.
   The replayed command gets `/dev/null` as stdin, never the controller's
   own (under an MCP host, its JSON-RPC stream); the process runner does
-  this for verify commands as well. Where no backend works
-  (Windows, a kernel without Landlock ABI 3, an already-sandboxed macOS
-  process),
+  this for verify commands as well. On Windows the command runs in a fresh
+  AppContainer per replay (`runtime/_confine_windows.py`): its SID is
+  granted modify on the copy and the temp directory for the run only, the
+  command inherits exactly its standard handles and runs in a kill-on-close
+  Job Object, and the grants are revoked when it exits. An AppContainer
+  reads only what it is granted, so the controller's interpreter and the
+  live trees the copy links to are granted read and execute to one
+  Ouroboros capability SID; that grant is persistent, recorded in
+  `~/.ouroboros/exec-sandbox/read-grants.jsonl`, and removed by
+  `ouroboros.runtime.exec_sandbox.remove_persistent_read_grants()`. The
+  Windows probe adds the Windows mutation classes (file attributes, the
+  DACL, alternate data streams). Where no backend works (a kernel without
+  Landlock ABI 3, an already-sandboxed macOS process),
   nothing is replayed, the claims keep the transcript-only rules, and the
   observation records `replay_skipped: sandbox_unavailable`. Under Landlock
   the command also cannot read `/proc/<pid>/environ`, `mem` or `maps` of the
   controller or any other process outside its domain (Landlock denies
-  ptrace-mode access across the domain boundary). `sandbox-exec` cannot deny
+  ptrace-mode access across the domain boundary), and an AppContainer
+  process cannot open another process for reading its memory. `sandbox-exec` cannot deny
   the macOS equivalent (`KERN_PROCARGS2`), so on macOS a replayed command can
   read the environment of the user's other processes; the replayed command
   is one the worker already ran with the same access. Effects the command
@@ -199,7 +210,10 @@ command text a second way. The rules:
   (with its loopback interface brought up, so loopback stays available),
   or not at all when the Linux process already has only a loopback interface
   (a container started with `--network none`). Unix-domain sockets stay
-  available. Where none of these works, nothing is replayed and the
+  available. On Windows the AppContainer holds no network capability, which
+  denies loopback too (an AppContainer reaches loopback only through an
+  administrator's exemption); the confined command reports
+  `loopback_available: false`. Where none of these works, nothing is replayed and the
   observation records `replay_skipped: network_isolation_unavailable`.
 - **Live paths.** The copy reaches live paths through its links: the linked
   dependency trees and the targets of copied symlinks. They are outside the
