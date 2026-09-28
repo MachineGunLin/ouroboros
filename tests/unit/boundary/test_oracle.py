@@ -23,8 +23,8 @@ from ouroboros.core.seed import OntologySchema, Seed, SeedMetadata
 
 V1_PACKAGE = (
     '{"base_files":[],"checks":[{"argv":["python3",".ouroboros_checks/repro_1.py"],"assertions":'
-    '[{"assertion_id":"repro_1.a1","criterion_key":"ac_1","file":null,"locator":null}],'
-    '"check_id":"repro_1","cwd":".","failure_signature":"OUROBOROS_CHECK_FAILED:repro_1",'
+    '[{"assertion_id":"script_1_1.a1","criterion_key":"ac_1","file":null,"locator":null}],'
+    '"check_id":"script_1_1","cwd":".","failure_signature":"OUROBOROS_CHECK_FAILED:repro_1",'
     '"role":"reproduction"}],"criterion_keys":["ac_1","ac_2"],'
     '"files":[{"content":"print(1)\\n",'
     '"path":".ouroboros_checks/repro_1.py","sha256":'
@@ -36,7 +36,7 @@ V1_PACKAGE = (
 )
 # Pinned digest of V1_PACKAGE's canonical bytes; it changes only with an
 # intentional change to the package schema.
-V1_DIGEST = "c21403e5bf89eed5ab8c705d25ceaed571602909c2618acc9c3ebd4e6e6fdaa7"
+V1_DIGEST = "52de5e8af37b5bd6eb0d246c26ace04751865b3861285c7d754261666bf4b999"
 
 BUGGY = "def clamp(value, low, high):\n    if value > high:\n        return value\n    return max(low, value)\n"
 FIXED = "def clamp(value, low, high):\n    return max(low, min(high, value))\n"

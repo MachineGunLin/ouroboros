@@ -41,6 +41,8 @@ from ouroboros.boundary.package import (
     UncoveredObligation,
     oracle_check,
     oracle_files,
+    script_assertion_id,
+    script_check_id,
     seed_criterion_keys,
     seed_digest,
 )
@@ -371,10 +373,13 @@ def _mint_identifiers(normalized: dict[str, list[dict[str, Any]]]) -> None:
     for entry in normalized["checks"]:
         number = entry["assertions"][0]["criterion"]
         scripts[number] = scripts.get(number, 0) + 1
-        check_id = f"script_{number}_{scripts[number]}"
+        check_id = script_check_id(number, scripts[number])
         entry["check_id"] = check_id
         entry["assertions"] = [
-            {"criterion": link["criterion"], "assertion_id": f"{check_id}.a{position}"}
+            {
+                "criterion": link["criterion"],
+                "assertion_id": script_assertion_id(check_id, position),
+            }
             for position, link in enumerate(entry["assertions"], start=1)
         ]
 
