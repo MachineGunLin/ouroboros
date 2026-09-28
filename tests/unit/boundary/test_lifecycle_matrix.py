@@ -71,7 +71,13 @@ from ouroboros.events.base import BaseEvent
 
 from .clamp_fixtures import _oracle
 from .conftest import build_package
-from .journal_fixtures import admission_receipt, verification_receipt
+from .journal_fixtures import (
+    admission_receipt,
+    criterion,
+    decision_data,
+    final_bindings,
+    verification_receipt,
+)
 
 RUN = "run_matrix"
 BOUNDARY = boundary_version_id(RUN, 1)
@@ -80,51 +86,19 @@ T0 = datetime(2026, 9, 28, tzinfo=UTC)
 
 
 def _bindings(phase: str, package: CheckPackage) -> BindingsPayload:
-    check = package.checks[0]
-    record = {
-        "criterion_key": check.assertions[0].criterion_key,
-        "check_id": check.check_id,
-        "tier": "A",
-        "binding_source": None,
-        "binding": None,
-        "status_hint": None,
-        "reason": "r",
-        "declared": None,
-    }
-    return BindingsPayload.model_validate({"phase": phase, "checks": [record]})
+    return final_bindings(package, phase)
 
 
 def _undecided(package: CheckPackage) -> dict[str, Any]:
     """A decision the package could not make: every criterion indeterminate, none accepted."""
-    return {
-        "schema_version": "ouroboros.acceptance_reconciliation.v3",
-        "run_accepted": False,
-        "existing_run_accepted": True,
-        "artifact_verdict": "indeterminate",
-        "verified_pass_count": 0,
-        "unverified_count": 0,
-        "criterion_count": len(package.criterion_keys),
-        "tier_summary": {},
-        "criteria": [
-            {
-                "root_ac_index": index,
-                "criterion_key": key,
-                "package_status": "indeterminate",
-                "tier": "A",
-                "reason": "authority_error:OSError",
-                "failed_heldout_only": False,
-                "binding": None,
-                "existing_outcome": "succeeded",
-                "existing_failure_class": None,
-                "existing_accepted": True,
-                "accepted": False,
-                "governed_by": "check_package",
-                "declared_binding_pass": False,
-            }
+    reason = "authority_error:OSError"
+    return decision_data(
+        [
+            criterion(index, key, "indeterminate", reason=reason)
             for index, key in enumerate(package.criterion_keys)
         ],
-        "undecided_reason": "authority_error:OSError",
-    }
+        undecided_reason=reason,
+    )
 
 
 class _Records:
