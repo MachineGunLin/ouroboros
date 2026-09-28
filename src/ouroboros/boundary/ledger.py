@@ -1118,6 +1118,8 @@ def _project(
         raise BoundaryOrderError("the run's boundary versions are not v1, v2, ... in order")
     states: dict[int, VersionState] = {}
     for number, events in versions.items():
+        if any(event.aggregate_id != boundary_version_id(execution_id, number) for event in events):
+            raise BoundaryOrderError("a boundary version holds a record of another aggregate")
         problems = verify_boundary_order(events, run_events=run_events)
         if problems:
             raise BoundaryOrderError(problems[0])
