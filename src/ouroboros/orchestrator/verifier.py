@@ -96,10 +96,16 @@ _VALID_FAILURE_CLASSES: frozenset[str] = frozenset(
         # Kept in sync by hand with FailureClass: failure_taxonomy imports this
         # module, so the vocabulary cannot be derived from the enum here.
         "TRANSCRIPT_MISSING_INFRASTRUCTURE",
+        "SCRIPT_ABSENT_FROM_ARTIFACT",
     }
 )
 
-_UNAVAILABLE_FAILURE_CLASS = "TRANSCRIPT_MISSING_INFRASTRUCTURE"
+# Failure classes of a verifier that had no evidence to judge, not a
+# rejection: the transcript was lost, or every unproven claim is a recorded
+# run that cannot be replayed because its script left the workspace.
+_UNAVAILABLE_FAILURE_CLASSES: frozenset[str] = frozenset(
+    {"TRANSCRIPT_MISSING_INFRASTRUCTURE", "SCRIPT_ABSENT_FROM_ARTIFACT"}
+)
 
 
 class VerifierStatus(StrEnum):
@@ -191,19 +197,20 @@ class VerifierVerdict:
             )
             raise VerifierContractError(msg)
         unavailable_claimed = (
-            self.failure_class == _UNAVAILABLE_FAILURE_CLASS
+            self.failure_class in _UNAVAILABLE_FAILURE_CLASSES
             or status is VerifierStatus.UNAVAILABLE
             or (not self.passed and retry_admission is RetryAdmission.ACCEPT)
         )
         unavailable_valid = (
             not self.passed
-            and self.failure_class == _UNAVAILABLE_FAILURE_CLASS
+            and self.failure_class in _UNAVAILABLE_FAILURE_CLASSES
             and status is VerifierStatus.UNAVAILABLE
             and retry_admission is RetryAdmission.ACCEPT
         )
         if unavailable_claimed and not unavailable_valid:
             raise VerifierContractError(
-                "UNAVAILABLE requires TRANSCRIPT_MISSING_INFRASTRUCTURE and ACCEPT"
+                "UNAVAILABLE requires TRANSCRIPT_MISSING_INFRASTRUCTURE or "
+                "SCRIPT_ABSENT_FROM_ARTIFACT, and ACCEPT"
             )
         if self.passed and status is not VerifierStatus.PASS:
             msg = "VerifierVerdict(passed=True) must have status PASS"
@@ -237,7 +244,7 @@ def _normalize_verifier_status(
             return VerifierStatus.PASS
         if failure_class == "BLOCKED":
             return VerifierStatus.BLOCKED
-        if failure_class == _UNAVAILABLE_FAILURE_CLASS:
+        if failure_class in _UNAVAILABLE_FAILURE_CLASSES:
             return VerifierStatus.UNAVAILABLE
         return VerifierStatus.FAIL
     try:
@@ -284,7 +291,7 @@ def _normalize_evidence_used(evidence_used: tuple[str, ...]) -> tuple[str, ...]:
 def _default_retry_admission_for_failure_class(
     failure_class: str | None,
 ) -> RetryAdmission:
-    if failure_class == _UNAVAILABLE_FAILURE_CLASS:
+    if failure_class in _UNAVAILABLE_FAILURE_CLASSES:
         return RetryAdmission.ACCEPT
     if failure_class == "FABRICATION_SUSPECTED":
         return RetryAdmission.ESCALATE_MODEL

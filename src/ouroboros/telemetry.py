@@ -412,6 +412,7 @@ _NO_EVIDENCE_REPLAY_REASONS = frozenset(
     {
         "environment_unverifiable",
         "transcript_unavailable",
+        "script_absent_from_artifact",
         "no_verifier_verdict",
         "verifier_verdict_not_passed",
         "no_legacy_record",

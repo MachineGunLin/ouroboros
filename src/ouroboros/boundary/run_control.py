@@ -76,6 +76,7 @@ _FAILURE_CLASS_VALUES = frozenset(
         "stall",
         "blocked",
         "transcript_missing_infrastructure",
+        "script_absent_from_artifact",
     }
 )
 SWITCH_TEXT = (

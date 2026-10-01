@@ -2547,7 +2547,7 @@ def render_parallel_verification_report(
         )
         or (
             result.atomic_verifier_verdict is not None
-            and result.atomic_verifier_verdict.failure_class == "TRANSCRIPT_MISSING_INFRASTRUCTURE"
+            and result.atomic_verifier_verdict.status is VerifierStatus.UNAVAILABLE
         )
     ]
     if unverifiable_indices:
@@ -9192,14 +9192,14 @@ Respond with either ATOMIC or the structured JSON object only.
                 verify_gate_outcome=verify_gate_outcome,
                 verify_gate_replaces_all_evidence=verify_gate_replaces_all_evidence,
             )
-            transcript_unavailable = bool(
+            verifier_unavailable = bool(
                 verifier_verdict is not None
-                and verifier_verdict.failure_class == "TRANSCRIPT_MISSING_INFRASTRUCTURE"
+                and verifier_verdict.status is VerifierStatus.UNAVAILABLE
             )
-            if transcript_unavailable:
-                # Transcript collection failed after the worker completed. Do not
-                # discard or repeat the work; keep the result successful and expose
-                # the unavailable verifier in telemetry and the final report.
+            if verifier_unavailable:
+                # No evidence to judge (transcript lost, or a recorded run whose
+                # script left the workspace). Do not discard or repeat the work;
+                # keep the result successful and expose it in the final report.
                 fat_harness_error = None
                 log.warning(
                     "parallel_executor.ac.transcript_verification_unavailable",
