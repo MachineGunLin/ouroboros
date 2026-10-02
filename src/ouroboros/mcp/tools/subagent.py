@@ -1973,6 +1973,11 @@ def build_evolve_subagent(
     parallel: bool = True,
     skip_qa: bool = False,
     project_dir: str | None = None,
+    commit_policy: str | None = None,
+    auto_session_id: str | None = None,
+    execution_id: str | None = None,
+    checkpoint_commits: tuple[dict[str, Any], ...] = (),
+    checkpoint_attempted_ac_ids: tuple[str, ...] = (),
     conductor_directive: Mapping[str, Any] | None = None,
     conductor_decision_id: str | None = None,
     predecessor_execution_id: str | None = None,
@@ -2015,6 +2020,19 @@ def build_evolve_subagent(
     else:
         qa_note = "\n## QA\nRun QA evaluation after the generation completes.\n"
 
+    checkpoint_note = ""
+    if commit_policy and commit_policy != "none" and auto_session_id:
+        checkpoint_note = (
+            "\n## Checkpoint Commits\n"
+            f"commit_policy: {commit_policy}\n"
+            f"auto_session_id: {auto_session_id}\n"
+            f"execution_id: {execution_id or 'none'}\n"
+            "When you run this `evolve_step`, forward `commit_policy`, "
+            "`auto_session_id`, `execution_id`, `checkpoint_commits`, and "
+            "`checkpoint_attempted_ac_ids` so verified acceptance criteria are "
+            "checkpoint-committed in the execution worktree.\n"
+        )
+
     if execute:
         mode_note = "\n## Mode\nFull pipeline: Execute the seed, then Evaluate the output.\n"
     else:
@@ -2044,7 +2062,7 @@ Gen 2+ lifecycle (no seed — reconstruct from prior generation):
 
 ## Lineage ID
 {lineage_id}
-{seed_note}{mode_note}{parallel_note}{project_dir_note}{qa_note}{conductor_note}
+{seed_note}{mode_note}{parallel_note}{project_dir_note}{qa_note}{checkpoint_note}{conductor_note}
 Return a generation report: generation, phase, action, ontology similarity,
 evaluation verdict, active/frozen AC indices, and ontology delta. Report only
 verified convergence; ontology-only stability is ontology_stable. Stop after one generation."""
@@ -2057,6 +2075,17 @@ verified convergence; ontology-only stability is ontology_stable. Stop after one
         "skip_qa": skip_qa,
         "project_dir": project_dir,
     }
+    # Forward the checkpoint contract so plugin-mode evolve reaches the same AC
+    # checkpoint behavior as the in-process path. Only attach the fields when
+    # a committing policy is actually configured, so legacy callers that never
+    # set commit_policy keep the prior context shape.
+    if commit_policy and commit_policy != "none" and auto_session_id:
+        context["commit_policy"] = commit_policy
+        context["auto_session_id"] = auto_session_id
+        if execution_id:
+            context["execution_id"] = execution_id
+        context["checkpoint_commits"] = [dict(item) for item in checkpoint_commits]
+        context["checkpoint_attempted_ac_ids"] = list(checkpoint_attempted_ac_ids)
     if conductor_directive is not None:
         context["conductor_directive"] = dict(conductor_directive)
         context["conductor_decision_id"] = conductor_decision_id

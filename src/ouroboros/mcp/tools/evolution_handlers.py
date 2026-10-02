@@ -744,6 +744,19 @@ class EvolveStepHandler(BridgeAwareMixin):
             parallel=arguments.get("parallel", True),
             skip_qa=arguments.get("skip_qa", False),
             project_dir=arguments.get("project_dir"),
+            commit_policy=arguments.get("commit_policy"),
+            auto_session_id=arguments.get("auto_session_id"),
+            execution_id=arguments.get("execution_id"),
+            checkpoint_commits=tuple(
+                item
+                for item in (arguments.get("checkpoint_commits") or [])
+                if isinstance(item, dict)
+            ),
+            checkpoint_attempted_ac_ids=tuple(
+                item
+                for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
+                if isinstance(item, str)
+            ),
             conductor_directive=(
                 conductor_directive.to_event_data() if conductor_directive is not None else None
             ),
@@ -1629,6 +1642,16 @@ class StartEvolveStepHandler:
                     tool_name="ouroboros_start_evolve_step",
                 )
             )
+        if arguments.get("recover_expired_claim") is True and should_dispatch_via_plugin(
+            self.agent_runtime_backend,
+            self.opencode_mode,
+        ):
+            return Result.err(
+                MCPToolError(
+                    "recover_expired_claim requires the in-process evolve runtime",
+                    tool_name="ouroboros_start_evolve_step",
+                )
+            )
 
         directive_result = await _resolve_conductor_directive(
             arguments=arguments,
@@ -1651,6 +1674,19 @@ class StartEvolveStepHandler:
             parallel=arguments.get("parallel", True),
             skip_qa=arguments.get("skip_qa", False),
             project_dir=arguments.get("project_dir"),
+            commit_policy=arguments.get("commit_policy"),
+            auto_session_id=arguments.get("auto_session_id"),
+            execution_id=arguments.get("execution_id"),
+            checkpoint_commits=tuple(
+                item
+                for item in (arguments.get("checkpoint_commits") or [])
+                if isinstance(item, dict)
+            ),
+            checkpoint_attempted_ac_ids=tuple(
+                item
+                for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
+                if isinstance(item, str)
+            ),
             conductor_directive=(
                 conductor_directive.to_event_data() if conductor_directive is not None else None
             ),
