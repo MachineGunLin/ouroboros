@@ -49,6 +49,38 @@ class TestBuildEvolveSubagentCheckpointContract:
         }
         assert "Checkpoint" not in payload.prompt
 
+    def test_lists_only_without_policy_or_session(self) -> None:
+        payload = build_evolve_subagent(
+            lineage_id="lin-3",
+            checkpoint_commits=({"ac": "a1"},),
+            checkpoint_attempted_ac_ids=("a1",),
+        )
+        assert payload.context["checkpoint_commits"] == [{"ac": "a1"}]
+        assert payload.context["checkpoint_attempted_ac_ids"] == ["a1"]
+        assert "commit_policy" not in payload.context
+        assert "auto_session_id" not in payload.context
+
+    def test_execution_id_only(self) -> None:
+        payload = build_evolve_subagent(lineage_id="lin-4", execution_id="exec-9")
+        assert payload.context["execution_id"] == "exec-9"
+        assert "commit_policy" not in payload.context
+
+    def test_auto_session_id_only(self) -> None:
+        payload = build_evolve_subagent(lineage_id="lin-5", auto_session_id="sess-9")
+        assert payload.context["auto_session_id"] == "sess-9"
+        assert "commit_policy" not in payload.context
+
+    def test_commit_policy_only(self) -> None:
+        # All five params are required=False in the schema, so a lone
+        # commit_policy is legal input and must be preserved.
+        payload = build_evolve_subagent(lineage_id="lin-6", commit_policy="on-pass")
+        assert payload.context["commit_policy"] == "on-pass"
+
+    def test_commit_policy_none_keeps_legacy_shape(self) -> None:
+        payload = build_evolve_subagent(lineage_id="lin-7", commit_policy="none")
+        assert "commit_policy" not in payload.context
+        assert "Checkpoint" not in payload.prompt
+
 
 class TestStartEvolveStepPluginCheckpoint:
     @pytest.fixture
@@ -102,6 +134,19 @@ class TestStartEvolveStepPluginCheckpoint:
         result = await handler.handle({"lineage_id": "lin-abc", "benchmark_control": True})
         assert result.is_ok is False
         assert "benchmark_control" in str(result.error)
+
+    async def test_lists_only_reach_plugin_context(self, handler) -> None:
+        result = await handler.handle(
+            {
+                "lineage_id": "lin-abc",
+                "checkpoint_commits": [{"ac": "a1"}],
+                "checkpoint_attempted_ac_ids": ["a1"],
+            }
+        )
+        assert result.is_ok
+        context = result.value.meta["_subagent"]["context"]
+        assert context["checkpoint_commits"] == [{"ac": "a1"}]
+        assert context["checkpoint_attempted_ac_ids"] == ["a1"]
 
 
 class TestEvolveStepPluginCheckpoint:

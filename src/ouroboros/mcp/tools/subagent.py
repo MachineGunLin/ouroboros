@@ -2021,16 +2021,29 @@ def build_evolve_subagent(
         qa_note = "\n## QA\nRun QA evaluation after the generation completes.\n"
 
     checkpoint_note = ""
-    if commit_policy and commit_policy != "none" and auto_session_id:
+    checkpoint_lines: list[str] = []
+    if commit_policy and commit_policy != "none":
+        checkpoint_lines.append(f"commit_policy: {commit_policy}")
+    if auto_session_id:
+        checkpoint_lines.append(f"auto_session_id: {auto_session_id}")
+    if execution_id:
+        checkpoint_lines.append(f"execution_id: {execution_id}")
+    if checkpoint_commits:
+        checkpoint_lines.append(
+            f"checkpoint_commits: {len(checkpoint_commits)} record(s) in context"
+        )
+    if checkpoint_attempted_ac_ids:
+        checkpoint_lines.append(
+            f"checkpoint_attempted_ac_ids: {len(checkpoint_attempted_ac_ids)} id(s) in context"
+        )
+    if checkpoint_lines:
         checkpoint_note = (
             "\n## Checkpoint Commits\n"
-            f"commit_policy: {commit_policy}\n"
-            f"auto_session_id: {auto_session_id}\n"
-            f"execution_id: {execution_id or 'none'}\n"
-            "When you run this `evolve_step`, forward `commit_policy`, "
-            "`auto_session_id`, `execution_id`, `checkpoint_commits`, and "
-            "`checkpoint_attempted_ac_ids` so verified acceptance criteria are "
-            "checkpoint-committed in the execution worktree.\n"
+            + "\n".join(checkpoint_lines)
+            + "\nCarry these checkpoint fields forward when you run this "
+            "`evolve_step`, so verified acceptance criteria are "
+            "checkpoint-committed in the execution worktree and commits stay "
+            "idempotent.\n"
         )
 
     if execute:
@@ -2075,16 +2088,18 @@ verified convergence; ontology-only stability is ontology_stable. Stop after one
         "skip_qa": skip_qa,
         "project_dir": project_dir,
     }
-    # Forward the checkpoint contract so plugin-mode evolve reaches the same AC
-    # checkpoint behavior as the in-process path. Only attach the fields when
-    # a committing policy is actually configured, so legacy callers that never
-    # set commit_policy keep the prior context shape.
-    if commit_policy and commit_policy != "none" and auto_session_id:
+    # Forward each provided checkpoint field independently so no declared
+    # input is silently dropped when sibling fields are absent. Fields left
+    # at their defaults keep the prior context shape for legacy callers.
+    if commit_policy and commit_policy != "none":
         context["commit_policy"] = commit_policy
+    if auto_session_id:
         context["auto_session_id"] = auto_session_id
-        if execution_id:
-            context["execution_id"] = execution_id
+    if execution_id:
+        context["execution_id"] = execution_id
+    if checkpoint_commits:
         context["checkpoint_commits"] = [dict(item) for item in checkpoint_commits]
+    if checkpoint_attempted_ac_ids:
         context["checkpoint_attempted_ac_ids"] = list(checkpoint_attempted_ac_ids)
     if conductor_directive is not None:
         context["conductor_directive"] = dict(conductor_directive)
