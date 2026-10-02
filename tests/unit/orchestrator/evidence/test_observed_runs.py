@@ -293,3 +293,68 @@ class TestScriptPresent:
         verdict = _verify(workspace, _bash(PATCH_THEN_RUN, "item_20", 0))
 
         assert verdict.passed is True, verdict.reasons
+
+
+class TestMixedClaims:
+    """A proven tests_passed claim carries the criterion; absent ones are recorded."""
+
+    @staticmethod
+    def _verify_claims(workspace: Path, transcript: tuple[AgentMessage, ...], tests: list[str]):
+        messages = (
+            *transcript,
+            build_observation_message(WorkspaceObservation(changed_paths=frozenset({"writer.py"}))),
+            AgentMessage(type="result", content="done"),
+        )
+        return _verify_atomic_evidence_against_runtime_messages(
+            messages=messages,
+            typed_evidence=EvidenceRecord(
+                data={"files_touched": ["writer.py"], "commands_run": tests, "tests_passed": tests}
+            ),
+            ac_content=AC,
+            execution_profile=load_profile("code"),
+            task_cwd=str(workspace),
+            adapter_working_directory=str(workspace),
+            verify_gate_active=True,
+        )
+
+    def test_one_proven_and_one_absent_passes_with_a_not_replayed_record(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        (workspace / "check.py").write_text("print('ok')\n")
+        transcript = (
+            *_bash(PATCH_THEN_RUN, "item_20", 0),
+            *_bash("python check.py", "item_21", 0),
+        )
+
+        verdict = self._verify_claims(workspace, transcript, [CLAIM, "python check.py"])
+
+        assert verdict.passed is True, verdict.reasons
+        assert verdict.status is VerifierStatus.PASS
+        assert verdict.not_replayed == (f"{SCRIPT_ABSENT_FROM_ARTIFACT}: tests_passed: {CLAIM}",)
+
+    def test_only_absent_claims_take_the_no_evidence_path(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+
+        verdict = self._verify_claims(workspace, _bash(PATCH_THEN_RUN, "item_20", 0), [CLAIM])
+
+        assert verdict.passed is False
+        assert verdict.failure_class == FailureClass.SCRIPT_ABSENT_FROM_ARTIFACT.value
+        assert verdict.status is VerifierStatus.UNAVAILABLE
+        assert verdict.not_replayed == (f"{SCRIPT_ABSENT_FROM_ARTIFACT}: tests_passed: {CLAIM}",)
+
+    def test_proven_and_fabricated_is_fabrication(self, tmp_path: Path) -> None:
+        workspace = _workspace(tmp_path / "ws")
+        (workspace / "check.py").write_text("print('ok')\n")
+        transcript = (
+            *_bash(PATCH_THEN_RUN, "item_20", 0),
+            *_bash("python check.py", "item_21", 0),
+        )
+
+        verdict = self._verify_claims(
+            workspace, transcript, [CLAIM, "python check.py", "python never_ran.py"]
+        )
+
+        assert verdict.passed is False
+        assert verdict.failure_class == FailureClass.FABRICATION_SUSPECTED.value
+        assert "python never_ran.py" in verdict.reasons[0]

@@ -146,6 +146,10 @@ class VerifierVerdict:
         status: Typed verifier status. Defaults from ``passed`` and
             ``failure_class`` for backward compatibility.
         evidence_used: Stable evidence refs used by the verifier.
+        not_replayed: Claims the transcript recorded running that could not
+            be replayed, each as ``<reason>: <field>: <claim>`` (reason
+            ``script_absent_from_artifact``). Recorded on a pass as well: a
+            pass rests on the other, proven claims, never on these.
         retry_admission: Machine-readable next-action admission. Defaults to
             ACCEPT for passes and the H7 recovery policy for failures.
     """
@@ -156,6 +160,7 @@ class VerifierVerdict:
     status: VerifierStatus | str | None = None
     evidence_used: tuple[str, ...] = ()
     retry_admission: RetryAdmission | str | None = None
+    not_replayed: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         status = _normalize_verifier_status(
@@ -231,6 +236,7 @@ class VerifierVerdict:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "retry_admission", retry_admission)
         object.__setattr__(self, "evidence_used", _normalize_evidence_used(self.evidence_used))
+        object.__setattr__(self, "not_replayed", _normalize_evidence_used(self.not_replayed))
 
 
 def _normalize_verifier_status(

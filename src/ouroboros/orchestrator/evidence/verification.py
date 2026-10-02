@@ -291,12 +291,25 @@ def _verify_atomic_evidence_against_runtime_messages(
 
     if not_replayed:
         # Every other claim is supported; these runs happened but cannot be
-        # replayed. The criterion has no evidence: the verifier withholds its
-        # pass without rejecting the work.
+        # replayed, so they are recorded and prove nothing. A criterion with
+        # another tests_passed claim proven passes on that claim. One whose
+        # only tests_passed claims are these has no evidence: the verifier
+        # withholds its pass without rejecting the work.
+        record = tuple(f"{SCRIPT_ABSENT_FROM_ARTIFACT}: {entry}" for entry in not_replayed)
+        test_claims = (
+            tuple(_flatten_evidence_values(typed_evidence.get("tests_passed")))
+            if "tests_passed" in required_fields
+            else ()
+        )
+        # Only tests_passed claims are ever not replayed, and every other
+        # one reached here proven.
+        if len(test_claims) > len(not_replayed):
+            return VerifierVerdict(passed=True, not_replayed=record)
         return VerifierVerdict(
             passed=False,
             reasons=(f"not_replayed: {SCRIPT_ABSENT_FROM_ARTIFACT}: " + "; ".join(not_replayed),),
             failure_class=FailureClass.SCRIPT_ABSENT_FROM_ARTIFACT.value,
+            not_replayed=record,
         )
 
     return VerifierVerdict(passed=True)

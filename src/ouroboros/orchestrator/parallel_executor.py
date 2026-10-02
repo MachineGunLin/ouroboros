@@ -9197,9 +9197,8 @@ Respond with either ATOMIC or the structured JSON object only.
                 and verifier_verdict.status is VerifierStatus.UNAVAILABLE
             )
             if verifier_unavailable:
-                # No evidence to judge (transcript lost, or a recorded run whose
-                # script left the workspace). Do not discard or repeat the work;
-                # keep the result successful and expose it in the final report.
+                # No evidence to judge (lost transcript, or only unreplayable runs):
+                # keep the work successful and expose it in the final report.
                 fat_harness_error = None
                 log.warning(
                     "parallel_executor.ac.transcript_verification_unavailable",
@@ -12940,6 +12939,7 @@ Respond with either ATOMIC or the structured JSON object only.
             data["verifier_status"] = verifier_verdict.status.value
             data["retry_admission"] = verifier_verdict.retry_admission.value
             data["verifier_evidence_used"] = list(verifier_verdict.evidence_used)
+            data["verifier_not_replayed"] = list(verifier_verdict.not_replayed)
         if typed_evidence is not None:
             data["typed_evidence_fields"] = sorted(typed_evidence.data)
             data["ignored_out_of_scope_evidence_fields"] = list(
