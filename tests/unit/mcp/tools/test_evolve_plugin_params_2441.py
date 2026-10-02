@@ -37,6 +37,34 @@ class TestBuildEvolveSubagentCheckpointContract:
         assert "Checkpoint" in payload.prompt
         assert "commit_policy" in payload.prompt
 
+    def test_prompt_carries_real_values_not_just_names(self) -> None:
+        # Bridge-visible contract: the OpenCode bridge drops
+        # SubagentPayload.context, so the child can only recover values
+        # present verbatim in the prompt.
+        payload = build_evolve_subagent(
+            lineage_id="lin-v",
+            commit_policy="on-pass",
+            auto_session_id="sess-v",
+            execution_id="exec-v",
+            checkpoint_commits=({"ac": "a1"}, {"ac": "a2"}),
+            checkpoint_attempted_ac_ids=("a1", "a2", "a3"),
+        )
+        assert "commit_policy: on-pass" in payload.prompt
+        assert "auto_session_id: sess-v" in payload.prompt
+        assert "execution_id: exec-v" in payload.prompt
+        assert '"ac": "a1"' in payload.prompt
+        assert '"ac": "a2"' in payload.prompt
+        for ac_id in ("a1", "a2", "a3"):
+            assert f'"{ac_id}"' in payload.prompt
+
+    def test_absent_fields_add_no_prompt_noise(self) -> None:
+        payload = build_evolve_subagent(lineage_id="lin-8", execution_id="exec-only")
+        assert "execution_id: exec-only" in payload.prompt
+        assert "commit_policy" not in payload.prompt
+        assert "auto_session_id" not in payload.prompt
+        assert "checkpoint_commits" not in payload.prompt
+        assert "checkpoint_attempted_ac_ids" not in payload.prompt
+
     def test_legacy_shape_unchanged_without_checkpoint_params(self) -> None:
         payload = build_evolve_subagent(lineage_id="lin-2")
         assert payload.context == {

@@ -2020,6 +2020,11 @@ def build_evolve_subagent(
     else:
         qa_note = "\n## QA\nRun QA evaluation after the generation completes.\n"
 
+    # The OpenCode bridge only carries tool_name/title/agent/prompt/timeout
+    # to the child (see ouroboros-bridge.ts `Raw`), so checkpoint values must
+    # travel inside the prompt itself — context alone never reaches the child.
+    # Only provided fields are rendered, with real values (JSON for lists),
+    # so absent fields add no prompt noise.
     checkpoint_note = ""
     checkpoint_lines: list[str] = []
     if commit_policy and commit_policy != "none":
@@ -2030,11 +2035,11 @@ def build_evolve_subagent(
         checkpoint_lines.append(f"execution_id: {execution_id}")
     if checkpoint_commits:
         checkpoint_lines.append(
-            f"checkpoint_commits: {len(checkpoint_commits)} record(s) in context"
+            f"checkpoint_commits: {_bounded_json([dict(item) for item in checkpoint_commits], 6_000)}"
         )
     if checkpoint_attempted_ac_ids:
         checkpoint_lines.append(
-            f"checkpoint_attempted_ac_ids: {len(checkpoint_attempted_ac_ids)} id(s) in context"
+            f"checkpoint_attempted_ac_ids: {_bounded_json(list(checkpoint_attempted_ac_ids), 6_000)}"
         )
     if checkpoint_lines:
         checkpoint_note = (
