@@ -1965,6 +1965,99 @@ def build_lateral_multi_subagent(
     return payloads
 
 
+#: Max serialized bytes of the checkpoint state section in an evolve
+#: subagent prompt. The OpenCode bridge truncates the whole prompt at
+#: 100_000 bytes (ouroboros-bridge.ts MAX_BYTES) with only a warning, so a
+#: silently truncated checkpoint list could lose commit hashes and break
+#: idempotency. Checkpoint state (unbounded by schema) that does not fit
+#: fails closed instead of dispatching a child with partial state.
+CHECKPOINT_STATE_MAX_BYTES = 20_000
+
+
+def render_checkpoint_note(
+    *,
+    commit_policy: str | None = None,
+    auto_session_id: str | None = None,
+    execution_id: str | None = None,
+    checkpoint_commits: tuple[dict[str, Any], ...] = (),
+    checkpoint_attempted_ac_ids: tuple[str, ...] = (),
+) -> str:
+    """Render provided checkpoint fields with real values, never truncated.
+
+    Lists use full JSON so the child can recover every record and id.
+    Absent fields render nothing.
+    """
+    lines: list[str] = []
+    if commit_policy and commit_policy != "none":
+        lines.append(f"commit_policy: {commit_policy}")
+    if auto_session_id:
+        lines.append(f"auto_session_id: {auto_session_id}")
+    if execution_id:
+        lines.append(f"execution_id: {execution_id}")
+    if checkpoint_commits:
+        lines.append(
+            "checkpoint_commits: "
+            + json.dumps(
+                [dict(item) for item in checkpoint_commits],
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+        )
+    if checkpoint_attempted_ac_ids:
+        lines.append(
+            "checkpoint_attempted_ac_ids: "
+            + json.dumps(
+                list(checkpoint_attempted_ac_ids),
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+        )
+    if not lines:
+        return ""
+    return (
+        "\n## Checkpoint Commits\n"
+        + "\n".join(lines)
+        + "\nCarry these checkpoint fields forward when you run this "
+        "`evolve_step`, so verified acceptance criteria are "
+        "checkpoint-committed in the execution worktree and commits stay "
+        "idempotent.\n"
+    )
+
+
+def check_checkpoint_state_capacity(
+    *,
+    commit_policy: str | None = None,
+    auto_session_id: str | None = None,
+    execution_id: str | None = None,
+    checkpoint_commits: tuple[dict[str, Any], ...] = (),
+    checkpoint_attempted_ac_ids: tuple[str, ...] = (),
+) -> str | None:
+    """Fail closed when checkpoint state cannot fit plugin transport.
+
+    Returns an error message when the rendered section exceeds
+    CHECKPOINT_STATE_MAX_BYTES, else None. Callers must refuse to dispatch
+    the child on error — a truncated list would lose commit hashes and
+    break idempotency.
+    """
+    rendered = render_checkpoint_note(
+        commit_policy=commit_policy,
+        auto_session_id=auto_session_id,
+        execution_id=execution_id,
+        checkpoint_commits=checkpoint_commits,
+        checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
+    )
+    size = len(rendered.encode("utf-8"))
+    if size > CHECKPOINT_STATE_MAX_BYTES:
+        return (
+            "checkpoint state exceeds plugin transport/prompt capacity "
+            f"({size} > {CHECKPOINT_STATE_MAX_BYTES} bytes); refusing to "
+            "dispatch to avoid silently dropping checkpoint records"
+        )
+    return None
+
+
 def build_evolve_subagent(
     *,
     lineage_id: str,
@@ -2023,33 +2116,15 @@ def build_evolve_subagent(
     # The OpenCode bridge only carries tool_name/title/agent/prompt/timeout
     # to the child (see ouroboros-bridge.ts `Raw`), so checkpoint values must
     # travel inside the prompt itself — context alone never reaches the child.
-    # Only provided fields are rendered, with real values (JSON for lists),
-    # so absent fields add no prompt noise.
-    checkpoint_note = ""
-    checkpoint_lines: list[str] = []
-    if commit_policy and commit_policy != "none":
-        checkpoint_lines.append(f"commit_policy: {commit_policy}")
-    if auto_session_id:
-        checkpoint_lines.append(f"auto_session_id: {auto_session_id}")
-    if execution_id:
-        checkpoint_lines.append(f"execution_id: {execution_id}")
-    if checkpoint_commits:
-        checkpoint_lines.append(
-            f"checkpoint_commits: {_bounded_json([dict(item) for item in checkpoint_commits], 6_000)}"
-        )
-    if checkpoint_attempted_ac_ids:
-        checkpoint_lines.append(
-            f"checkpoint_attempted_ac_ids: {_bounded_json(list(checkpoint_attempted_ac_ids), 6_000)}"
-        )
-    if checkpoint_lines:
-        checkpoint_note = (
-            "\n## Checkpoint Commits\n"
-            + "\n".join(checkpoint_lines)
-            + "\nCarry these checkpoint fields forward when you run this "
-            "`evolve_step`, so verified acceptance criteria are "
-            "checkpoint-committed in the execution worktree and commits stay "
-            "idempotent.\n"
-        )
+    # Only provided fields are rendered, with real values (full JSON for
+    # lists), so absent fields add no prompt noise.
+    checkpoint_note = render_checkpoint_note(
+        commit_policy=commit_policy,
+        auto_session_id=auto_session_id,
+        execution_id=execution_id,
+        checkpoint_commits=checkpoint_commits,
+        checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
+    )
 
     if execute:
         mode_note = "\n## Mode\nFull pipeline: Execute the seed, then Evaluate the output.\n"

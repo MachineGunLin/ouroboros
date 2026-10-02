@@ -110,6 +110,54 @@ class TestBuildEvolveSubagentCheckpointContract:
         assert "Checkpoint" not in payload.prompt
 
 
+class TestCheckpointStateOversize:
+    """P1: checkpoint state must never be silently truncated.
+
+    Full JSON is rendered regardless of size; oversize state fails closed
+    at the handler gate (plugin path only) instead of dispatching partial
+    idempotency state to the child.
+    """
+
+    def test_big_ac_text_keeps_hash_and_later_records(self) -> None:
+        from ouroboros.mcp.tools.subagent import render_checkpoint_note
+
+        big_text = "x" * 7000
+        note = render_checkpoint_note(
+            commit_policy="on-pass",
+            auto_session_id="sess-big",
+            checkpoint_commits=(
+                {"ac_id": "a1", "ac_text": big_text, "commit": "deadbeef"},
+                {"ac_id": "a2", "commit": "cafef00d"},
+            ),
+            checkpoint_attempted_ac_ids=("a1", "a2"),
+        )
+        assert "deadbeef" in note
+        assert "cafef00d" in note
+        assert big_text in note
+        assert '"a2"' in note
+
+    def test_capacity_gate_passes_normal_state(self) -> None:
+        from ouroboros.mcp.tools.subagent import check_checkpoint_state_capacity
+
+        assert (
+            check_checkpoint_state_capacity(
+                commit_policy="on-pass",
+                checkpoint_commits=({"ac": "a1"},),
+                checkpoint_attempted_ac_ids=("a1",),
+            )
+            is None
+        )
+
+    def test_capacity_gate_fails_closed_on_big_state(self) -> None:
+        from ouroboros.mcp.tools.subagent import check_checkpoint_state_capacity
+
+        error = check_checkpoint_state_capacity(
+            checkpoint_attempted_ac_ids=tuple(f"ac-{i:05d}" for i in range(3000)),
+        )
+        assert error is not None
+        assert "plugin transport/prompt capacity" in error
+
+
 class TestStartEvolveStepPluginCheckpoint:
     @pytest.fixture
     async def event_store(self):
@@ -175,6 +223,36 @@ class TestStartEvolveStepPluginCheckpoint:
         context = result.value.meta["_subagent"]["context"]
         assert context["checkpoint_commits"] == [{"ac": "a1"}]
         assert context["checkpoint_attempted_ac_ids"] == ["a1"]
+
+    async def test_oversize_state_fails_closed_without_dispatch(self, handler) -> None:
+        result = await handler.handle(
+            {
+                "lineage_id": "lin-abc",
+                "checkpoint_attempted_ac_ids": [f"ac-{i:05d}" for i in range(3000)],
+            }
+        )
+        assert result.is_ok is False
+        assert "plugin transport/prompt capacity" in str(result.error)
+
+    async def test_multi_record_values_reach_plugin_prompt(self, handler) -> None:
+        big_text = "y" * 7000
+        result = await handler.handle(
+            {
+                "lineage_id": "lin-abc",
+                "commit_policy": "on-pass",
+                "auto_session_id": "sess-m",
+                "checkpoint_commits": [
+                    {"ac_id": "a1", "ac_text": big_text, "commit": "deadbeef"},
+                    {"ac_id": "a2", "commit": "cafef00d"},
+                ],
+                "checkpoint_attempted_ac_ids": ["a1", "a2"],
+            }
+        )
+        assert result.is_ok
+        prompt = result.value.meta["_subagent"]["prompt"]
+        assert "deadbeef" in prompt
+        assert "cafef00d" in prompt
+        assert big_text in prompt
 
 
 class TestEvolveStepPluginCheckpoint:

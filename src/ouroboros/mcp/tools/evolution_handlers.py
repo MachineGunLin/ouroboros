@@ -65,6 +65,7 @@ from ouroboros.mcp.tools.subagent import (
     DELEGATED_TO_PLUGIN,
     DELEGATED_TO_SUBAGENT,
     build_evolve_subagent,
+    check_checkpoint_state_capacity,
     dispatch_plugin_terminal,
     should_dispatch_via_plugin,
 )
@@ -737,6 +738,29 @@ class EvolveStepHandler(BridgeAwareMixin):
         # Parity with qa / execute_seed / lateral / evaluate handlers. When
         # the opencode bridge plugin is active we emit a `_subagent`
         # envelope instead of running the Python evolutionary_loop inline.
+        checkpoint_commits = tuple(
+            item for item in (arguments.get("checkpoint_commits") or []) if isinstance(item, dict)
+        )
+        checkpoint_attempted_ac_ids = tuple(
+            item
+            for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
+            if isinstance(item, str)
+        )
+        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            capacity_error = check_checkpoint_state_capacity(
+                commit_policy=arguments.get("commit_policy"),
+                auto_session_id=arguments.get("auto_session_id"),
+                execution_id=arguments.get("execution_id"),
+                checkpoint_commits=checkpoint_commits,
+                checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
+            )
+            if capacity_error is not None:
+                return Result.err(
+                    MCPToolError(
+                        capacity_error,
+                        tool_name="ouroboros_evolve_step",
+                    )
+                )
         payload = build_evolve_subagent(
             lineage_id=lineage_id,
             seed_content=arguments.get("seed_content"),
@@ -747,16 +771,8 @@ class EvolveStepHandler(BridgeAwareMixin):
             commit_policy=arguments.get("commit_policy"),
             auto_session_id=arguments.get("auto_session_id"),
             execution_id=arguments.get("execution_id"),
-            checkpoint_commits=tuple(
-                item
-                for item in (arguments.get("checkpoint_commits") or [])
-                if isinstance(item, dict)
-            ),
-            checkpoint_attempted_ac_ids=tuple(
-                item
-                for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
-                if isinstance(item, str)
-            ),
+            checkpoint_commits=checkpoint_commits,
+            checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
             conductor_directive=(
                 conductor_directive.to_event_data() if conductor_directive is not None else None
             ),
@@ -1667,6 +1683,29 @@ class StartEvolveStepHandler:
         # --- Subagent dispatch: gate on runtime + opencode_mode ---
         # Own-gate parity with StartExecuteSeedHandler. Plugin mode is
         # terminal: return envelope, skip background-job enqueue entirely.
+        checkpoint_commits = tuple(
+            item for item in (arguments.get("checkpoint_commits") or []) if isinstance(item, dict)
+        )
+        checkpoint_attempted_ac_ids = tuple(
+            item
+            for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
+            if isinstance(item, str)
+        )
+        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            capacity_error = check_checkpoint_state_capacity(
+                commit_policy=arguments.get("commit_policy"),
+                auto_session_id=arguments.get("auto_session_id"),
+                execution_id=arguments.get("execution_id"),
+                checkpoint_commits=checkpoint_commits,
+                checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
+            )
+            if capacity_error is not None:
+                return Result.err(
+                    MCPToolError(
+                        capacity_error,
+                        tool_name="ouroboros_start_evolve_step",
+                    )
+                )
         payload = build_evolve_subagent(
             lineage_id=lineage_id,
             seed_content=arguments.get("seed_content"),
@@ -1677,16 +1716,8 @@ class StartEvolveStepHandler:
             commit_policy=arguments.get("commit_policy"),
             auto_session_id=arguments.get("auto_session_id"),
             execution_id=arguments.get("execution_id"),
-            checkpoint_commits=tuple(
-                item
-                for item in (arguments.get("checkpoint_commits") or [])
-                if isinstance(item, dict)
-            ),
-            checkpoint_attempted_ac_ids=tuple(
-                item
-                for item in (arguments.get("checkpoint_attempted_ac_ids") or [])
-                if isinstance(item, str)
-            ),
+            checkpoint_commits=checkpoint_commits,
+            checkpoint_attempted_ac_ids=checkpoint_attempted_ac_ids,
             conductor_directive=(
                 conductor_directive.to_event_data() if conductor_directive is not None else None
             ),
