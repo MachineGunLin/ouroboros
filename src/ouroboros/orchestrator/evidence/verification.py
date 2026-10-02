@@ -21,6 +21,10 @@ from ouroboros.orchestrator.evidence.harness_observation import (
     observation_from_message,
     observations_confirm_unmutated_workspace,
 )
+from ouroboros.orchestrator.evidence.observed_runs import (
+    SCRIPT_ABSENT_FROM_ARTIFACT,
+    observed_zero_exit_run,
+)
 from ouroboros.orchestrator.evidence.test_detection import (
     _functional_command_supports_test_claim,
     _runtime_messages_have_completed_command_for_test_claim,
@@ -100,8 +104,12 @@ def _verify_atomic_evidence_against_runtime_messages(
 
     unsupported: list[str] = []
     evidence_form_mismatches: list[str] = []
+    # Observed runs whose script is absent from the artifact: not replayable,
+    # so they yield no evidence; they are not fabrication.
+    not_replayed: list[str] = []
     masked_command_mismatch = False
     completed_command_mismatch = False
+    absent_script_mismatch = False
     backed_commands = tuple(
         command
         for command in _flatten_evidence_values(typed_evidence.get("commands_run"))
@@ -142,6 +150,12 @@ def _verify_atomic_evidence_against_runtime_messages(
                 # Replay-first: a transcript command linked to this claim
                 # exited 0 when the harness replayed it in a workspace copy.
                 if replayed_command_supports_claim(value, support_messages):
+                    continue
+                # The transcript recorded this command running with exit 0
+                # as part of a larger Bash call (after the edit that set it
+                # up): the same structured support the whole-command alias
+                # gives, narrowed to a recorded zero exit.
+                if observed_zero_exit_run(value, support_messages, task_cwd=workspace_cwd):
                     continue
                 if _runtime_messages_have_masked_test_command_form(
                     value,
@@ -205,6 +219,25 @@ def _verify_atomic_evidence_against_runtime_messages(
                     task_cwd=workspace_cwd,
                 ):
                     continue
+                # The same functional tier for a run the transcript recorded
+                # inside a larger Bash call. When its script is no longer in
+                # the workspace (a scratch script the worker ran and deleted),
+                # the run cannot be replayed and nothing vouches for what it
+                # ran: no evidence, never fabrication. Without the verify gate
+                # it stays a rejection, as an evidence-form mismatch.
+                observed = observed_zero_exit_run(value, support_messages, task_cwd=workspace_cwd)
+                if observed is not None and observed.script is not None:
+                    if observed.script_present:
+                        if verify_gate_active:
+                            continue
+                    elif verify_gate_active:
+                        not_replayed.append(f"{field_name}: {value}")
+                        continue
+                    else:
+                        absent_script_mismatch = True
+                        evidence_form_mismatches.append(f"{field_name}: {value}")
+                        unsupported.append(f"{field_name}: {value}")
+                        continue
                 if _runtime_messages_have_masked_test_command_for_test_claim(
                     value=value,
                     messages=support_messages,
@@ -243,11 +276,40 @@ def _verify_atomic_evidence_against_runtime_messages(
                     "retry with contract-compliant test evidence from the runtime "
                     "or a runner-owned adapter"
                 )
+            if absent_script_mismatch:
+                details.append(
+                    f"{SCRIPT_ABSENT_FROM_ARTIFACT}: the recorded run's script is not "
+                    "in the workspace, so it cannot be replayed; keep the script or "
+                    "cite a command that checks the delivered artifact"
+                )
             reason_prefix = "evidence form mismatch; " + "; ".join(details)
         return VerifierVerdict(
             passed=False,
             reasons=(reason_prefix + ": " + "; ".join(unsupported),),
             failure_class=failure_class,
+        )
+
+    if not_replayed:
+        # Every other claim is supported; these runs happened but cannot be
+        # replayed, so they are recorded and prove nothing. A criterion with
+        # another tests_passed claim proven passes on that claim. One whose
+        # only tests_passed claims are these has no evidence: the verifier
+        # withholds its pass without rejecting the work.
+        record = tuple(f"{SCRIPT_ABSENT_FROM_ARTIFACT}: {entry}" for entry in not_replayed)
+        test_claims = (
+            tuple(_flatten_evidence_values(typed_evidence.get("tests_passed")))
+            if "tests_passed" in required_fields
+            else ()
+        )
+        # Only tests_passed claims are ever not replayed, and every other
+        # one reached here proven.
+        if len(test_claims) > len(not_replayed):
+            return VerifierVerdict(passed=True, not_replayed=record)
+        return VerifierVerdict(
+            passed=False,
+            reasons=(f"not_replayed: {SCRIPT_ABSENT_FROM_ARTIFACT}: " + "; ".join(not_replayed),),
+            failure_class=FailureClass.SCRIPT_ABSENT_FROM_ARTIFACT.value,
+            not_replayed=record,
         )
 
     return VerifierVerdict(passed=True)

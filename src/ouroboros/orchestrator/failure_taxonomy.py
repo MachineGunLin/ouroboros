@@ -52,6 +52,12 @@ class FailureClass(StrEnum):
             worker failure: a gaming leaf leaves plausible-looking messages,
             not none. Kept distinct from EVIDENCE_MISSING so an infrastructure
             fault is never reported — or counted — as a worker rejection.
+        SCRIPT_ABSENT_FROM_ARTIFACT: Every claim the transcript does not
+            otherwise prove is a run it recorded with exit 0 of a workspace
+            script that is no longer in the workspace (a scratch script the
+            worker ran and deleted). The run cannot be replayed, so the
+            criterion has no evidence; it is not fabrication and not a
+            worker rejection.
     """
 
     EVIDENCE_MISSING = "EVIDENCE_MISSING"
@@ -61,6 +67,7 @@ class FailureClass(StrEnum):
     STALL = "STALL"
     BLOCKED = "BLOCKED"
     TRANSCRIPT_MISSING_INFRASTRUCTURE = "TRANSCRIPT_MISSING_INFRASTRUCTURE"
+    SCRIPT_ABSENT_FROM_ARTIFACT = "SCRIPT_ABSENT_FROM_ARTIFACT"
 
 
 _HARD_PRECONDITION_VALUE_KEY_TOKENS = frozenset(
@@ -263,6 +270,14 @@ _POLICY_TABLE: dict[FailureClass, RecoveryPolicy] = {
         rationale=(
             "The harness lost the transcript after the leaf completed. Preserve "
             "the work as unverified instead of repeating provider effects."
+        ),
+    ),
+    FailureClass.SCRIPT_ABSENT_FROM_ARTIFACT: RecoveryPolicy(
+        action=RecoveryAction.CONTINUE,
+        rationale=(
+            "The transcript recorded the claimed run, but its script is gone "
+            "from the workspace, so it cannot be replayed. Preserve the work as "
+            "unverified instead of repeating it."
         ),
     ),
 }

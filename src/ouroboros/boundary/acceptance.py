@@ -436,6 +436,9 @@ class LegacyNoEvidenceReason(StrEnum):
     """The runtime transcript was unavailable (``TRANSCRIPT_MISSING_INFRASTRUCTURE``)."""
     NO_VERIFIER_VERDICT = "no_verifier_verdict"
     """No verifier verdict was recorded for the attempt."""
+    SCRIPT_ABSENT_FROM_ARTIFACT = "script_absent_from_artifact"
+    """Every unproven claim is a recorded run whose script left the workspace,
+    so it was not replayed (``SCRIPT_ABSENT_FROM_ARTIFACT``)."""
     VERIFIER_VERDICT_NOT_PASSED = "verifier_verdict_not_passed"
     """A verdict that did not pass, with no rejection the executor made."""
 

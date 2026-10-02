@@ -74,8 +74,14 @@ def test_the_replay_reason_is_read_from_the_results_typed_fields() -> None:
         passed=False, failure_class=FailureClass.TRANSCRIPT_MISSING_INFRASTRUCTURE.value
     )
     failed_verdict = SimpleNamespace(passed=False, failure_class=None)
+    script_absent = SimpleNamespace(
+        passed=False, failure_class=FailureClass.SCRIPT_ABSENT_FROM_ARTIFACT.value
+    )
     assert _reason(_legacy_result(verify_gate_outcome=unverifiable)) is (
         LegacyNoEvidenceReason.ENVIRONMENT_UNVERIFIABLE
+    )
+    assert _reason(_legacy_result(atomic_verifier_verdict=script_absent)) is (
+        LegacyNoEvidenceReason.SCRIPT_ABSENT_FROM_ARTIFACT
     )
     assert _reason(_legacy_result(atomic_verifier_verdict=transcript)) is (
         LegacyNoEvidenceReason.TRANSCRIPT_UNAVAILABLE
